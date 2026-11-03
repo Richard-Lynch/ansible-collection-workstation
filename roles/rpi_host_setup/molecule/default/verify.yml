@@ -1,0 +1,92 @@
+---
+# The cmdline editor is the highest-risk pure logic in this role: /boot/firmware/cmdline.txt is a
+# SINGLE line, and every naive editing approach has a specific silent failure (lineinfile appends a
+# second line the firmware ignores; a regex replace can match a substring of an unrelated token).
+# So it is tested against the cases that have bitten people.
+- name: Verify
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    _script: "{{ playbook_dir }}/../../files/rpi_cmdline.py"
+
+  tasks:
+    - name: Create a realistic cmdline fixture
+      ansible.builtin.copy:
+        dest: "{{ _tmp }}/cmdline.txt"
+        content: "console=serial0,115200 root=PARTUUID=deadbeef-02 rootfstype=ext4 fsck.repair=yes rootwait\n"
+        mode: "0644"
+      vars:
+        _tmp: "{{ lookup('env', 'MOLECULE_EPHEMERAL_DIRECTORY') | default('/tmp', true) }}"
+
+    - name: Add the cgroup tokens
+      ansible.builtin.command:
+        cmd: >-
+          {{ ansible_playbook_python }} {{ _script }}
+          --file {{ _tmp }}/cmdline.txt
+          --set cgroup_enable=memory --set cgroup_memory=1 --remove cgroup_disable
+      vars:
+        _tmp: "{{ lookup('env', 'MOLECULE_EPHEMERAL_DIRECTORY') | default('/tmp', true) }}"
+      register: first
+      changed_when: false
+
+    - name: A second identical run must be a no-op
+      ansible.builtin.command:
+        cmd: >-
+          {{ ansible_playbook_python }} {{ _script }}
+          --file {{ _tmp }}/cmdline.txt
+          --set cgroup_enable=memory --set cgroup_memory=1 --remove cgroup_disable
+      vars:
+        _tmp: "{{ lookup('env', 'MOLECULE_EPHEMERAL_DIRECTORY') | default('/tmp', true) }}"
+      register: second
+      changed_when: false
+
+    - name: Read the result back
+      ansible.builtin.slurp:
+        src: "{{ _tmp }}/cmdline.txt"
+      vars:
+        _tmp: "{{ lookup('env', 'MOLECULE_EPHEMERAL_DIRECTORY') | default('/tmp', true) }}"
+      register: final
+
+    - name: The edit must be correct, idempotent, and still ONE line
+      ansible.builtin.assert:
+        that:
+          - "'CHANGED' in first.stdout"
+          - "'UNCHANGED' in second.stdout"
+          # the new tokens landed
+          - "'cgroup_enable=memory' in _content"
+          - "'cgroup_memory=1' in _content"
+          # the original tokens survived — including root=PARTUUID=, whose VALUE contains '='
+          - "'root=PARTUUID=deadbeef-02' in _content"
+          - "'rootwait' in _content"
+          - "'rootfstype=ext4' in _content"
+          # ONE line: the firmware silently ignores a second one, so an appended token would look
+          # applied and do nothing at all
+          - _content.strip().splitlines() | length == 1
+        fail_msg: "cmdline edit wrong: {{ _content }}"
+        success_msg: "cmdline edited correctly, idempotently, and remains a single line."
+        quiet: true
+      vars:
+        _content: "{{ final.content | b64decode }}"
+
+    - name: A substring must not be mistaken for a token
+      # `panic=10` must not match inside `nopanic=1`, and `root=` must not clobber `rootwait`.
+      # Both are one-character-away mistakes that would rewrite the wrong kernel parameter.
+      ansible.builtin.command:
+        cmd: >-
+          {{ ansible_playbook_python }} -c
+          "import sys; sys.path.insert(0, '{{ playbook_dir }}/../../files');
+          from rpi_cmdline import apply_changes;
+          print(' '.join(apply_changes(['console=serial0','nopanic=1','rootwait'], ['panic=10'], [])))"
+      register: substr
+      changed_when: false
+
+    - name: nopanic and rootwait must both survive
+      ansible.builtin.assert:
+        that:
+          - "'nopanic=1' in substr.stdout"
+          - "'rootwait' in substr.stdout"
+          - "'panic=10' in substr.stdout"
+        fail_msg: "token matching hit a substring: {{ substr.stdout }}"
+        success_msg: "Tokens are matched whole; nopanic=1 and rootwait are untouched."
+        quiet: true

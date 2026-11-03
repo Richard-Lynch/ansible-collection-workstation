@@ -1,0 +1,135 @@
+---
+# ENTRYPOINT: download a BIOS image and verify it against ASUS's published SHA-256.
+#
+# THE CHECKSUM IS THE POINT. A truncated or corrupted BIOS image bricks the board, and the
+# corruption is silent — the file looks fine until the flash fails partway. ASUS publishes a
+# SHA-256 for every version, so there is no reason to accept an unverified one.
+#
+# Verification is delegated to utils_file_download, which passes the hash to get_url; get_url
+# computes the digest after transfer and DELETES the file on mismatch, so a bad download cannot
+# be left lying around to be flashed later by mistake.
+#
+# GENERATE-DON'T-APPLY: reports what it would fetch and stops unless asus_bios_apply=true.
+
+- name: Apply role defaults
+  ansible.builtin.include_tasks: setup_vars.yml
+
+- name: Select the requested version from the pinned table
+  ansible.builtin.set_fact:
+    _bios: >-
+      {{ (asus_bios_versions | selectattr('version', 'equalto', asus_bios_version | string) | list | first)
+         | default({}) }}
+
+- name: Assert the version is one we hold a checksum for
+  # No checksum, no download. An unverified BIOS is exactly what this role exists to avoid, so a
+  # version absent from the table is a hard stop rather than a fallback to unverified fetching.
+  ansible.builtin.assert:
+    that:
+      - _bios | length > 0
+      - _bios.sha256 | default('') | length == 64
+    fail_msg: >-
+      No pinned checksum for version '{{ asus_bios_version }}'.
+      Known: {{ asus_bios_versions | map(attribute='version') | join(', ') }}.
+      Add the version and its ASUS-published SHA-256 to the role rather than downloading it
+      unverified — a corrupted BIOS image bricks the board.
+    quiet: true
+
+- name: Refuse a beta unless explicitly allowed
+  # Beta firmware on a machine you depend on is a deliberate choice, not a default. Combined with
+  # ASUS's "cannot be rolled back" flag on several versions, an accidental beta flash is
+  # permanent.
+  ansible.builtin.assert:
+    that:
+      - not (_bios.beta | default(false)) or (asus_bios_allow_beta | bool)
+    fail_msg: >-
+      Version {{ _bios.version }} is a BETA release and asus_bios_allow_beta is false.
+      Several versions of this BIOS cannot be rolled back once flashed, so a beta is a one-way
+      door. Pass asus_bios_allow_beta=true if that is genuinely what you want.
+    quiet: true
+
+- name: Refuse a version whose download URL is known-bad
+  # A pinned URL that 404s is worse than an absent one: it looks authoritative. Verified by HEAD
+  # when the table was built, and the failures are flagged rather than silently carried.
+  ansible.builtin.assert:
+    that:
+      - not (_bios.url_unverified | default(false))
+    fail_msg: >-
+      Version {{ _bios.version }} has no verified download URL — ASUS serves it from a path the
+      pinned pattern does not match (HTTP 404 when last checked). Find the real URL on
+      {{ asus_bios_support_url }} and update the role before using this version.
+    quiet: true
+
+- name: Report the plan
+  ansible.builtin.debug:
+    msg: >-
+      {{ 'Downloading' if (asus_bios_apply | bool) else 'WOULD download' }}
+      BIOS {{ _bios.version }}{{ ' [BETA]' if _bios.beta | default(false) else '' }}
+      ({{ _bios.released }}, {{ _bios.size }}) for {{ asus_bios_board }}
+      to {{ asus_bios_dest }}, verifying sha256:{{ _bios.sha256[:16] }}...
+      {{ _bios.notes }}
+      {{ 'THIS VERSION CANNOT BE ROLLED BACK once flashed.' if _bios.no_rollback | default(false) else '' }}
+      {{ '' if (asus_bios_apply | bool) else 'Re-run with asus_bios_apply=true.' }}
+
+- name: Ensure the destination directory exists
+  ansible.builtin.file:
+    path: "{{ asus_bios_dest | dirname }}"
+    state: directory
+    mode: "0755"
+  when: asus_bios_apply | bool
+
+- name: Download and verify the BIOS image
+  # Reuses the repo's shared downloader rather than a bare get_url, so the checksum handling and
+  # caching behaviour stay in one place. file_download_checksum was added to that role for
+  # exactly this use.
+  ansible.builtin.include_role:
+    name: richard_lynch.common.utils_file_download
+  vars:
+    file_download_url: "{{ _bios.url }}"
+    file_download_path: "{{ asus_bios_dest }}"
+    file_download_checksum: "sha256:{{ _bios.sha256 | lower }}"
+    file_download_ttl_days: 3650
+    file_download_timeout: 300
+  when: asus_bios_apply | bool
+
+- name: Read back the downloaded file
+  # get_url already verified and would have deleted a bad file, so this confirms the file EXISTS
+  # and is the expected size — catching the case where the download silently did not happen at
+  # all (a TTL skip, a stale cache) rather than happening wrongly.
+  ansible.builtin.stat:
+    path: "{{ asus_bios_dest }}"
+    checksum_algorithm: sha256
+    get_checksum: true
+  register: _bios_stat
+  when: asus_bios_apply | bool
+
+- name: Assert the verified image is in place
+  ansible.builtin.assert:
+    that:
+      - _bios_stat.stat.exists
+      - _bios_stat.stat.checksum | lower == _bios.sha256 | lower
+    fail_msg: >-
+      {{ asus_bios_dest }} is missing or does not match ASUS's published checksum.
+      got={{ _bios_stat.stat.checksum | default('(absent)') }}
+      want={{ _bios.sha256 | lower }}
+      Do NOT flash this file.
+    quiet: true
+  when: asus_bios_apply | bool
+
+- name: Explain the flashing steps
+  ansible.builtin.debug:
+    msg: "{{ _steps.splitlines() }}"
+  when: asus_bios_apply | bool
+  vars:
+    _steps: |
+      BIOS {{ _bios.version }} downloaded and SHA-256 verified against ASUS's published value.
+
+      To flash:
+        EZ Flash 3 (in-BIOS, needs working CPU/RAM):
+          keep the filename as-is, boot to BIOS, Advanced Mode > Tool > ASUS EZ Flash 3.
+        BIOS FlashBack (works with NO CPU/RAM/GPU):
+          rename with ASUS's BIOSRenamer utility, use the dedicated rear USB port,
+          hold the FlashBack button ~3s, wait for the light to stop blinking.
+
+      Do not cut power during the flash.
+      AFTER flashing, firmware settings are typically reset — re-check EXPO, AHCI, ReBAR,
+      Above 4G Decoding and Secure Boot.

@@ -1,0 +1,71 @@
+---
+# ENTRYPOINT: confirm this board's ASUS ProductID from the live search API.
+#
+# WHY IT MATTERS ENOUGH TO HAVE ITS OWN ENTRYPOINT. ASUS sells SEVEN near-identical B850M boards,
+# including both "TUF GAMING B850M-PLUS WIFI7" and "TUF GAMING B850M-PLUS WIFI7 W" — different
+# products with different ProductIDs (33373 and 32356 respectively) and different firmware. The
+# single-character difference in the name is the whole distinction, and flashing one board's BIOS
+# onto another is how a motherboard dies.
+#
+# So the ID is not left as a comment in a variable file: this verifies it against ASUS's own
+# search API, which — unlike their BIOS endpoint — does honour its query.
+#
+# Read-only. Fails loudly on a mismatch rather than proceeding with a guess.
+
+- name: Apply role defaults
+  ansible.builtin.include_tasks: setup_vars.yml
+
+- name: Query the ASUS product search API
+  # The one ASUS endpoint that reliably answers a query. SearchType/PageSize/Pages are all
+  # required — the API returns a 400 naming them if any is missing.
+  ansible.builtin.uri:
+    url: >-
+      https://odinapi.asus.com/recent-data/apiv2/SearchResult?SystemCode=asus&WebsiteCode=uk&SearchKey={{ asus_bios_board | urlencode }}&SearchType=products&PageSize=20&Pages=1
+    return_content: true
+    headers:
+      User-Agent: Mozilla/5.0
+  register: _asus_search
+  changed_when: false
+
+- name: Extract the matching products
+  # Names come back wrapped in <h2> tags, so they are stripped before comparison. Matched on the
+  # EXACT name: a substring match would make "…WIFI7" match "…WIFI7 W" and reintroduce precisely
+  # the confusion this entrypoint exists to prevent.
+  ansible.builtin.set_fact:
+    _asus_matches: >-
+      {{ (_asus_search.content | from_json).Result.List
+         | map('combine', {}) | list
+         | selectattr('Name', 'defined')
+         | map('combine', {}) | list }}
+
+- name: Find this exact board
+  ansible.builtin.set_fact:
+    _asus_exact: >-
+      {{ _asus_matches
+         | selectattr('Name', 'search', '^<h2>' ~ (asus_bios_board | regex_escape) ~ '</h2>$')
+         | list }}
+
+- name: Report what the API says
+  ansible.builtin.debug:
+    msg: >-
+      {{ (_asus_matches | length) }} B850M-family product(s) returned;
+      exact matches for '{{ asus_bios_board }}':
+      {{ _asus_exact | map(attribute='ProductID') | list }}
+      (pinned: {{ asus_bios_product_id }})
+
+- name: Assert the pinned ProductID still matches the vendor
+  # A pinned ID that has silently drifted from the vendor's is the failure this guards. Fails
+  # rather than warns: every download path keys off this ID, and a wrong one means another
+  # board's firmware.
+  ansible.builtin.assert:
+    that:
+      - _asus_exact | length == 1
+      - (_asus_exact | first).ProductID | int == asus_bios_product_id | int
+    fail_msg: >-
+      ProductID mismatch for '{{ asus_bios_board }}'.
+      pinned={{ asus_bios_product_id }}
+      vendor={{ _asus_exact | map(attribute='ProductID') | list | default('(no exact match)') }}
+      matches={{ _asus_exact | length }}.
+      ASUS sells several near-identical B850M variants — confirm the exact board name before
+      changing the pinned ID, and never flash firmware for a variant you have not confirmed.
+    quiet: true

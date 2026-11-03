@@ -1,0 +1,111 @@
+---
+# ENTRYPOINT: survey a machine's thermal hardware and PROPOSE fand inventory for it.
+#
+#   include_role: {name: config_fan_control, tasks_from: discover}
+#
+# THE ONBOARDING STEP. Without it, adopting a new machine means reading sysfs by hand and
+# transcribing chip names, labels, limits and PCI paths into inventory — slow, error-prone, and
+# repeated for every machine.
+#
+# IT PROPOSES; IT DOES NOT DECIDE. Three things it cannot know, and says so in its own output
+# rather than guessing:
+#
+#   * which header drives which fan — the kernel numbers headers in Super-I/O order and knows
+#     nothing about the case;
+#   * which header is a PUMP — getting this wrong is dangerous, so every group is emitted
+#     COMMENTED OUT and the pump list is empty with a warning;
+#   * what is audible — there is no sensor for noise, so pwm_min/pwm_max are placeholders that
+#     name the measurement play.
+#
+# Config that looked finished would be worse than config that obviously is not.
+#
+# Writes nothing to the target beyond the helper itself; reads sysfs only.
+
+- name: Apply role defaults
+  ansible.builtin.include_tasks: setup_vars.yml
+
+- name: HARD GATE — an absolute controller path for the draft is declared
+  ansible.builtin.assert:
+    that:
+      - fand_discover_output is defined
+      - fand_discover_output is match('/')
+    fail_msg: >-
+      fand_discover_save is true but fand_discover_output is not an absolute path on the
+      controller. Declare it (the role has no default for where a draft lands).
+    quiet: true
+  when: fand_discover_save | bool
+
+- name: Try to load common Super-I/O sensor modules
+  # Without one of these the fan headers do not exist in sysfs at all, and the survey would
+  # report "no controllable headers" when the truth is "the module is not loaded".
+  ansible.builtin.command:
+    argv: [modprobe, "{{ item }}"]
+  become: true
+  register: _fand_modprobe
+  changed_when: _fand_modprobe.rc == 0
+  failed_when: false
+  loop: "{{ fand_discover_modules }}"
+
+- name: Install the discovery helper
+  ansible.builtin.copy:
+    src: fand-discover
+    dest: "{{ fand_discover_path }}"
+    mode: "0755"
+  become: true
+
+- name: Survey the hardware
+  ansible.builtin.command:
+    argv: ["{{ fand_python }}", "{{ fand_discover_path }}"]
+  become: true
+  register: _fand_discover
+  changed_when: false
+
+- name: Show the proposed configuration
+  ansible.builtin.debug:
+    msg: "{{ _fand_discover.stdout_lines }}"
+
+- name: Save it locally for editing
+  # Written to the controller, not the target: it is a draft destined for inventory, and
+  # leaving it on the machine would invite someone to treat it as live config.
+  #
+  # The path is ABSOLUTE. `delegate_to: localhost` resolves a relative dest against the PLAYBOOK
+  # directory rather than the working directory, so a bare './fand-discovered.yml' lands in
+  # the playbook's directory while the play reports success — a draft written somewhere nobody
+  # would look is worse than no draft at all.
+  ansible.builtin.copy:
+    content: "{{ _fand_discover.stdout }}\n"
+    dest: "{{ fand_discover_output }}"
+    mode: "0644"
+  delegate_to: localhost
+  become: false
+  when: fand_discover_save | bool
+
+- name: Confirm the draft actually landed where it was meant to
+  # The failure this catches wrote a real file, to the wrong place, and reported ok. A path that
+  # is merely ASKED for is not a path that was written.
+  ansible.builtin.stat:
+    path: "{{ fand_discover_output }}"
+  delegate_to: localhost
+  become: false
+  register: _fand_draft
+  when: fand_discover_save | bool
+
+- name: The draft must exist and be non-empty
+  ansible.builtin.assert:
+    that:
+      - _fand_draft.stat.exists
+      - _fand_draft.stat.size > 0
+    fail_msg: "Draft was not written to {{ fand_discover_output }}"
+    success_msg: "Draft written to {{ fand_discover_output }} ({{ _fand_draft.stat.size }} bytes)"
+    quiet: true
+  when: fand_discover_save | bool
+
+- name: Where it went, and what to do next
+  ansible.builtin.debug:
+    msg:
+      - "Draft saved to {{ fand_discover_output }}"
+      - "NEXT: identify the pump, map headers to fans, then measure stall and noise."
+      - "  headers one at a time : hold one header at a fixed duty and listen"
+      - "  stall + noise sweep   : sweep each header's duty and record RPM"
+      - "Then paste the edited block into the host's inventory entry."
+  when: fand_discover_save | bool

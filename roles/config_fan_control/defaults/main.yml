@@ -1,0 +1,127 @@
+---
+# AUTO-GENERATED defaults file — DO NOT EDIT.
+#
+# Source of truth: roles/config_fan_control/meta/argument_specs.py
+# Regenerate:      venv/bin/python tools/argspec/cli.py x generate config_fan_control
+#
+# Edits here are silently overwritten on the next generation. To change a value or its
+# documentation, change the OptionSpec in the source file above — descriptions there
+# are emitted as the comments in this file.
+# Entrypoint:      main
+
+# Gate. Without it the role validates the config against the live
+# hardware and reports, writing nothing and starting nothing.
+fand_apply__default: false
+
+# Whether the service should be running. Setting false stops and
+# disables it, which releases every header to the hardware curve —
+# the safe direction.
+fand_enabled__default: true
+
+# Ancillary sysfs readings collected for CONTEXT, not control:
+# {name: {path, scale, unit}}. A fan graph alone cannot answer 'why did
+# it ramp?' — GPU power, utilisation, VRAM, clocks and the card's own
+# fan are what turn a speed change into an explanation.
+# Paths rather than hardcoded readings, so another machine collects a
+# different set without touching the daemon.
+fand_extra_metrics__default: {}
+
+# Headers driving a pump. The daemon REFUSES to control these: driving
+# a pump from a fan curve risks cavitation and loss of coolant flow,
+# and a pump's RPM says nothing about whether coolant is moving.
+fand_pump_headers__default: []
+
+# Seconds between control steps.
+fand_interval__default: 3.0
+
+# How fast duty rises toward a higher demand, 0-1. Default 1.0 (immediate)
+# because thermal safety takes priority on the way up.
+fand_rise_rate__default: 1.0
+
+# How fast duty falls toward a lower demand, 0-1. Deliberately slow: fans
+# that chase transients are worse than steady noise, because variation is
+# what the ear catches.
+fand_fall_rate__default: 0.08
+
+# Duty change below this is not written at all.
+fand_deadband_pwm__default: 3
+
+# Consecutive read failures before a sensor counts as lost. Below this
+# the last good demand is held — one bad poll is not a reason to act.
+fand_sensor_fail_tolerance__default: 5
+
+# On sensor loss the group is released to the hardware curve AND the
+# curve's low points raised to at least this. The chip's curve only
+# follows CPU temperature, so a lost GPU sensor would otherwise let it
+# run quiet while the GPU cooks.
+fand_failsafe_floor_pwm__default: 140
+
+# systemd watchdog. Catches a hung-but-alive daemon, which neither
+# ExecStop nor ExecStopPost would ever fire for.
+fand_watchdog_sec__default: 30
+
+# Where the daemon is installed.
+fand_path__default: /usr/local/bin/fand
+
+# Where the rendered config is written.
+fand_config_path__default: /etc/fand.json
+
+# Prometheus textfile output. Costs nothing on a host with no scraper —
+# the file simply waits until Alloy's unix exporter is deployed.
+fand_metrics_path__default: /var/lib/node_exporter/textfile_collector/fand.prom
+
+# One load test: `load_command` (argv), `sensors` (which to watch),
+# `abort_above` (a list of {sensor, celsius} — REQUIRED, a load test
+# with no abort temperature is just a way to overheat a machine on a
+# timer), and optional `cooldown_samples` and `container`.
+# `container` names an image to run the load in, rather than layering a
+# tool onto an image-based OS where it would slow every update and
+# re-resolve on each rebase.
+# Declared per test in its own play, because what stresses a GPU and
+# what stresses an NVMe have nothing in common.
+fand_loadtest__default: {}
+
+# Short name for this test, used in the result filenames so two tests do
+# not overwrite each other's timeline.
+fand_loadtest_name__default: run
+
+# Gate. Without it the test reports and verifies wiring only.
+fand_loadtest_apply__default: false
+
+# Maximum seconds of load. An abort can end it sooner.
+fand_loadtest_duration__default: 180
+
+# Seconds between samples. Also the abort-check period.
+fand_loadtest_interval__default: 2.0
+
+# Where the harness is installed on the target.
+fand_loadtest_path__default: /usr/local/bin/fand-loadtest
+
+# Where the rendered test config is written.
+fand_loadtest_config__default: /etc/fand-loadtest.json
+
+# Where the timeline is written on the target.
+fand_loadtest_results__default: /var/tmp/fand-loadtest-{{ fand_loadtest_name | default('run') }}.json
+
+# Where the discovery helper is installed on the target.
+fand_discover_path__default: /usr/local/bin/fand-discover
+
+# Write the draft to fand_discover_output as well as printing it.
+fand_discover_save__default: true
+
+# Sensor modules to try loading before surveying. Without a Super-I/O
+# module the fan headers do not exist in sysfs, and the survey would
+# report no controllable headers when the module simply was not loaded.
+fand_discover_modules__default:
+  - nct6775
+  - it87
+  - coretemp
+  - k10temp
+  - drivetemp
+  - spd5118
+
+# Interpreter for the daemon. Stdlib only; no packages needed.
+fand_python__default: /usr/bin/python3
+
+# systemd unit name.
+fand_unit__default: fand.service

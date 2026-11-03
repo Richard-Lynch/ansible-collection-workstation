@@ -1,0 +1,59 @@
+---
+# DISPATCHER. Selects an entrypoint by `rpi_boot_action`, for callers who prefer that to
+# tasks_from.
+#
+#   probe          what this board is, what it boots from, what is attached   (read-only)
+#   eeprom_report  decode BOOT_ORDER into plain English                       (read-only)
+#   eeprom         converge the EEPROM boot order                             (writes firmware)
+#   provision_ssd  image + seed the SSD from the pinned OS image              (DESTROYS the SSD)
+#   harden_sd      make the rescue card read-only (overlayfs)                 (writes)
+#   watchdog       arm the hardware watchdog + panic= reboot                  (writes)
+#   verify         post-reboot: is root really the SSD, is the card sealed    (read-only)
+#   rollback       BOOT_ORDER back to SD-first; disarm the watchdog           (writes)
+#
+# RUN `probe` FIRST on a new board. The EEPROM setting is a property of the BOARD, not of either
+# disk — it survives re-imaging both — so a second-hand or previously-tinkered-with Pi can carry
+# anything, and assuming otherwise is how a fleet ends up with two machines that boot differently
+# from identical media.
+#
+# THE ORDER THE ACTIONS ARE LISTED IN IS NOT THE ORDER TO RUN THEM IN. The correct sequence is
+#
+#   probe -> (reservation) -> [service deployment, by another role] -> harden_sd -> provision_ssd
+#            -> eeprom -> reboot -> verify -> watchdog
+#
+# and two parts of that are counter-intuitive enough to be worth stating here, because getting
+# either wrong is silent:
+#
+#   * harden_sd runs BEFORE the migration, while the SD is still the running root. Overlayfs is
+#     enabled against the RUNNING system; run it afterwards and it hardens the SSD instead, which
+#     destroys the primary system's persistence while every assertion still passes.
+#   * eeprom runs AFTER the SSD is verified. Once the SSD holds loadable boot files the firmware
+#     stops falling back to the card, so USB-first plus a half-provisioned SSD is a dark Pi whose
+#     rescue path has been preempted.
+#
+# Both are enforced by the actions themselves where possible (harden_sd refuses to touch the
+# current root's disk), because ordering documented in a comment is ordering a human can get
+# wrong at 1am.
+
+- name: Resolve declared options over their generated defaults
+  ansible.builtin.include_tasks: _resolve_defaults.yml
+
+- name: Enforce the constraints Ansible cannot
+  # Numeric ranges, notably the watchdog's <= 15s hardware ceiling. Generated from
+  # meta/argument_specs.py so the bound is declared once rather than drifting between the
+  # interface and a hand-written assert.
+  ansible.builtin.include_tasks: _argspec_guards.yml
+
+- name: Assert a known action was requested
+  ansible.builtin.assert:
+    that:
+      - rpi_boot_action in _actions
+    fail_msg: >-
+      Unknown rpi_boot_action '{{ rpi_boot_action | default('(unset)') }}'.
+      Choose one of: {{ _actions | join(', ') }}.
+    quiet: true
+  vars:
+    _actions: [probe, eeprom_report, eeprom, provision_ssd, harden_sd, watchdog, verify, rollback]
+
+- name: Run the requested action
+  ansible.builtin.include_tasks: "{{ rpi_boot_action }}.yml"

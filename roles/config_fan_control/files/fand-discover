@@ -1,0 +1,318 @@
+#!/usr/bin/env python3
+"""Survey a machine's thermal hardware and PROPOSE fand inventory for it.
+
+WHAT THIS IS FOR. Onboarding a new machine otherwise means reading sysfs by hand and
+transcribing it — slow, error-prone, and repeated for every machine.
+
+WHAT IT CANNOT KNOW, and says so rather than guessing:
+
+  * WHICH HEADER DRIVES WHICH FAN. The kernel numbers headers in Super-I/O order and knows
+    nothing about the case. Only a human looking at the machine (or driving one header at a
+    time and listening) can map header -> location.
+  * WHICH HEADER IS A PUMP. Getting this wrong is dangerous: a pump driven down a fan curve can
+    cavitate and lose coolant flow, and its RPM says nothing about whether coolant is moving.
+    So every spinning header is emitted COMMENTED OUT with a warning, never as ready config.
+  * WHAT IS AUDIBLE. There is no sensor for noise. pwm_min/pwm_max are emitted as placeholders
+    with the measurement play named.
+
+So the output is a STARTING POINT that must be edited, and it is written to say so. Proposing
+config that looks finished would be worse than proposing none.
+
+Writes nothing. Reads sysfs only.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import pathlib
+import sys
+
+HWMON = pathlib.Path("/sys/class/hwmon")
+
+# Sensors worth driving fans from, with a sane starting shape per kind. These are STARTING
+# POINTS keyed on what the component is, not measurements of any particular machine.
+#
+#   gamma > 1  flat through the low range, hard ramp near the top  (GPUs: lots of thermal mass,
+#              and nothing needs airflow at 50C)
+#   gamma < 1  ramps early                                          (NVMe: the throttle is
+#              abrupt, so intervene before it is close)
+KNOWN = {
+    "amdgpu": {"floor": 45, "headroom": 10, "gamma": 1.6, "why": "GPU"},
+    "nvidia": {"floor": 45, "headroom": 10, "gamma": 1.6, "why": "GPU"},
+    "k10temp": {"floor": 50, "ceiling": 88, "gamma": 1.4, "why": "AMD CPU (throttles ~95)"},
+    "coretemp": {"floor": 50, "ceiling": 90, "gamma": 1.4, "why": "Intel CPU"},
+    "zenpower": {"floor": 50, "ceiling": 88, "gamma": 1.4, "why": "AMD CPU"},
+    "nvme": {"floor": 40, "headroom": 6, "gamma": 0.8, "why": "NVMe — abrupt throttle"},
+    "drivetemp": {"floor": 35, "ceiling": 55, "gamma": 1.0, "why": "SATA drive"},
+    "spd5118": {"floor": 40, "ceiling": 70, "gamma": 1.0, "why": "DIMM"},
+}
+
+SUPERIO = ("nct6", "it87", "nzxt", "f71", "w836")
+
+
+def read(path: pathlib.Path) -> str | None:
+    try:
+        return path.read_text().strip()
+    except OSError:
+        return None
+
+
+def temp_limits(stem: str) -> dict[str, float]:
+    """The limits the hardware itself declares. These anchor a ceiling to something real."""
+    out = {}
+    for attr in ("crit", "emergency", "max"):
+        raw = read(pathlib.Path(f"{stem}_{attr}"))
+        if raw is None:
+            continue
+        try:
+            value = int(raw) / 1000.0
+        except ValueError:
+            continue
+        # Drivers park unset limits at absurd values (some NVMe drives report max=65261850C).
+        if 0 < value < 200:
+            out[attr] = value
+    return out
+
+
+def survey() -> dict:
+    chips: list[dict] = []
+    for hw in sorted(HWMON.glob("hwmon*")):
+        name = read(hw / "name")
+        if not name:
+            continue
+        real = str(hw.resolve())
+        entry: dict = {
+            "chip": name,
+            "path": real,
+            "hwmon": hw.name,
+            "temps": [],
+            "pwms": [],
+            "fans": [],
+        }
+
+        for inp in sorted(hw.glob("temp*_input")):
+            idx = "".join(c for c in inp.name if c.isdigit())
+            stem = str(inp).replace("_input", "")
+            raw = read(inp)
+            entry["temps"].append(
+                {
+                    "index": int(idx),
+                    "label": read(pathlib.Path(f"{stem}_label")),
+                    "celsius": (int(raw) / 1000.0) if raw and raw.lstrip("-").isdigit() else None,
+                    "limits": temp_limits(stem),
+                }
+            )
+
+        for pwm in sorted(hw.glob("pwm[0-9]")):
+            idx = int("".join(c for c in pwm.name if c.isdigit()))
+            rpm_raw = read(hw / f"fan{idx}_input")
+            entry["pwms"].append(
+                {
+                    "index": idx,
+                    "duty": read(pwm),
+                    "mode": read(hw / f"pwm{idx}_enable"),
+                    "rpm": int(rpm_raw) if rpm_raw and rpm_raw.isdigit() else None,
+                    "writable": os_access(pwm),
+                }
+            )
+
+        for fan in sorted(hw.glob("fan[0-9]_input")):
+            idx = int("".join(c for c in fan.name if c.isdigit()))
+            raw = read(fan)
+            entry["fans"].append(
+                {
+                    "index": idx,
+                    "rpm": int(raw) if raw and raw.isdigit() else None,
+                    "has_pwm": (hw / f"pwm{idx}").exists(),
+                }
+            )
+        chips.append(entry)
+    return {"chips": chips}
+
+
+def os_access(path: pathlib.Path) -> bool:
+    try:
+        return path.stat().st_mode & 0o200 != 0
+    except OSError:
+        return False
+
+
+def duplicate_chips(chips: list[dict]) -> set[str]:
+    seen: dict[str, int] = {}
+    for c in chips:
+        seen[c["chip"]] = seen.get(c["chip"], 0) + 1
+    return {name for name, n in seen.items() if n > 1}
+
+
+def propose(data: dict) -> str:
+    """Render survey results as inventory YAML — explicitly a DRAFT, not finished config."""
+    chips = data["chips"]
+    dupes = duplicate_chips(chips)
+    out: list[str] = []
+    w = out.append
+
+    w("# ===========================================================================")
+    w("# DRAFT fand configuration — generated by `fand-discover`. NOT ready to use.")
+    w("#")
+    w("# Three things this could not know, each of which you must fill in:")
+    w("#   1. which header drives which fan (the kernel knows nothing about the case)")
+    w("#   2. which header is a PUMP — driving one down a fan curve can cavitate it")
+    w("#   3. what is audible — there is no sensor for noise")
+    w("# ===========================================================================")
+    w("")
+
+    superio = [c for c in chips if c["chip"].lower().startswith(SUPERIO)]
+    if not superio:
+        w("# NO SUPER-I/O CHIP FOUND. Without one there are no controllable fan headers.")
+        w("# Is the driver loaded? On most boards: modprobe nct6775")
+        w("")
+    else:
+        w(f"fand_chip: {superio[0]['chip']}")
+        if len(superio) > 1:
+            names = ", ".join(c["chip"] for c in superio)
+            w(f"# NOTE: {len(superio)} Super-I/O chips found ({names}); the first is assumed.")
+        w("")
+
+    # ---- sensors ----
+    w("fand_sensors:")
+    proposed = 0
+    used_names: set[str] = set()
+    for chip in chips:
+        kind = KNOWN.get(chip["chip"])
+        if not kind:
+            continue
+        for temp in chip["temps"]:
+            if temp["celsius"] is None:
+                continue
+            # A channel reading exactly 0 is almost always an unpopulated one (boards commonly
+            # report unused PCH_* channels as 0), not a component at freezing point.
+            if temp["celsius"] == 0:
+                continue
+            limits = temp["limits"]
+            ceiling = kind.get("ceiling")
+            source = "no declared limit — CHECK THIS against the vendor spec"
+            if ceiling is None and limits:
+                hard = min(limits.values())
+                ceiling = int(hard - kind.get("headroom", 10))
+                source = f"hardware declares {', '.join(f'{k} {v:g}C' for k, v in sorted(limits.items()))}"
+            if ceiling is None:
+                ceiling = 85
+
+            label = temp["label"]
+            slug = (label or f"temp{temp['index']}").lower().replace(" ", "_").replace("/", "_")
+            name = f"{chip['chip'].replace('-', '_')}_{slug}"
+            # Two chips of the same name produce the same sensor name for the same label --
+            # a dGPU and an iGPU both offer `edge`. A duplicate key would be silently
+            # collapsed by YAML, so the iGPU could masquerade as the discrete card. Suffix with
+            # the PCI slot, which is what distinguishes them.
+            if name in used_names:
+                leaf = chip["path"].split("/")[-3] if "/" in chip["path"] else chip["hwmon"]
+                name = f"{name}_{leaf.replace(':', '_').replace('.', '_')}"
+            used_names.add(name)
+
+            w(f"  - name: {name}")
+            w(f"    chip: {chip['chip']}")
+            if label:
+                w(f"    label: {label}")
+            else:
+                w(f"    index: {temp['index']}    # no label on this channel")
+            if chip["chip"] in dupes:
+                # The disambiguation is not optional: the daemon REFUSES to start rather than
+                # pick between two same-named chips, because picking wrong reads plausibly.
+                leaf = chip["path"].split("/")[-3] if "/" in chip["path"] else chip["path"]
+                w(
+                    f'    path_contains: "{leaf}"    # REQUIRED: {len(dupes)} chips named '
+                    f"{chip['chip']}; verify this is the right one"
+                )
+            w(f"    floor: {kind['floor']}")
+            w(f"    ceiling: {ceiling}    # {source}")
+            w(f"    gamma: {kind['gamma']}")
+            w(f"    # {kind['why']}; reads {temp['celsius']:.0f}C now")
+            proposed += 1
+    if not proposed:
+        w("  []  # nothing recognised — see the survey below and add sensors by hand")
+    w("")
+
+    # ---- groups ----
+    w("# ---------------------------------------------------------------------------")
+    w("# FAN GROUPS — every one is commented out, deliberately.")
+    w("#")
+    w("# Uncomment a header only once you know what it drives. To find out, run ONE")
+    w("# header at a time and listen:")
+    w("#   (hold one header at a fixed duty and listen)")
+    w("#")
+    w("# A header with rpm=0 may be EMPTY, or may have a fan whose tacho is not")
+    w("# connected — those read identically. Drive it to 100% and listen before")
+    w("# concluding it is empty.")
+    w("#")
+    w("# pwm_min MUST clear the stall duty, and pwm_max should sit below what you find")
+    w("# annoying. Measure both:")
+    w("#   (sweep each header's duty and record RPM)")
+    w("# ---------------------------------------------------------------------------")
+    w("# fand_groups:")
+    for chip in superio:
+        for pwm in chip["pwms"]:
+            rpm = pwm["rpm"]
+            state = (
+                f"spinning at {rpm} RPM"
+                if rpm
+                else "rpm=0 — EMPTY, or a fan with no tacho (drive it and listen)"
+            )
+            w(f"#   - name: CHANGEME_hdr{pwm['index']}")
+            w(f"#     header: {pwm['index']}")
+            w(f"#     chip: {chip['chip']}")
+            w("#     sensors: [CHANGEME]")
+            w("#     pwm_min: 51      # ~20% — MEASURE the stall point, do not assume")
+            w("#     pwm_max: 191     # ~75% — MEASURE what is too loud")
+            w(
+                f"#     # currently {state}; duty {pwm['duty']}, mode {pwm['mode']}"
+                f"{'' if pwm['writable'] else ', NOT WRITABLE'}"
+            )
+    w("")
+    w("# fand_pump_headers: []   # <- IDENTIFY THE PUMP AND LIST IT HERE BEFORE APPLYING.")
+    w("#   A pump driven down a fan curve can cavitate and lose coolant flow, and its RPM")
+    w("#   tells you nothing about whether coolant is moving. The usual tell is the header")
+    w("#   with the highest steady RPM and a flat factory curve. Confirm in the BIOS fan")
+    w("#   page, where headers are named (AIO_PUMP / CPU_FAN / CHA_FAN*).")
+    w("")
+
+    # ---- survey ----
+    w("# ---------------------------------------------------------------------------")
+    w("# FULL SURVEY (what was actually found)")
+    w("# ---------------------------------------------------------------------------")
+    for chip in chips:
+        w(f"# {chip['chip']}  ({chip['hwmon']})")
+        w(f"#   {chip['path']}")
+        for temp in chip["temps"]:
+            lim = ", ".join(f"{k} {v:g}C" for k, v in sorted(temp["limits"].items()))
+            val = f"{temp['celsius']:.1f}C" if temp["celsius"] is not None else "unreadable"
+            w(
+                f"#     temp{temp['index']:<3} {temp['label'] or '(no label)':<32} {val:>10}"
+                f"{('   [' + lim + ']') if lim else ''}"
+            )
+        for fan in chip["fans"]:
+            tag = "" if fan["has_pwm"] else "   (tacho only — no pwm channel)"
+            w(
+                f"#     fan{fan['index']:<4} {fan['rpm'] if fan['rpm'] is not None else '?':>6} RPM{tag}"
+            )
+    return "\n".join(out) + "\n"
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Survey thermal hardware and propose fand inventory."
+    )
+    parser.add_argument("--json", action="store_true", help="emit the raw survey as JSON")
+    args = parser.parse_args()
+
+    data = survey()
+    if args.json:
+        print(json.dumps(data, indent=2))
+    else:
+        print(propose(data), end="")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,74 @@
+---
+# ENTRYPOINT: random-offset small-block I/O test.
+#
+# DESTRUCTIVE: requires usb_media_apply=true.
+#
+# WHAT THIS ADDS over the sequential benchmark. Sequential dd measures the one access pattern
+# flash is best at. A controller can post a healthy 40 MB/s sequential figure and still stall on
+# scattered 4KiB writes, because each one forces a read-modify-write of a much larger erase block.
+# That amplification is invisible to a sequential test.
+#
+# It is also a wear signal: a p99 write latency an order of magnitude above the median usually
+# means the controller is working hard to find clean erase blocks. Reported as an observation
+# rather than folded into the pass/fail verdict, because a single slow outlier means nothing and
+# the threshold is a heuristic.
+#
+# RELEVANCE TO INSTALL MEDIA IS LIMITED, and worth saying plainly: writing a hybrid ISO is purely
+# sequential, so a stick can be perfect for that job and mediocre here. This matters if the stick
+# will later hold a filesystem with many small files.
+
+- name: Apply role defaults
+  ansible.builtin.include_tasks: setup_vars.yml
+
+- name: Resolve and vet the target device
+  ansible.builtin.include_tasks: resolve_device.yml
+
+- name: Require the apply flag for a destructive test
+  ansible.builtin.assert:
+    that:
+      - usb_media_apply | bool
+    fail_msg: >-
+      The random I/O test writes to {{ usb_media_device }} and destroys its contents.
+      Re-run with usb_media_apply=true if that is what you want.
+    quiet: true
+
+- name: Unmount the device before writing
+  ansible.builtin.command:
+    cmd: "{{ usb_media_diskutil }} unmountDisk {{ usb_media_device }}"
+  changed_when: true
+  become: "{{ usb_media_become | bool }}"
+
+- name: Run the random I/O test
+  # Seeded, so a run is reproducible and comparable against a later run on the same device.
+  ansible.builtin.command:
+    cmd: >-
+      {{ usb_media_python }} {{ role_path }}/files/usb_random_io.py
+      {{ _usb_raw }} {{ _usb_dev.TotalSize | int }}
+      {{ usb_media_random_ops | int }} {{ usb_media_random_seed | int }}
+  register: _usb_random
+  changed_when: true
+  become: "{{ usb_media_become | bool }}"
+
+- name: Report the random I/O result
+  ansible.builtin.debug:
+    msg: "{{ (_usb_random.stdout | from_json).report }}"
+
+- name: Deliver the verdict, then leave the device usable either way
+  # block/always so the cleanup runs on failure too — a device that failed its test is the one
+  # you most want handed back in a usable state, not left as raw unpartitioned media.
+  block:
+    - name: Assert every randomly-addressed block returned its own data
+      ansible.builtin.assert:
+        that:
+          - (_usb_random.stdout | from_json).ok | bool
+        fail_msg: >-
+          RANDOM I/O FAILURE on {{ usb_media_device }} — it did not return the bytes written at
+          some random offsets. This is a failing device; do not use it for install media.
+        quiet: true
+
+  always:
+    - name: Leave the device usable again
+      ansible.builtin.include_tasks: reformat.yml
+      when:
+        - usb_media_apply | bool
+        - usb_media_reformat | bool

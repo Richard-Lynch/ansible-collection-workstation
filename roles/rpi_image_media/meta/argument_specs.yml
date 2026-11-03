@@ -1,0 +1,102 @@
+---
+# AUTO-GENERATED argument spec — DO NOT EDIT.
+#
+# Source of truth: roles/rpi_image_media/meta/argument_specs.py
+# Regenerate:      venv/bin/python tools/argspec/cli.py x generate rpi_image_media
+#
+# Edits here are silently overwritten on the next generation. To change a value or its
+# documentation, change the OptionSpec in the source file above — descriptions there
+# are emitted as the comments in this file.
+argument_specs:
+  main:
+    short_description: Seed a written Pi card for a fully headless first boot
+    description:
+      - Runs on the CONTROLLER, not on a Pi.
+      - ''
+      - 'SCOPE: this role seeds ONLY. The usb_media role does the dangerous part — it'
+      - already owns the dd, the four-condition device gate and the post-write
+      - read-back — so re-implementing any of that here would create a second source of
+      - truth for 'is it safe to write to this disk'.
+      - ''
+      - What it adds is the Pi-specific first-boot provisioning that turns a freshly
+      - 'written card into a machine Ansible can reach: a user, an SSH key, a'
+      - hostname, and SSH enabled.
+    version_added: '1.0'
+    author: Collection maintainers
+    options:
+      rpi_image_action:
+        description:
+          - plan   — report every file that would be written (default, writes nothing)
+          - seed   — mount the card's boot partition and write the provisioning files
+          - verify — re-mount and assert each seeded file is present and correct
+        type: str
+        required: false
+        default: plan
+        choices:
+          - plan
+          - seed
+          - verify
+      rpi_image_apply:
+        description: 'Actually write. Default false: report the plan and stop.'
+        type: bool
+        required: false
+        default: false
+      rpi_image_hostname:
+        description:
+          - Hostname seeded onto the card — and the CARD-IDENTITY marker.
+          - 'REQUIRED with no default: a card seeded with the wrong name produces a'
+          - hostname collision in DNS and monitoring that nothing else detects, and
+          - a default would let an undeclared caller create one silently.
+          - Also what makes a card identifiable afterwards, which is the only check
+          - that can tell two otherwise-identical cards apart.
+        type: str
+        required: true
+      rpi_image_user:
+        description:
+          - First-boot username. REQUIRED with no default — a default username is
+          - site config wearing a default's clothing, and makes the role silently
+          - wrong for every other caller.
+        type: str
+        required: true
+      rpi_image_password_hash:
+        description:
+          - The user's password as a CRYPT HASH, never plaintext.
+          - Resolve it at run time from a secret store (for example 1Password via
+          - richard_lynch.common.onepassword_cached). Neither the repo nor the card
+          - should ever hold the plaintext.
+          - no_log because a validation failure would otherwise echo it into the
+          - run log and CI output.
+        type: str
+        required: true
+        no_log: true
+      rpi_image_authorized_key:
+        description:
+          - The SSH PUBLIC key seeded into the user's authorized_keys.
+          - 'PUBLIC only. Nothing private-key-shaped may ever be seeded onto a card:'
+          - an SD card is readable by anyone who physically takes it, and the fact
+          - that a card carries only a hash and a public key is what makes an
+          - SD-based rescue system acceptable at all. The seed step refuses a value
+          - that looks like a private key.
+        type: str
+        required: true
+      rpi_image_boot_mount:
+        description:
+          - Where the card's FAT boot partition is mounted on the controller.
+          - macOS automounts a freshly written Pi image here by its volume label.
+        type: str
+        required: false
+        default: /Volumes/bootfs
+      rpi_image_wifi_ssid:
+        description:
+          - Optional WiFi SSID for a Pi that genuinely cannot be wired.
+          - Ethernet is the expected uplink.
+        type: str
+        required: false
+      rpi_image_wifi_country:
+        description:
+          - "WiFi regulatory domain (ISO 3166 alpha-2, e.g. 'US'). No default: where"
+          - "a device is used is the caller's to say. REQUIRED WHENEVER WIFI IS USED: without a"
+          - country code the radio comes up rfkill-blocked on first boot, so a
+          - headless Pi never appears on the network and nothing on it says why.
+        type: str
+        required: false

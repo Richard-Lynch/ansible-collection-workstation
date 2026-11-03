@@ -1,0 +1,41 @@
+# Copyright: (c) 2026, Richard Lynch
+# GNU General Public License v3.0+ (see https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+---
+namespace: richard_lynch
+name: workstation
+version: 1.0.0
+readme: README.md
+authors:
+  - Richard Lynch
+description: >-
+  Workstation and device roles: per-component fan control, Raspberry Pi boot media, image seeding, host setup and fleet reports, bootable USB media, and BIOS flashing media for one ASUS board.
+license:
+  - GPL-3.0-or-later
+tags:
+  - workstation
+  - raspberrypi
+  - linux
+  - desktop
+dependencies:
+  ansible.utils: ">=5.0.0"
+  community.general: ">=10.0.0"
+  richard_lynch.common: ">=1.0.0,<2.0.0"
+repository: https://github.com/Richard-Lynch/ansible-collection-workstation
+documentation: https://github.com/Richard-Lynch/ansible-collection-workstation/blob/main/README.md
+homepage: https://github.com/Richard-Lynch/ansible-collection-workstation
+issues: https://github.com/Richard-Lynch/ansible-collection-workstation/issues
+build_ignore:
+  - .ansible-lint
+  - configured_roles.txt
+  - roles/*/defaults/SKIP
+  - .github
+  - .gitignore
+  - collections.galaxy
+  - devkit.toml
+  - dist
+  - export.manifest
+  - tests/output
+  - roles/*/meta/argument_specs.py
+  - roles/*/molecule
+  - "*.tar.gz"

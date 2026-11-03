@@ -1,0 +1,38 @@
+---
+# AUTO-GENERATED argument spec — DO NOT EDIT.
+#
+# Source of truth: roles/rpi_fleet_report/meta/argument_specs.py
+# Regenerate:      venv/bin/python tools/argspec/cli.py x generate rpi_fleet_report
+#
+# Edits here are silently overwritten on the next generation. To change a value or its
+# documentation, change the OptionSpec in the source file above — descriptions there
+# are emitted as the comments in this file.
+argument_specs:
+  main:
+    short_description: Whole-fleet drift report for the Pi nodes
+    description:
+      - "READ-ONLY. Answers 'is the fleet in the state the repo says?' across every Pi:"
+      - boot device, EEPROM order, rescue-card sealing, watchdog, throttling, and
+      - whether each node is still actually stateless.
+      - ''
+      - Exists so drift is found ON PURPOSE, on a schedule, rather than during an
+      - 'incident: state that nothing reports keeps drifting until it matters.'
+    version_added: '1.0'
+    author: Collection maintainers
+    options:
+      rpi_report_expect_ssd_root:
+        description:
+          - Whether these Pis are expected to be running from their SSDs.
+          - Set false for a fleet still mid-migration, so the report describes
+          - rather than complains.
+        type: bool
+        required: false
+        default: true
+      rpi_report_fail_on_drift:
+        description:
+          - Turn drift into a task failure, for CI or a scheduled check.
+          - Default false so the report is safe to run ad hoc and always prints the
+          - whole picture rather than stopping at the first problem.
+        type: bool
+        required: false
+        default: false

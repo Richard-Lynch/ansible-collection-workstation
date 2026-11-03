@@ -1,0 +1,104 @@
+---
+# POST-REBOOT verification. READ-ONLY.
+#
+# This is where the LIVE state is asserted, and it exists as a separate action precisely because
+# nothing in harden_sd, eeprom or watchdog can legitimately assert its own result: every one of
+# them takes effect at the next boot. Asserting there would pass on an unchanged system and keep
+# passing forever — the trap this repo has a lint rule about.
+#
+# Run it after the reboot that follows the provisioning sequence.
+
+- name: Resolve declared options over their generated defaults
+  ansible.builtin.include_tasks: _resolve_defaults.yml
+
+- name: Survey the board
+  ansible.builtin.include_tasks: probe.yml
+
+- name: Verify the Pi is running from the DECLARED SSD
+  # Pinned to rpi_boot_ssd_by_id from inventory, not merely to "some usb-* device": the looser
+  # form passes if the Pi booted from a different USB disk entirely, which is exactly the
+  # confusion this check exists to resolve.
+  ansible.builtin.assert:
+    that:
+      - rpi_probe.root.medium == 'usb-or-nvme'
+      - rpi_probe.root.by_id | default('') == rpi_boot_ssd_by_id
+    fail_msg: >-
+      This Pi is NOT running from its declared SSD.
+      root is on {{ rpi_probe.root.medium }} ({{ rpi_probe.root.by_id | default(rpi_probe.root.kernel) }}),
+      expected {{ rpi_boot_ssd_by_id }}.
+      If it fell back to the rescue card, the SSD or its USB bridge has failed — the machine is
+      running on a card that is not meant to carry a workload, and nothing else will say so.
+    success_msg: "Root is the declared SSD ({{ rpi_boot_ssd_by_id }})."
+    quiet: true
+
+- name: Verify the rescue card is not mounted read-write anywhere
+  # A rescue card being written to is a rescue card wearing out. Checked from the live mount table
+  # rather than from fstab, because fstab is the claim and the mount table is the fact.
+  ansible.builtin.command:
+    cmd: findmnt -rn -o SOURCE,TARGET,OPTIONS
+  register: _rpi_mounts
+  changed_when: false
+
+- name: HARD GATE — no SD-card filesystem may be mounted writable
+  # THE REGEX IS LOAD-BEARING AND WAS WRONG FIRST TIME. `findmnt -rn` emits
+  # "SOURCE TARGET OPTIONS", so the options field is preceded by a SPACE, not a comma — an
+  # anchor of `(^|,)ro` never matched a read-only mount and flagged every one of them as a
+  # violation. `[ ,]ro([, ]|$)` matches `ro` as a whole option wherever it appears.
+  # It also correctly does NOT treat `rw,errors=remount-ro` as read-only: that is a read-write
+  # mount whose options merely CONTAIN the characters "ro", and a substring test would have
+  # silently excused exactly the case this gate exists to catch. Both cases are covered by
+  # fixtures in molecule/default/verify.yml.
+  ansible.builtin.assert:
+    that:
+      - _rpi_mounts.stdout_lines | select('search', '^/dev/mmcblk') | reject('search', '[ ,]ro([, ]|$)') | list | length == 0
+    fail_msg: >-
+      An SD-card filesystem is mounted READ-WRITE on this Pi:
+      {{ _rpi_mounts.stdout_lines | select('search', '^/dev/mmcblk')
+         | reject('search', '[ ,]ro([, ]|$)') | list }}.
+      The card is the rescue system; writing to it both wears it out and lets it drift from the
+      image it was built from.
+    success_msg: "No SD-card filesystem is mounted writable."
+    quiet: true
+
+- name: Verify the boot order is what inventory declares
+  # The LIVE value, now that the board has rebooted and the staged EEPROM update has flashed.
+  ansible.builtin.assert:
+    that:
+      - rpi_probe.eeprom.boot_order | default('') == rpi_boot_order
+    fail_msg: >-
+      Live BOOT_ORDER is {{ rpi_probe.eeprom.boot_order | default('unreadable') }}, expected
+      {{ rpi_boot_order }}.
+      tries, in order: {{ rpi_probe.eeprom.boot_order_decoded | default([]) | join(' -> ') }}.
+      A staged update may not have flashed — check for /boot/firmware/pieeprom.upd.
+    success_msg: >-
+      BOOT_ORDER={{ rpi_boot_order }}:
+      {{ rpi_probe.eeprom.boot_order_decoded | join('  ->  ') }}
+    quiet: true
+
+- name: Verify the fallback is still a complete, bootable rescue system
+  # NOT merely "a card is present". A card that is blank or half-written is WORSE than none: under
+  # BOOT_ORDER=0xf14 a nearly-empty card has been reported to block USB boot entirely
+  # (raspberrypi/rpi-eeprom#423), so a degraded card can take down a perfectly healthy SSD path.
+  ansible.builtin.assert:
+    that:
+      - rpi_probe.block_devices | selectattr('kernel', 'search', '^mmcblk') | list | length > 0
+    fail_msg: >-
+      No SD card is present. The Pi is running with NO fallback: if the SSD or its USB bridge
+      fails, this board needs a site visit.
+    success_msg: "A rescue card is present."
+    quiet: true
+
+- name: Report the watchdog and panic state
+  ansible.builtin.debug:
+    msg:
+      - "watchdog device:     {{ 'present' if rpi_probe.watchdog.device_present else 'ABSENT' }}"
+      - "RuntimeWatchdogUSec: {{ rpi_probe.watchdog.runtime_usec | default('unset') }}"
+      - "panic= (effective):  {{ rpi_probe.cmdline.panic | default('UNSET — a kernel panic will hang this board indefinitely') }}"
+      - "memory cgroup:       {{ 'available' if rpi_probe.cmdline.cgroup_memory_available else 'NOT available — container memory limits are silently unenforced' }}"
+      - "throttling recorded: {{ rpi_probe.throttling.flags | default([]) | join('; ') | default('none', true) }}"
+
+- name: Summarise
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }} verified: running from {{ rpi_boot_ssd_by_id }},
+      BOOT_ORDER={{ rpi_boot_order }}, rescue card present and not mounted writable.

@@ -1,0 +1,34 @@
+---
+# DISPATCHER. This role has several entrypoints; main.yml selects one by `usb_media_action` so
+# that a caller who does not want to think about tasks_from does not have to.
+#
+#   list       enumerate attached disks and say which are eligible targets   (read-only)
+#   inspect    identify and vet ONE device, reporting what it is             (read-only)
+#   benchmark  sequential read speed; write speed too with usb_media_apply   (write is destructive)
+#   integrity  prove the device stores what is written to it                 (destructive)
+#   random_io  scattered 4KiB read/write latency and verification            (destructive)
+#   retention  write, wait, re-read — catches cells that decay over time     (destructive)
+#   write      download, verify and write an installer image                 (destructive)
+#
+# Callers that prefer to be explicit can bypass this entirely:
+#
+#   - ansible.builtin.include_role:
+#       name: usb_media
+#       tasks_from: benchmark
+#
+# The destructive entrypoints are all gated on the SAME usb_media_apply flag, and all route their
+# device selection through resolve_device.yml — one safety gate, not one per entrypoint.
+
+- name: Assert a known action was requested
+  ansible.builtin.assert:
+    that:
+      - usb_media_action in _usb_media_actions
+    fail_msg: >-
+      Unknown usb_media_action '{{ usb_media_action | default('(unset)') }}'.
+      Choose one of: {{ _usb_media_actions | join(', ') }}.
+    quiet: true
+  vars:
+    _usb_media_actions: [list, inspect, benchmark, integrity, random_io, retention, write]
+
+- name: Run the requested action
+  ansible.builtin.include_tasks: "{{ usb_media_action }}.yml"

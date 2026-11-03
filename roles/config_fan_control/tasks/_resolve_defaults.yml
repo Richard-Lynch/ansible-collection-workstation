@@ -1,0 +1,91 @@
+---
+# AUTO-GENERATED defaults resolver — DO NOT EDIT.
+#
+# Source of truth: roles/config_fan_control/meta/argument_specs.py
+# Regenerate:      venv/bin/python tools/argspec/cli.py x generate config_fan_control
+#
+# Edits here are silently overwritten on the next generation. To change a value or its
+# documentation, change the OptionSpec in the source file above — descriptions there
+# are emitted as the comments in this file.
+
+# Binds every declared option to its generated default, so a caller-supplied value
+# wins and an unsupplied one falls back rather than evaluating Undefined.
+#
+# Include this FIRST from every entrypoint:
+#   - ansible.builtin.include_tasks: _resolve_defaults.yml
+#
+# Role-specific setup logic belongs in tasks/setup_vars.yml, NOT here — this file is
+# overwritten on every generation.
+#
+# TWO BRANCHES, because `set_fact` persists for the whole play. A role invoked twice in
+# one play would otherwise see its OWN leftover facts on the second call, so a later
+# caller that omitted an option silently inherited the earlier caller's value instead of
+# the declared default. On a repeat call this ignores the role's own facts and rebinds
+# the defaults; an include-level `vars:` shadows the fact, so a value the caller DID
+# supply this time still wins. Roles called once per play only ever run the first branch.
+
+- name: Resolve declared options over their generated defaults
+  ansible.builtin.set_fact:
+    fand_apply: "{{ fand_apply | default(fand_apply__default) if fand_apply__default is defined else fand_apply | default(omit) }}"
+    fand_enabled: "{{ fand_enabled | default(fand_enabled__default) if fand_enabled__default is defined else fand_enabled | default(omit) }}"
+    fand_extra_metrics: "{{ fand_extra_metrics | default(fand_extra_metrics__default) if fand_extra_metrics__default is defined else fand_extra_metrics | default(omit) }}"
+    fand_pump_headers: "{{ fand_pump_headers | default(fand_pump_headers__default) if fand_pump_headers__default is defined else fand_pump_headers | default(omit) }}"
+    fand_interval: "{{ fand_interval | default(fand_interval__default) if fand_interval__default is defined else fand_interval | default(omit) }}"
+    fand_rise_rate: "{{ fand_rise_rate | default(fand_rise_rate__default) if fand_rise_rate__default is defined else fand_rise_rate | default(omit) }}"
+    fand_fall_rate: "{{ fand_fall_rate | default(fand_fall_rate__default) if fand_fall_rate__default is defined else fand_fall_rate | default(omit) }}"
+    fand_deadband_pwm: "{{ fand_deadband_pwm | default(fand_deadband_pwm__default) if fand_deadband_pwm__default is defined else fand_deadband_pwm | default(omit) }}"
+    fand_sensor_fail_tolerance: "{{ fand_sensor_fail_tolerance | default(fand_sensor_fail_tolerance__default) if fand_sensor_fail_tolerance__default is defined else fand_sensor_fail_tolerance | default(omit) }}"
+    fand_failsafe_floor_pwm: "{{ fand_failsafe_floor_pwm | default(fand_failsafe_floor_pwm__default) if fand_failsafe_floor_pwm__default is defined else fand_failsafe_floor_pwm | default(omit) }}"
+    fand_watchdog_sec: "{{ fand_watchdog_sec | default(fand_watchdog_sec__default) if fand_watchdog_sec__default is defined else fand_watchdog_sec | default(omit) }}"
+    fand_path: "{{ fand_path | default(fand_path__default) if fand_path__default is defined else fand_path | default(omit) }}"
+    fand_config_path: "{{ fand_config_path | default(fand_config_path__default) if fand_config_path__default is defined else fand_config_path | default(omit) }}"
+    fand_metrics_path: "{{ fand_metrics_path | default(fand_metrics_path__default) if fand_metrics_path__default is defined else fand_metrics_path | default(omit) }}"
+    fand_loadtest: "{{ fand_loadtest | default(fand_loadtest__default) if fand_loadtest__default is defined else fand_loadtest | default(omit) }}"
+    fand_loadtest_name: "{{ fand_loadtest_name | default(fand_loadtest_name__default) if fand_loadtest_name__default is defined else fand_loadtest_name | default(omit) }}"
+    fand_loadtest_apply: "{{ fand_loadtest_apply | default(fand_loadtest_apply__default) if fand_loadtest_apply__default is defined else fand_loadtest_apply | default(omit) }}"
+    fand_loadtest_duration: "{{ fand_loadtest_duration | default(fand_loadtest_duration__default) if fand_loadtest_duration__default is defined else fand_loadtest_duration | default(omit) }}"
+    fand_loadtest_interval: "{{ fand_loadtest_interval | default(fand_loadtest_interval__default) if fand_loadtest_interval__default is defined else fand_loadtest_interval | default(omit) }}"
+    fand_loadtest_path: "{{ fand_loadtest_path | default(fand_loadtest_path__default) if fand_loadtest_path__default is defined else fand_loadtest_path | default(omit) }}"
+    fand_loadtest_config: "{{ fand_loadtest_config | default(fand_loadtest_config__default) if fand_loadtest_config__default is defined else fand_loadtest_config | default(omit) }}"
+    fand_loadtest_results: "{{ fand_loadtest_results | default(fand_loadtest_results__default) if fand_loadtest_results__default is defined else fand_loadtest_results | default(omit) }}"
+    fand_discover_path: "{{ fand_discover_path | default(fand_discover_path__default) if fand_discover_path__default is defined else fand_discover_path | default(omit) }}"
+    fand_discover_save: "{{ fand_discover_save | default(fand_discover_save__default) if fand_discover_save__default is defined else fand_discover_save | default(omit) }}"
+    fand_discover_modules: "{{ fand_discover_modules | default(fand_discover_modules__default) if fand_discover_modules__default is defined else fand_discover_modules | default(omit) }}"
+    fand_python: "{{ fand_python | default(fand_python__default) if fand_python__default is defined else fand_python | default(omit) }}"
+    fand_unit: "{{ fand_unit | default(fand_unit__default) if fand_unit__default is defined else fand_unit | default(omit) }}"
+  when: not (_config_fan_control__argspec_resolved | default(false))
+
+- name: Rebind the defaults on a repeat call, ignoring this role's own leftover facts
+  ansible.builtin.set_fact:
+    fand_apply: "{{ fand_apply__default if fand_apply__default is defined else fand_apply | default(omit) }}"
+    fand_enabled: "{{ fand_enabled__default if fand_enabled__default is defined else fand_enabled | default(omit) }}"
+    fand_extra_metrics: "{{ fand_extra_metrics__default if fand_extra_metrics__default is defined else fand_extra_metrics | default(omit) }}"
+    fand_pump_headers: "{{ fand_pump_headers__default if fand_pump_headers__default is defined else fand_pump_headers | default(omit) }}"
+    fand_interval: "{{ fand_interval__default if fand_interval__default is defined else fand_interval | default(omit) }}"
+    fand_rise_rate: "{{ fand_rise_rate__default if fand_rise_rate__default is defined else fand_rise_rate | default(omit) }}"
+    fand_fall_rate: "{{ fand_fall_rate__default if fand_fall_rate__default is defined else fand_fall_rate | default(omit) }}"
+    fand_deadband_pwm: "{{ fand_deadband_pwm__default if fand_deadband_pwm__default is defined else fand_deadband_pwm | default(omit) }}"
+    fand_sensor_fail_tolerance: "{{ fand_sensor_fail_tolerance__default if fand_sensor_fail_tolerance__default is defined else fand_sensor_fail_tolerance | default(omit) }}"
+    fand_failsafe_floor_pwm: "{{ fand_failsafe_floor_pwm__default if fand_failsafe_floor_pwm__default is defined else fand_failsafe_floor_pwm | default(omit) }}"
+    fand_watchdog_sec: "{{ fand_watchdog_sec__default if fand_watchdog_sec__default is defined else fand_watchdog_sec | default(omit) }}"
+    fand_path: "{{ fand_path__default if fand_path__default is defined else fand_path | default(omit) }}"
+    fand_config_path: "{{ fand_config_path__default if fand_config_path__default is defined else fand_config_path | default(omit) }}"
+    fand_metrics_path: "{{ fand_metrics_path__default if fand_metrics_path__default is defined else fand_metrics_path | default(omit) }}"
+    fand_loadtest: "{{ fand_loadtest__default if fand_loadtest__default is defined else fand_loadtest | default(omit) }}"
+    fand_loadtest_name: "{{ fand_loadtest_name__default if fand_loadtest_name__default is defined else fand_loadtest_name | default(omit) }}"
+    fand_loadtest_apply: "{{ fand_loadtest_apply__default if fand_loadtest_apply__default is defined else fand_loadtest_apply | default(omit) }}"
+    fand_loadtest_duration: "{{ fand_loadtest_duration__default if fand_loadtest_duration__default is defined else fand_loadtest_duration | default(omit) }}"
+    fand_loadtest_interval: "{{ fand_loadtest_interval__default if fand_loadtest_interval__default is defined else fand_loadtest_interval | default(omit) }}"
+    fand_loadtest_path: "{{ fand_loadtest_path__default if fand_loadtest_path__default is defined else fand_loadtest_path | default(omit) }}"
+    fand_loadtest_config: "{{ fand_loadtest_config__default if fand_loadtest_config__default is defined else fand_loadtest_config | default(omit) }}"
+    fand_loadtest_results: "{{ fand_loadtest_results__default if fand_loadtest_results__default is defined else fand_loadtest_results | default(omit) }}"
+    fand_discover_path: "{{ fand_discover_path__default if fand_discover_path__default is defined else fand_discover_path | default(omit) }}"
+    fand_discover_save: "{{ fand_discover_save__default if fand_discover_save__default is defined else fand_discover_save | default(omit) }}"
+    fand_discover_modules: "{{ fand_discover_modules__default if fand_discover_modules__default is defined else fand_discover_modules | default(omit) }}"
+    fand_python: "{{ fand_python__default if fand_python__default is defined else fand_python | default(omit) }}"
+    fand_unit: "{{ fand_unit__default if fand_unit__default is defined else fand_unit | default(omit) }}"
+  when: _config_fan_control__argspec_resolved | default(false)
+
+- name: Record that this role has resolved its options in this play
+  ansible.builtin.set_fact:
+    _config_fan_control__argspec_resolved: true

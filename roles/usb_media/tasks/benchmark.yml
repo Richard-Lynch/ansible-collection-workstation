@@ -1,0 +1,198 @@
+---
+# ENTRYPOINT: measure sequential read (and optionally write) throughput of a USB device.
+#
+# The read test is NON-DESTRUCTIVE and always runs. The write test DESTROYS the device's contents
+# and only runs with usb_media_apply=true, the same flag that gates the real image write — one
+# flag for "yes, you may write to this stick", not a different one per entrypoint.
+#
+# Reads and writes go to the RAW node (/dev/rdiskN). On macOS the buffered node adds a cache layer
+# that reports the page cache's speed rather than the stick's, which is how a failing USB 2.0
+# stick can benchmark at 2 GB/s and tell you nothing.
+
+- name: Apply role defaults
+  ansible.builtin.include_tasks: setup_vars.yml
+
+- name: Resolve and vet the target device
+  ansible.builtin.include_tasks: resolve_device.yml
+
+- name: Measure sequential read speed
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: >-
+      set -o pipefail;
+      {{ usb_media_dd }} if={{ _usb_raw }} of=/dev/null
+      bs=1m count={{ usb_media_bench_mb | int }} 2>&1 | tail -1
+  register: _usb_readbench
+  changed_when: false
+  become: "{{ usb_media_become | bool }}"
+
+- name: Report read speed
+  ansible.builtin.debug:
+    msg: "sequential read:  {{ _mbs }} MB/s   ({{ _usb_readbench.stdout | trim }})"
+  vars:
+    # dd prints "... (12345678 bytes/sec)". Parsed with a plain digit class — POSIX bracket
+    # classes match NOTHING in Python's re, which is what Ansible's regex filters use.
+    _bps: "{{ (_usb_readbench.stdout | default('') | regex_search('\\(([0-9]+) bytes/sec\\)', '\\1') | first | default(0)) | int }}"
+    _mbs: "{{ (_bps | int / 1000 / 1000) | round(1) }}"
+
+- name: Explain that the write benchmark was skipped
+  ansible.builtin.debug:
+    msg: >-
+      Write benchmark SKIPPED (it destroys the stick's contents).
+      Re-run with usb_media_apply=true to include it.
+  when: not (usb_media_apply | bool)
+
+- name: Unmount the device before writing
+  # diskutil unmountDisk, not umount: every volume on the whole disk must be released or the raw
+  # write fails with "Resource busy". This leaves the device node present.
+  ansible.builtin.command:
+    cmd: "{{ usb_media_diskutil }} unmountDisk {{ usb_media_device }}"
+  changed_when: true
+  become: "{{ usb_media_become | bool }}"
+  when: usb_media_apply | bool
+
+- name: Measure sequential write speed (burst — into the SLC cache)
+  # The flattering number, and the one every quick benchmark reports. Kept because the COMPARISON
+  # with the sustained figure below is what reveals the cache, and a stick whose two numbers match
+  # is behaving very differently from one that halves.
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: >-
+      set -o pipefail;
+      {{ usb_media_dd }} if=/dev/zero of={{ _usb_raw }}
+      bs=1m count={{ usb_media_bench_mb | int }} 2>&1 | tail -1
+  register: _usb_writebench
+  changed_when: true
+  become: "{{ usb_media_become | bool }}"
+  when: usb_media_apply | bool
+
+- name: Report burst write speed
+  ansible.builtin.debug:
+    msg: "sequential write (burst,     {{ usb_media_bench_mb }} MB): {{ _mbs | float | round(1) }} MB/s"
+  vars:
+    _bps: "{{ (_usb_writebench.stdout | default('') | regex_search('\\(([0-9]+) bytes/sec\\)', '\\1') | first | default(0)) | int }}"
+    _mbs: "{{ (_bps | int / 1000 / 1000) | float }}"
+  when: usb_media_apply | bool
+
+# MEASUREMENT ORDER AND STICK STATE. Every figure below is affected by what was written to the
+# device immediately before it. Observed on one USB 3 stick: 69 MB/s burst on a rested
+# stick, but 27 MB/s burst when measured minutes after several GB of back-to-back writes — the
+# SLC cache had not been given idle time to flush to the slower backing flash, so the "burst"
+# test was writing into an already-full cache.
+#
+# That is a property of the hardware, not a bug here, and it is worth knowing rather than hiding:
+# a stick mid-way through an 8GB image write IS in the degraded state, so the degraded number is
+# arguably the honest one for predicting the tail of a long write. But a burst figure measured on
+# a saturated cache is not a burst figure at all, and comparing it against the sustained figure
+# then understates the cache effect.
+#
+# So: the numbers are reported with their sizes attached, and a re-run on a rested stick is the
+# way to get a clean burst baseline. Nothing here tries to "correct" for cache state — a
+# benchmark that silently adjusted its own results would be worse than one that reports what it
+# actually measured.
+
+- name: Measure SUSTAINED write speed (past the SLC cache)
+  # THE NUMBER THAT PREDICTS A REAL IMAGE WRITE. Consumer flash absorbs the first ~1GB into a fast
+  # SLC cache and then falls back to its native rate; a 256MB benchmark measures only the cache and
+  # overstates an 8GB write substantially. Measured on one USB 3 stick: 69.0 MB/s at 256MB
+  # and 68.1 at 1GB, then 39.8 MB/s at 2GB — a 42% drop, entirely invisible to the short test.
+  #
+  # 2GB is the deliberate middle ground: past the cliff on every stick tested, but ~50 seconds
+  # rather than the ~30 minutes a full-capacity pass costs. Capacity PROOF is a different question
+  # and belongs to the integrity entrypoint's full mode, not here.
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: >-
+      set -o pipefail;
+      {{ usb_media_dd }} if=/dev/zero of={{ _usb_raw }}
+      bs=1m count={{ usb_media_sustained_mb | int }} 2>&1 | tail -1
+  register: _usb_sustained
+  changed_when: true
+  become: "{{ usb_media_become | bool }}"
+  async: "{{ usb_media_write_timeout | int }}"
+  poll: 0
+  when:
+    - usb_media_apply | bool
+    - (usb_media_sustained_mb | int) > 0
+
+- name: Wait for the sustained write to finish
+  ansible.builtin.async_status:
+    jid: "{{ _usb_sustained.ansible_job_id }}"
+  register: _usb_sustained_done
+  until: _usb_sustained_done.finished
+  retries: "{{ ((usb_media_write_timeout | int) / (usb_media_poll_interval | int)) | round(0, 'ceil') | int }}"
+  delay: "{{ usb_media_poll_interval | int }}"
+  become: "{{ usb_media_become | bool }}"
+  when:
+    - usb_media_apply | bool
+    - (usb_media_sustained_mb | int) > 0
+
+- name: Assert the sustained write completed
+  # The explicit re-check an `until:` loop requires: a loop that exhausts its retries continues
+  # rather than failing, so without this a timed-out benchmark would fall through to a parse of
+  # empty output and report 0 MB/s as though it were a measurement.
+  ansible.builtin.assert:
+    that:
+      - _usb_sustained_done.finished | default(false) | bool
+      - (_usb_sustained_done.rc | default(1) | int) == 0
+    fail_msg: >-
+      The sustained write benchmark did not complete.
+      finished={{ _usb_sustained_done.finished | default(false) }}
+      rc={{ _usb_sustained_done.rc | default('unknown') }}
+    quiet: true
+  when:
+    - usb_media_apply | bool
+    - (usb_media_sustained_mb | int) > 0
+
+- name: Report sustained write speed and the cache effect
+  ansible.builtin.debug:
+    msg:
+      - "sequential write (sustained, {{ usb_media_sustained_mb }} MB): {{ _sus | float | round(1) }} MB/s"
+      - "{{ _verdict }}"
+  vars:
+    _burst_bps: "{{ (_usb_writebench.stdout | default('') | regex_search('\\(([0-9]+) bytes/sec\\)', '\\1') | first | default(0)) | int }}"
+    _sus_bps: "{{ (_usb_sustained_done.stdout | default('') | regex_search('\\(([0-9]+) bytes/sec\\)', '\\1') | first | default(0)) | int }}"
+    # Rates in MB/s. Kept as plain divisions; the ZERO GUARD lives at each point of use below
+    # rather than here, because a var defined with {{ }} is re-templated to a STRING when another
+    # var references it — so a `| max` applied here does not survive into the next expression, and
+    # the divisor arrives as 0 anyway. ansible-lint renders every var undefined, which is exactly
+    # the case that exposed this: "division by zero" despite an apparently correct guard.
+    _burst: "{{ (_burst_bps | int) / 1000 / 1000 }}"
+    _sus: "{{ (_sus_bps | int) / 1000 / 1000 }}"
+    # max(..., 0.1) inline: keeps the division defined under lint's all-undefined render, while
+    # `when:` below is what stops a meaningless figure from ever being printed for real.
+    _drop: "{{ (100 - ((_sus | float) / ([_burst | float, 0.1] | max) * 100)) | round(0) }}"
+    _verdict: >-
+      {{ 'SLC cache drop: ' ~ _drop ~ '% slower once the cache is exhausted — the sustained figure
+      is the one that predicts a real image write.'
+      if ((_sus | float) < ([_burst | float, 0.1] | max) * 0.85)
+      else 'No significant cache cliff: this stick sustains close to its burst rate.' }}
+  when:
+    - usb_media_apply | bool
+    - (usb_media_sustained_mb | int) > 0
+    - (_sus_bps | int) > 0
+
+- name: Estimate how long a real image write would take
+  # Uses the SUSTAINED rate when one was measured, falling back to burst otherwise. Estimating an
+  # 8GB write from a 256MB burst figure is how "about 2 minutes" becomes four, which is precisely
+  # the surprise this whole benchmark exists to prevent.
+  ansible.builtin.debug:
+    msg: >-
+      At {{ _rate | float | round(1) }} MB/s ({{ _basis }}), writing an 8 GB installer image
+      would take about {{ ((8000 / ([_rate | float, 0.1] | max)) / 60) | round(1) }} minutes.
+  vars:
+    _burst_bps: "{{ (_usb_writebench.stdout | default('') | regex_search('\\(([0-9]+) bytes/sec\\)', '\\1') | first | default(0)) | int }}"
+    _sus_bps: "{{ (_usb_sustained_done.stdout | default('') | regex_search('\\(([0-9]+) bytes/sec\\)', '\\1') | first | default(0)) | int }}"
+    _rate: "{{ (_sus_bps | int if (_sus_bps | int) > 0 else _burst_bps | int) / 1000 / 1000 }}"
+    _basis: "{{ 'sustained' if (_sus_bps | int) > 0 else 'burst — optimistic' }}"
+  when:
+    - usb_media_apply | bool
+    - ((_sus_bps | int) > 0) or ((_burst_bps | int) > 0)
+
+- name: Leave the device usable again
+  # The write benchmark destroys the partition table, so reformatting is how the run finishes.
+  # Skipped automatically on a read-only run, which never touched the device.
+  ansible.builtin.include_tasks: reformat.yml
+  when:
+    - usb_media_apply | bool
+    - usb_media_reformat | bool

@@ -1,0 +1,214 @@
+---
+# Make the SD card a read-only RESCUE SHELL: overlayfs root, `ro` boot partition.
+#
+# ============================== READ THIS BEFORE EDITING ==============================
+# THIS ACTION MUST RUN WHILE THE SD CARD IS STILL THE RUNNING ROOT.
+#
+# overlayfs is enabled against the RUNNING system — raspi-config edits the running root's
+# cmdline.txt and installs overlayroot for IT. Run this after the machine has migrated to the SSD and
+# it hardens THE SSD instead: the primary system silently loses persistence, every workload write
+# evaporates at the next power cycle, and a "did the config land?" assertion still PASSES, because
+# it reads the same file that was wrongly edited. Green asserts, broken machine.
+#
+# Ordering alone is a weak guarantee — a human can run actions out of order at 1am. So the first
+# gate below REFUSES to run when the resolved target is the disk currently backing /. That check,
+# not the documented sequence, is what actually prevents the failure.
+# ======================================================================================
+#
+# Two further things this action deliberately does NOT do:
+#
+#   * It does not assert the live mount is read-only afterwards. The overlay takes effect at the
+#     NEXT BOOT, so asserting `findmnt /` here would pass on a still-writable system and keep
+#     passing forever — the same trap as `steamos-readonly enable`. Config is asserted now; the
+#     live state is asserted by `verify` after a reboot.
+#   * It does not edit a hardened card in place. Per the design the card is WRITE-ONCE and
+#     re-imaged when it must change, because the supported maintenance cycle needs two reboots and
+#     leaves an interruptible window in which the card is writable with nothing guaranteeing a
+#     re-seal.
+
+- name: Resolve declared options over their generated defaults
+  ansible.builtin.include_tasks: _resolve_defaults.yml
+
+- name: Survey the board before touching anything
+  ansible.builtin.include_tasks: probe.yml
+
+# --- 1. device anchoring: WHICH disk are we about to seal? ---------------------------------------
+
+- name: Discover the SD card's stable by-id name
+  # On a Pi the card is the only mmc-* block device, so discovery is reliable; inventory can still
+  # override it for a board where that is not true.
+  #
+  # Selected from the probe's BLOCK-DEVICE list, which already contains only whole disks (lsblk
+  # TYPE=disk), so partitions cannot be picked up here and no length-based tie-break is needed.
+  # An earlier version sorted by `attribute='__len__'` to prefer the shortest name: Ansible's
+  # templating sandbox REJECTS that outright ("access to attribute '__len__' ... is unsafe"), so
+  # it would have failed at run time on the first real board. Verified against this venv.
+  ansible.builtin.set_fact:
+    _rpi_sd_by_id: >-
+      {{ rpi_boot_sd_by_id
+         | default((rpi_probe.block_devices | default([])
+                    | selectattr('by_id', 'defined')
+                    | selectattr('by_id', 'string')
+                    | selectattr('by_id', 'search', '^mmc-')
+                    | map(attribute='by_id') | sort | list | first | default('')), true) }}
+
+- name: HARD GATE — an SD card must actually have been identified
+  # An unresolved device would make every check below vacuous: `when: _rpi_sd_by_id == root` on an
+  # empty string is false, so the refusal would silently not fire and the action would proceed
+  # against nothing in particular. Absence must stop the play.
+  ansible.builtin.assert:
+    that:
+      - _rpi_sd_by_id | default('') | length > 0
+    fail_msg: >-
+      Could not identify the SD card. No mmc-* device appears in /dev/disk/by-id and
+      rpi_boot_sd_by_id is not declared in inventory.
+      REFUSING to harden anything — a hardening action that cannot name its target is exactly how
+      the wrong filesystem gets sealed. Run rpi_boot_action=probe and declare rpi_boot_sd_by_id.
+    quiet: true
+
+- name: HARD GATE — refuse to harden the disk that is currently the root
+  # THE CHECK THAT MATTERS. If the running root is the SSD, hardening would destroy the primary
+  # system's persistence while reporting success. Compared on the WHOLE-DISK by-id name, because
+  # root lives on a partition of it.
+  ansible.builtin.assert:
+    that:
+      - rpi_probe.root.medium == 'sd-card'
+      - (rpi_probe.root.by_id | default('')) is not search('^usb-')
+    fail_msg: >-
+      REFUSING to harden: this Pi's root is currently on
+      {{ rpi_probe.root.medium }} ({{ rpi_probe.root.by_id | default(rpi_probe.root.kernel) }}),
+      not on the SD card.
+      Hardening now would enable overlayfs on the RUNNING system — i.e. on the SSD — which
+      silently destroys the primary system's persistence while every later assertion still passes.
+      harden_sd belongs BEFORE the migration to the SSD, while the card is still the running root.
+      If this Pi has already migrated, its rescue card should be re-imaged instead (the card is
+      write-once by design).
+    success_msg: >-
+      Root is the SD card ({{ _rpi_sd_by_id }}) — safe to seal this medium.
+    quiet: true
+
+# --- 2. rescue tooling, installed BEFORE the card goes read-only ----------------------------------
+
+- name: Report the hardening plan and stop (default — no apply flag)
+  ansible.builtin.debug:
+    msg:
+      - "DRY RUN — would harden the rescue card {{ _rpi_sd_by_id }}:"
+      - "  1. install rescue tooling: {{ rpi_rescue_packages | join(', ') }}"
+      - "  2. enable overlayfs on the root filesystem (takes effect at the NEXT boot)"
+      - "  3. mount /boot/firmware read-only"
+      - "Re-run with rpi_boot_apply=true to apply. A reboot is then required, after which"
+      - "rpi_boot_action=verify asserts the card is genuinely read-only."
+  when: not (rpi_boot_apply | bool)
+
+- name: Install the tooling the rescue system needs to repair the SSD
+  # MUST happen before the card is sealed: afterwards its root is read-only and nothing can ever
+  # be added. Discovering the rescue system has no fsck happens during an outage — the worst
+  # possible time to learn it.
+  ansible.builtin.apt:
+    name: "{{ rpi_rescue_packages }}"
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+  become: true
+  when: rpi_boot_apply | bool
+
+- name: Disable dphys-swapfile on the rescue card
+  # On an overlay root the swapfile would be created in the tmpfs UPPER layer — i.e. swap backed
+  # by RAM, which is worse than no swap at all. Masked rather than stopped so it cannot be pulled
+  # back in by a dependency.
+  ansible.builtin.systemd:
+    name: dphys-swapfile
+    state: stopped
+    enabled: false
+    masked: true
+  become: true
+  failed_when: false
+  when: rpi_boot_apply | bool
+
+# --- 3. the seal ---------------------------------------------------------------------------------
+
+- name: Enable the overlay filesystem on the rescue card
+  # WHAT THIS ACTUALLY DOES ON BOOKWORM, verified against the raspi-config `bookworm` branch
+  # source (the packaged one; the implementation changed on 2023-08-30, before any Bookworm
+  # release):
+  #   * installs the `overlayroot` package if absent
+  #   * prepends `overlayroot=tmpfs ` to cmdline.txt
+  #   * does NOT write `boot=overlay`, and does NOT run update-initramfs itself — the package's
+  #     dpkg trigger does that
+  #
+  # An earlier version of this role encoded the BULLSEYE implementation (`boot=overlay` plus a
+  # hand-built initramfs). Everything it asserted was therefore wrong on the target OS: the final
+  # gate failed after a SUCCESSFUL seal, and the probe's `boot_overlay` flag was permanently false.
+  ansible.builtin.command:
+    cmd: raspi-config nonint enable_overlayfs
+  become: true
+  register: _rpi_overlay
+  changed_when: _rpi_overlay.rc == 0
+  when: rpi_boot_apply | bool
+
+- name: Mount the boot partition read-only
+  # Edits the /boot/firmware line in /etc/fstab from `defaults` to `defaults,ro`. Refuses (rc 1)
+  # if the overlay is already LIVE, which is why it runs in the same pass as the enable, before
+  # any reboot — and why failed_when is false: "already sealed" is not an error here.
+  ansible.builtin.command:
+    cmd: raspi-config nonint enable_bootro
+  become: true
+  register: _rpi_bootro
+  changed_when: _rpi_bootro.rc == 0
+  failed_when: false
+  when: rpi_boot_apply | bool
+
+# --- 4. verification: CONFIG only, never the live mount -------------------------------------------
+
+- name: Ask raspi-config whether the overlay is configured
+  # Its OWN read-back rather than our grep: get_overlay_conf greps cmdline.txt for
+  # `overlayroot=tmpfs` and echoes 0 when enabled. Using the tool's accessor means this check
+  # tracks the tool if the mechanism changes again, instead of silently encoding a stale one.
+  ansible.builtin.command:
+    cmd: raspi-config nonint get_overlay_conf
+  become: true
+  register: _rpi_overlay_conf
+  changed_when: false
+  when: rpi_boot_apply | bool
+
+- name: Ask raspi-config whether the boot partition is configured read-only
+  ansible.builtin.command:
+    cmd: raspi-config nonint get_bootro_conf
+  become: true
+  register: _rpi_bootro_conf
+  changed_when: false
+  when: rpi_boot_apply | bool
+
+- name: Confirm the overlayroot package is actually installed
+  # LOAD-BEARING, not belt-and-braces. `enable_overlayfs` runs `is_installed overlayroot ||
+  # apt-get install -y overlayroot` with no `set -e` and no check on the result — so if that apt
+  # call fails (no network, held packages), the function CONTINUES, writes the cmdline token, and
+  # returns 0. The card then boots READ-WRITE with every config check passing. The package is what
+  # makes the token mean anything.
+  ansible.builtin.command:
+    cmd: dpkg-query -W -f=${Status} overlayroot
+  become: true
+  register: _rpi_overlayroot_pkg
+  changed_when: false
+  failed_when: false
+  when: rpi_boot_apply | bool
+
+- name: HARD GATE — the hardening must be genuinely configured, not merely attempted
+  ansible.builtin.assert:
+    that:
+      - (_rpi_overlay_conf.stdout | default('1') | trim) == '0'
+      - (_rpi_bootro_conf.stdout | default('1') | trim) == '0'
+      - "'install ok installed' in (_rpi_overlayroot_pkg.stdout | default(''))"
+    fail_msg: >-
+      Hardening did not take on {{ inventory_hostname }}:
+      overlay configured={{ 'yes' if (_rpi_overlay_conf.stdout | default('1') | trim) == '0' else 'NO' }},
+      boot ro configured={{ 'yes' if (_rpi_bootro_conf.stdout | default('1') | trim) == '0' else 'NO' }},
+      overlayroot package={{ _rpi_overlayroot_pkg.stdout | default('(absent)') | trim }}.
+      The cmdline token is inert without the overlayroot package — a card in that state boots
+      READ-WRITE while looking hardened. Do not reboot and assume it worked.
+    success_msg: >-
+      Rescue card {{ _rpi_sd_by_id }} is configured read-only (overlayroot installed, cmdline and
+      fstab set). It takes effect at the NEXT BOOT — run rpi_boot_action=verify after rebooting to
+      assert the live state.
+    quiet: true
+  when: rpi_boot_apply | bool

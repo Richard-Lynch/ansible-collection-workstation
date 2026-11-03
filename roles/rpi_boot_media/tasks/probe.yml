@@ -1,0 +1,96 @@
+---
+# READ-ONLY survey of a Pi's boot state. Run this FIRST on any board.
+#
+# Reports; does not judge. The one exception is the DISABLE_HDMI warning below, which is reported
+# loudly because it silently voids the entire fallback design and nothing else would reveal it.
+
+- name: Resolve declared options over their generated defaults
+  ansible.builtin.include_tasks: _resolve_defaults.yml
+
+- name: Copy the boot probe
+  # Shipped to a temp path rather than run through `script:` so the interpreter is explicit and
+  # the file can be re-read on failure. Mode 0755 because it is executed directly.
+  ansible.builtin.copy:
+    src: rpi_boot_probe.py
+    dest: /tmp/rpi_boot_probe.py
+    mode: "0755"
+  changed_when: false
+
+- name: Survey the board
+  ansible.builtin.command:
+    cmd: "python3 /tmp/rpi_boot_probe.py"
+  register: _rpi_probe_raw
+  changed_when: false
+
+- name: Parse the survey
+  ansible.builtin.set_fact:
+    rpi_probe: "{{ _rpi_probe_raw.stdout | from_json }}"
+
+- name: Report what this board is and what it boots from
+  ansible.builtin.debug:
+    msg:
+      - "model:        {{ rpi_probe.model | default('unknown') }}"
+      - "soc serial:   {{ rpi_probe.soc_serial | default('unknown') }}   <- declare as rpi_soc_serial"
+      - "temperature:  {{ rpi_probe.temperature | default('unknown') }}"
+      - ""
+      - "ROOT IS ON:   {{ rpi_probe.root.medium }}  ({{ rpi_probe.root.kernel | default('?') }})"
+      - "  by-id:      {{ rpi_probe.root.by_id | default('(no stable name found)') }}"
+      - ""
+      - "EEPROM version:  {{ rpi_probe.eeprom.version | default('unknown') }}"
+      - "BOOT_ORDER:      {{ rpi_probe.eeprom.boot_order | default('unknown') }}"
+      - "  tries, in order: {{ rpi_probe.eeprom.boot_order_decoded | default([]) | join('  ->  ') }}"
+      - ""
+      - "overlay configured (next boot): {{ rpi_probe.cmdline.boot_overlay }}"
+      - "root read-only RIGHT NOW:       {{ rpi_probe.overlay.live_read_only }}"
+      - "watchdog device present:        {{ rpi_probe.watchdog.device_present }}"
+      - "panic= on the kernel cmdline:   {{ rpi_probe.cmdline.panic | default('(unset)') }}"
+      - ""
+      - "memory cgroup AVAILABLE:  {{ rpi_probe.cmdline.cgroup_memory_available }}"
+      - "throttling since boot:    {{ rpi_probe.throttling.flags | default([]) | join('; ') | default('none', true) }}"
+
+- name: Report the attached block devices
+  # The by-id names are what inventory must declare. Printed as a list so they can be copied
+  # rather than transcribed — a mistyped by-id name is a reservation-shaped bug that only shows
+  # up when something destructive runs against the wrong disk.
+  ansible.builtin.debug:
+    msg: >-
+      {{ item.kernel }}  {{ item.size_gb }}GB  {{ item.transport | default('?') }}
+      {{ item.model | default('') }}  ->  {{ item.by_id | default('(no by-id link)') }}
+  loop: "{{ rpi_probe.block_devices | default([]) }}"
+  loop_control:
+    label: "{{ item.kernel }}"
+
+- name: Report USB storage bridges (the UAS quirk candidates)
+  ansible.builtin.debug:
+    msg: >-
+      {{ item.vid_pid }}  {{ item.description }}
+      — if this bridge misbehaves, declare rpi_usb_quirks: ["{{ item.vid_pid }}:u"]
+  loop: "{{ rpi_probe.usb_bridges | default([]) }}"
+  loop_control:
+    label: "{{ item.vid_pid }}"
+
+- name: WARN — DISABLE_HDMI voids BOOT_ORDER entirely
+  # raspberrypi/rpi-eeprom#466: with DISABLE_HDMI=1 the firmware has been reported to ignore
+  # BOOT_ORDER. It is a very natural thing to set on a headless Pi, and the result is a board
+  # whose entire USB-first-with-SD-fallback design is inert while looking correctly configured —
+  # a silent guard in hardware. Reported at probe time so it is never a surprise later.
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: DISABLE_HDMI={{ rpi_probe.eeprom.disable_hdmi }} is set in this board's EEPROM.
+      It has been reported to make the firmware IGNORE BOOT_ORDER entirely
+      (raspberrypi/rpi-eeprom#466), which would make the USB-first / SD-fallback design inert
+      while still appearing configured. Remove it before relying on the fallback.
+  when:
+    - rpi_probe.eeprom.disable_hdmi is defined
+    - rpi_probe.eeprom.disable_hdmi not in [None, '', '0']
+
+- name: WARN — this board has recorded undervoltage or throttling
+  # Sticky bits (16-19), not the current state: an undervoltage event that has already passed
+  # still explains a corrupted write ten minutes earlier, and on a USB-booted Pi it presents as
+  # "the SSD is failing".
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: {{ rpi_probe.throttling.flags | join('; ') }}.
+      On a USB-booted Pi this presents as disk corruption or dropped devices. Check the PSU and
+      whether the SSD is drawing from the Pi's ~1.2A total USB budget before blaming the disk.
+  when: rpi_probe.throttling.flags | default([]) | length > 0

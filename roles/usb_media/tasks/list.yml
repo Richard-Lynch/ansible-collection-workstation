@@ -1,0 +1,59 @@
+---
+# ENTRYPOINT: list attached disks and say which are eligible write targets.
+#
+# Reads nothing but device metadata; writes nothing anywhere. Safe at any time.
+#
+# Evaluates each whole disk against the SAME four conditions resolve_device.yml enforces, so a
+# device listed here as ELIGIBLE is one the write path will actually accept. (The conditions are
+# expressed twice — once in Jinja there, once in Python here — because the listing has to explain
+# ALL devices including the refused ones, while the gate only has to refuse one. The molecule
+# scenario asserts the two agree, which is what keeps them from drifting apart.)
+
+- name: Apply role defaults
+  ansible.builtin.include_tasks: setup_vars.yml
+
+- name: Enumerate attached disks and evaluate each as a target
+  ansible.builtin.command:
+    cmd: >-
+      {{ usb_media_python }} {{ role_path }}/files/usb_list_targets.py
+      {{ usb_media_max_device_bytes | int }}
+  register: _usb_listraw
+  changed_when: false
+
+- name: Parse the listing
+  ansible.builtin.set_fact:
+    usb_media_targets: "{{ (_usb_listraw.stdout | from_json).devices }}"
+    usb_media_eligible: "{{ (_usb_listraw.stdout | from_json).eligible }}"
+
+- name: Render the device table
+  # Every disk, eligible or not, with the reason for each refusal. The refused rows matter as
+  # much as the eligible ones: seeing "internal disk" beside /dev/disk0 is what makes it obvious
+  # which line NOT to copy.
+  ansible.builtin.debug:
+    msg: >-
+      {{ '%-13s %-22s %9s  %-14s %s' | format(
+           item.device,
+           item.model | truncate(21, true, ''),
+           (item.size_gb | string) ~ ' GB',
+           item.link | default(''),
+           ('ELIGIBLE' if item.eligible else 'refused: ' ~ (item.reasons | join('; ')))
+         ) ~ _vols }}
+  vars:
+    # Volume names are how a human recognises which physical stick this is — and writing over a
+    # stick that still had files on it is the other common regret.
+    _vols: >-
+      {{ ('  [volumes: ' ~ (item.volumes | selectattr('name', 'string')
+          | map(attribute='name') | join(', ')) ~ ']')
+         if (item.volumes | selectattr('name', 'string') | list | length > 0) else '' }}
+  loop: "{{ usb_media_targets }}"
+  loop_control:
+    label: "{{ item.device }}"
+
+- name: Explain how to use the result
+  ansible.builtin.debug:
+    msg: >-
+      {{ (usb_media_eligible | length) }} eligible target(s):
+      {{ usb_media_eligible | join(', ') | default('none', true) }}.
+      Device ids are NOT stable — macOS renumbers them as devices come and go, so re-run this
+      immediately before writing rather than reusing an id from earlier.
+      Cross-check the size and volume names against the stick you physically plugged in.

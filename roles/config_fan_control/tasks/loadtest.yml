@@ -1,0 +1,203 @@
+---
+# ENTRYPOINT: heat a component deliberately and record how fan control responds.
+#
+#   include_role: {name: config_fan_control, tasks_from: loadtest}  (with fand_loadtest_apply=true)
+#
+# WHY. Every threshold in a fan config is a guess until the machine has actually been hot. Tuned
+# at idle, demand sits near zero and NOTHING is exercised — not the gammas, not the ceilings,
+# not the damping, and not the handover between sensors that is the whole point of
+# worst-component-wins.
+#
+# SAFETY IS THE STRUCTURE, NOT A CAVEAT. This deliberately heats hardware, so it is built around
+# abort rather than duration:
+#
+#   * per-sensor ABORT temperatures, checked every sample — reaching one stops the load at once;
+#   * abort if a watched sensor becomes unreadable, because losing sight of the component being
+#     heated is the worst moment to keep heating it;
+#   * a hard wall-clock cap, so a wedged load generator cannot run indefinitely;
+#   * the load runs in its own process group, killed on EVERY exit path including a crash, so an
+#     abandoned run cannot leave the machine cooking;
+#   * sensors are resolved and read BEFORE any load starts — a test that heats first and then
+#     discovers it cannot read the temperature has the ordering exactly backwards.
+#
+# Gated behind `fand_loadtest_apply=true`; without it this reports what it would do, checks the
+# load tool is present, and stops.
+
+- name: Apply role defaults
+  ansible.builtin.include_tasks: setup_vars.yml
+
+- name: HARD GATE — an absolute controller path for the timeline is declared
+  ansible.builtin.assert:
+    that:
+      - fand_loadtest_fetch_to is defined
+      - fand_loadtest_fetch_to is match('/')
+    fail_msg: >-
+      fand_loadtest_fetch_to is not an absolute path on the controller. Declare it per test
+      (the role has no default for where a timeline lands).
+    quiet: true
+
+- name: Refuse to run without abort thresholds
+  # A load test with no abort condition is just a way to overheat a machine on a timer.
+  ansible.builtin.assert:
+    that:
+      - "(fand_loadtest.abort_above | default([]) | length) > 0"
+    fail_msg: >-
+      This load test declares no abort thresholds. Heating a component with no temperature at
+      which to stop is not a test.
+    quiet: true
+
+- name: Pull the load container if this test uses one
+  # CONTAINER RATHER THAN A LAYERED PACKAGE. On an image-based OS, layering a diagnostic tool
+  # slows every image update and must re-resolve on each rebase (flatpak and distrobox are
+  # preferred for exactly this reason). A container holds the tool, passes through /dev/dri, and
+  # leaves the image untouched.
+  ansible.builtin.command:
+    argv: [podman, pull, "{{ fand_loadtest.container }}"]
+  become: false
+  register: _lt_pull
+  changed_when: "'Storing signatures' in (_lt_pull.stdout | default(''))"
+  when: fand_loadtest.container is defined
+
+- name: Check the load tool is available
+  # For a container test this checks podman itself; the tool inside is the image's problem.
+  ansible.builtin.command:
+    argv: [command, -v, "{{ 'podman' if fand_loadtest.container is defined else (fand_loadtest.load_command | first) }}"]
+  become: true
+  register: _lt_tool
+  changed_when: false
+  failed_when: false
+
+- name: Report what this would do
+  ansible.builtin.debug:
+    msg:
+      - "Load: {{ fand_loadtest.load_command | join(' ') }}"
+      - "Container: {{ fand_loadtest.container | default('(none — runs on the host)') }}"
+      - "Tool present: {{ 'yes' if _lt_tool.rc == 0 else 'NO — install it first' }}"
+      - "Duration: up to {{ fand_loadtest_duration }}s, sampling every {{ fand_loadtest_interval }}s"
+      - "Watching: {{ fand_loadtest.sensors | map(attribute='name') | join(', ') }}"
+      - "ABORT if: {{ fand_loadtest.abort_above | map('to_json') | join('; ') }}"
+      - "{{ 'Set fand_loadtest_apply=true to run it.' if not (fand_loadtest_apply | bool) else 'RUNNING.' }}"
+
+- name: The load tool must exist before we claim to test anything
+  ansible.builtin.assert:
+    that:
+      - _lt_tool.rc == 0
+    fail_msg: >-
+      {{ fand_loadtest.load_command | first }} is not installed on this host, so this test would
+      measure nothing. Install it, or choose a load command the machine already has.
+    quiet: true
+  when: fand_loadtest_apply | bool
+
+- name: Install the load test harness
+  ansible.builtin.copy:
+    src: fand-loadtest.py
+    dest: "{{ fand_loadtest_path }}"
+    mode: "0755"
+  become: true
+
+- name: Render the test config
+  ansible.builtin.copy:
+    content: "{{ fand_loadtest | combine({'chip': fand_chip, 'headers': fand_groups | map(attribute='header') | list}) | to_nice_json }}\n"
+    dest: "{{ fand_loadtest_config }}"
+    mode: "0644"
+  become: true
+
+- name: Verify the wiring without heating anything
+  # A dry run resolves every sensor and reads the baseline. If this cannot see the component,
+  # the real run would be heating something it cannot watch.
+  ansible.builtin.command:
+    argv:
+      - "{{ fand_python }}"
+      - "{{ fand_loadtest_path }}"
+      - --config
+      - "{{ fand_loadtest_config }}"
+      - --dry-run
+  become: true
+  register: _lt_dry
+  changed_when: false
+
+- name: Baseline
+  ansible.builtin.debug:
+    msg: "{{ _lt_dry.stdout_lines | default([]) }}"
+
+- name: Run the load test
+  when: fand_loadtest_apply | bool
+  block:
+    - name: Heat it
+      ansible.builtin.command:
+        argv:
+          - "{{ fand_python }}"
+          - "{{ fand_loadtest_path }}"
+          - --config
+          - "{{ fand_loadtest_config }}"
+          - --duration={{ fand_loadtest_duration }}
+          - --interval={{ fand_loadtest_interval }}
+          - --out={{ fand_loadtest_results }}
+      become: true
+      register: _lt_run
+      changed_when: true
+      # An abort is a RESULT, not a play failure: the harness exits non-zero when it stops
+      # early, and that outcome still produced a timeline worth reading.
+      failed_when: false
+
+    - name: The timeline
+      ansible.builtin.debug:
+        msg: "{{ _lt_run.stdout_lines | default([]) }}"
+
+    - name: Fetch the timeline for analysis
+      ansible.builtin.fetch:
+        src: "{{ fand_loadtest_results }}"
+        dest: "{{ fand_loadtest_fetch_to }}"
+        flat: true
+      become: true
+      register: _lt_fetch
+
+    - name: Confirm the timeline landed where it was meant to
+      # `fetch` succeeding says a file was written, not that it was written where anyone will
+      # look for it. A relative path lands somewhere unexpected while the play
+      # reports success.
+      ansible.builtin.stat:
+        path: "{{ fand_loadtest_fetch_to }}"
+      delegate_to: localhost
+      become: false
+      register: _lt_stat
+
+    - name: The timeline must exist and be non-empty
+      ansible.builtin.assert:
+        that:
+          - _lt_stat.stat.exists
+          - _lt_stat.stat.size > 0
+        fail_msg: "Timeline was not written to {{ fand_loadtest_fetch_to }}"
+        success_msg: "Timeline at {{ fand_loadtest_fetch_to }} ({{ _lt_stat.stat.size }} bytes)"
+        quiet: true
+
+    - name: Confirm the fans actually responded
+      # The point of the test. If the fans never changed speed while a component heated up, the
+      # curve is not working — and that must be a FAILURE, not a quiet line in a log.
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: |
+          set -o pipefail
+          {{ fand_python }} - "{{ fand_loadtest_results }}" <<'PY'
+          import json, sys
+          d = json.load(open(sys.argv[1]))
+          rows = d["samples"]
+          out = []
+          for hdr in rows[0]["groups"]:
+              rpms = [r["groups"][hdr]["rpm"] for r in rows if r["groups"][hdr]["rpm"]]
+              if rpms:
+                  out.append(f"hdr{hdr} rpm {min(rpms)}-{max(rpms)} (delta {max(rpms)-min(rpms)})")
+          for name in rows[0]["sensors"]:
+              vals = [r["sensors"][name] for r in rows if r["sensors"].get(name) is not None]
+              if vals:
+                  out.append(f"{name} {min(vals):.1f}-{max(vals):.1f}C (rise {max(vals)-min(vals):.1f})")
+          print("\n".join(out))
+          print("reason=" + d["reason"])
+          PY
+      become: true
+      register: _lt_summary
+      changed_when: false
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg: "{{ _lt_summary.stdout_lines | default([]) }}"

@@ -1,0 +1,199 @@
+---
+# The per-Pi OS baseline: identity, packages, time, bounded logs, security updates.
+#
+# Everything here is generic enough to be right for any Pi; everything site-specific
+# (the hostname itself, the timezone, which packages) arrives from inventory.
+
+- name: Resolve declared options over their generated defaults
+  ansible.builtin.include_tasks: _resolve_defaults.yml
+
+- name: Confirm this is the board inventory thinks it is
+  # Runs before anything writes. A card in the wrong Pi should be caught before it is configured
+  # as though it were a different host.
+  ansible.builtin.include_tasks: probe.yml
+
+- name: Report the pending baseline and stop (default — no apply flag)
+  ansible.builtin.debug:
+    msg:
+      - "DRY RUN — would apply the OS baseline to {{ inventory_hostname }}:"
+      - "  hostname:  {{ inventory_hostname }}"
+      - "  timezone:  {{ rpi_timezone }}"
+      - "  packages:  {{ rpi_host_packages | join(', ') }}"
+      - "  journald:  SystemMaxUse={{ rpi_journald_max_use }}"
+      - "  unattended security updates: {{ rpi_unattended_security }}"
+      - "Re-run with rpi_host_apply=true."
+  when: not (rpi_host_apply | bool)
+
+- name: End the run — not applying
+  ansible.builtin.meta: end_host
+  when: not (rpi_host_apply | bool)
+
+- name: Set the hostname
+  # The Pi OS installer leaves a generic name, so two freshly imaged boards answer to the same
+  # one until this runs.
+  ansible.builtin.hostname:
+    name: "{{ inventory_hostname }}"
+  become: true
+
+- name: Ensure the hostname resolves locally
+  # Without a matching /etc/hosts entry, sudo and various daemons pause on every invocation trying
+  # to resolve the hostname — which on these boards means waiting for the DNS service they may
+  # themselves be providing.
+  ansible.builtin.lineinfile:
+    path: /etc/hosts
+    regexp: "^127\\.0\\.1\\.1\\s"
+    line: "127.0.1.1\t{{ inventory_hostname }}"
+    state: present
+  become: true
+
+- name: Set the timezone
+  community.general.timezone:
+    name: "{{ rpi_timezone }}"
+  become: true
+
+- name: Install the baseline packages
+  ansible.builtin.apt:
+    name: "{{ rpi_host_packages }}"
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+  become: true
+
+- name: Bound journald's on-disk size
+  # An unbounded journal on a small root filesystem is a slow-motion disk-full outage, and on a
+  # node carrying DNS/DHCP a full disk is a network-wide event.
+  ansible.builtin.copy:
+    dest: /etc/systemd/journald.conf.d/10-size.conf
+    mode: "0644"
+    content: |
+      # Managed by Ansible (rpi_host_setup role). Do not hand-edit.
+      [Journal]
+      SystemMaxUse={{ rpi_journald_max_use }}
+  become: true
+  register: _rpi_journald
+
+- name: Restart journald to apply the size cap
+  ansible.builtin.systemd:
+    name: systemd-journald
+    state: restarted
+  become: true
+  when: _rpi_journald.changed # noqa: no-handler
+
+- name: Harden sshd — key-only, no root login
+  # NECESSARY BECAUSE THE CARD SEEDS TWO MECHANISMS. custom.toml sets
+  # password_authentication=false, but the legacy strap (userconf.txt + the `ssh` marker) brings
+  # sshd up with STOCK config — PasswordAuthentication yes — and seeds no key. Both are written
+  # deliberately, so on any image where the legacy path wins, the board comes up accepting
+  # passwords for an account whose crypt hash sits on a physically removable, world-readable FAT
+  # partition. A password shared across a fleet makes that a fleet-wide exposure.
+  #
+  # A drop-in rather than editing sshd_config, and `validate` so a malformed file can never lock
+  # Ansible out of a board it can only reach over SSH.
+  ansible.builtin.copy:
+    dest: /etc/ssh/sshd_config.d/10-ansible-hardening.conf
+    mode: "0644"
+    validate: "/usr/sbin/sshd -t -f %s"
+    content: |
+      # Managed by Ansible (rpi_host_setup role). Do not hand-edit.
+      PasswordAuthentication no
+      KbdInteractiveAuthentication no
+      PermitRootLogin no
+  become: true
+  register: _rpi_sshd
+
+- name: Restart sshd to apply the hardening
+  ansible.builtin.systemd:
+    name: ssh
+    state: restarted
+  become: true
+  when: _rpi_sshd.changed # noqa: no-handler
+
+- name: Read sshd's EFFECTIVE configuration back
+  # `sshd -T` prints the merged, running configuration — the only honest check. Asserting on the
+  # file we just wrote would prove we wrote it, not that sshd agrees: a drop-in can be overridden
+  # by an earlier `PasswordAuthentication yes` in the main config, since sshd takes the FIRST
+  # occurrence of a keyword, not the last.
+  ansible.builtin.command:
+    cmd: sshd -T
+  become: true
+  register: _rpi_sshd_eff
+  changed_when: false
+
+- name: HARD GATE — password authentication must actually be off
+  ansible.builtin.assert:
+    that:
+      - _rpi_sshd_eff.stdout_lines | select('match', '^passwordauthentication no$') | list | length == 1
+      - _rpi_sshd_eff.stdout_lines | select('match', '^permitrootlogin no$') | list | length == 1
+    fail_msg: >-
+      sshd on {{ inventory_hostname }} still accepts passwords or root logins:
+      {{ _rpi_sshd_eff.stdout_lines | select('match', '^(passwordauthentication|permitrootlogin) ') | list }}.
+      The account's crypt hash is on a removable card, so this is a real exposure — a drop-in can
+      be overridden by an earlier occurrence in the main sshd_config, which is why this asserts on
+      `sshd -T` rather than on the file we wrote.
+    success_msg: "sshd is key-only and refuses root logins."
+    quiet: true
+
+- name: Configure unattended SECURITY updates only
+  # Security updates automatic, full upgrades never: on a stateless fleet a rebuild is cheap and
+  # an unpatched box is not, but an unattended kernel change on a USB-booted Pi is exactly the
+  # thing that should be observed rather than discovered.
+  #
+  # THE ORIGINS LIST IS NOT OPTIONAL, and an earlier version omitted it. APT::Periodic alone only
+  # says "run unattended-upgrade"; WHAT it may upgrade comes from Allowed-Origins. Debian's stock
+  # list covers the Debian security archive and NOT archive.raspberrypi.com — which is where the
+  # kernel, firmware, bootloader and raspi-config come from on this image. So the Pi-specific
+  # security packages, i.e. the ones that matter most on this hardware, would never have been
+  # patched, silently, while the play reported "unattended security updates on".
+  ansible.builtin.copy:
+    dest: /etc/apt/apt.conf.d/51-ansible-unattended
+    mode: "0644"
+    content: |
+      // Managed by Ansible (rpi_host_setup role). Do not hand-edit.
+      APT::Periodic::Update-Package-Lists "1";
+      APT::Periodic::Unattended-Upgrade "{{ 1 if rpi_unattended_security else 0 }}";
+
+      Unattended-Upgrade::Origins-Pattern {
+          "origin=Debian,codename=${distro_codename},label=Debian-Security";
+          "origin=Debian,codename=${distro_codename}-security,label=Debian-Security";
+          // The Raspberry Pi archive: kernel, firmware, bootloader, raspi-config.
+          "origin=Raspberry Pi Foundation,codename=${distro_codename},label=Raspberry Pi Foundation";
+          "origin=Raspbian,codename=${distro_codename},label=Raspbian";
+      };
+
+      // Never reboot on our own initiative: these are HA nodes, and an unattended reboot of a
+      // USB-booted Pi is exactly the event that should be chosen rather than discovered.
+      Unattended-Upgrade::Automatic-Reboot "false";
+  become: true
+
+- name: Verify unattended-upgrades can actually run
+  # READ-BACK, because every layer above reports success whether or not anything works. A dry run
+  # exercises the real binary against the real config: if the package is missing, or the origins
+  # pattern is malformed, this is where it shows up — rather than in six months when a CVE lands
+  # and nothing has been patched.
+  ansible.builtin.command:
+    cmd: unattended-upgrade --dry-run --debug
+  become: true
+  register: _rpi_uu
+  changed_when: false
+  failed_when: false
+  when: rpi_unattended_security | bool
+
+- name: HARD GATE — unattended security updates must be genuinely operational
+  ansible.builtin.assert:
+    that:
+      - _rpi_uu.rc == 0
+    fail_msg: >-
+      unattended-upgrade --dry-run failed (rc={{ _rpi_uu.rc }}):
+      {{ (_rpi_uu.stderr | default('')) | trim | truncate(300) }}
+      Security updates are NOT running on {{ inventory_hostname }}, whatever the config says.
+    success_msg: >-
+      unattended-upgrades is installed and its configuration parses; security updates will run.
+    quiet: true
+  when: rpi_unattended_security | bool
+
+- name: Report the applied baseline
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }} baseline applied: timezone {{ rpi_timezone }},
+      journald capped at {{ rpi_journald_max_use }},
+      unattended security updates {{ 'on' if rpi_unattended_security else 'off' }}.

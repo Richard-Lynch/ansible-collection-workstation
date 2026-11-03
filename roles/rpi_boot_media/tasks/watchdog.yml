@@ -1,0 +1,174 @@
+---
+# Arm the board against hangs. TWO mechanisms, because one covers a failure the other cannot.
+#
+#   hardware watchdog  — systemd pets /dev/watchdog; if userspace or the kernel stops responding
+#                        the BCM timer resets the board.
+#   panic=N            — the KERNEL reboots itself N seconds after a panic.
+#
+# WHY BOTH. A panic at root-mount — the corrupt-SSD case this whole design cares about — happens
+# BEFORE systemd starts, so the watchdog is never armed and RuntimeWatchdogSec can never fire for
+# it. Without `panic=` such a Pi hangs indefinitely and the firmware re-picks the same SSD on every
+# power cycle. Documenting "we have a watchdog" while omitting panic= would leave the headline
+# failure mode uncovered.
+#
+# RUN THIS LAST, per-Pi, and only once that Pi has demonstrably booted clean. A watchdog on a board
+# that is already crash-looping converts a debuggable machine into one that reboots every 14
+# seconds. rollback disarms it.
+
+- name: Resolve declared options over their generated defaults
+  ansible.builtin.include_tasks: _resolve_defaults.yml
+
+- name: Enforce the constraints Ansible cannot
+  # Re-included because this entrypoint may be reached via tasks_from, bypassing main.yml. The
+  # <= 15s ceiling is the one bound in this role that can take out the whole fleet at once, so it
+  # is checked on every path that could write it.
+  ansible.builtin.include_tasks: _argspec_guards.yml
+
+- name: Survey the board
+  ansible.builtin.include_tasks: probe.yml
+
+- name: Report the pending watchdog configuration and stop (default — no apply flag)
+  ansible.builtin.debug:
+    msg:
+      - "DRY RUN — would arm this board against hangs:"
+      - "  RuntimeWatchdogSec = {{ rpi_watchdog_runtime_sec }}s   (hardware ceiling is 15s)"
+      - "  panic              = {{ rpi_watchdog_panic_sec }}s     (covers panics the watchdog cannot)"
+      - "  dtparam=watchdog=on in config.txt"
+      - ""
+      - "currently: watchdog device {{ 'present' if rpi_probe.watchdog.device_present else 'ABSENT' }},"
+      - "           panic={{ rpi_probe.cmdline.panic | default('(unset)') }}"
+      - ""
+      - "Re-run with rpi_boot_apply=true. Do this only once this Pi boots cleanly — a watchdog on"
+      - "a crash-looping board makes it undebuggable."
+  when: not (rpi_boot_apply | bool)
+
+- name: Decide whether to proceed
+  # A FLAG, NOT `meta: end_host`. end_host terminates the play for this host, including tasks the
+  # CALLER sequenced after the role — so a dry run of a play that does
+  # `include_role: provision_ssd` then reboot then verify would silently skip the last two and
+  # still look clean. A role must be able to decline to act without killing its caller.
+  ansible.builtin.set_fact:
+    _rpi_wd_skip: "{{ not (rpi_boot_apply | bool) }}"
+
+# --- 1. the hardware watchdog --------------------------------------------------------------------
+
+- name: Enable the hardware watchdog in the boot config
+  # NOTE THE FILE: dtparam goes in config.txt, NOT cmdline.txt — unlike panic=, cgroup_enable and
+  # usb-storage.quirks, which are all cmdline.txt. Putting it in the wrong file is silent: the
+  # parameter is simply ignored and /dev/watchdog never appears.
+  ansible.builtin.lineinfile:
+    path: /boot/firmware/config.txt
+    regexp: "^\\s*dtparam=watchdog="
+    line: "dtparam=watchdog=on"
+    state: present
+    create: false
+  become: true
+  register: _rpi_wd_dtparam
+  when: not _rpi_wd_skip | bool
+
+- name: Ensure the systemd drop-in directory exists
+  # BEFORE the file that goes in it — `copy:` does not create intermediate directories, so the
+  # reverse order fails on a host that has never had a system.conf.d.
+  ansible.builtin.file:
+    path: /etc/systemd/system.conf.d
+    state: directory
+    mode: "0755"
+  become: true
+  when: not _rpi_wd_skip | bool
+
+- name: Configure systemd's watchdog timeouts
+  # RuntimeWatchdogSec must be <= 15 (enforced by the generated guards above). RebootWatchdogSec
+  # covers the other end: a clean reboot that hangs during shutdown.
+  ansible.builtin.copy:
+    dest: /etc/systemd/system.conf.d/10-watchdog.conf
+    mode: "0644"
+    content: |
+      # Managed by roles/rpi_boot_media (rpi_boot_action=watchdog). Do not hand-edit.
+      #
+      # RuntimeWatchdogSec MUST be <= 15: the BCM hardware cannot accept a longer timeout, and
+      # larger values have produced continuous reboot loops that are hard to diagnose.
+      [Manager]
+      RuntimeWatchdogSec={{ rpi_watchdog_runtime_sec }}
+      RebootWatchdogSec=2min
+  become: true
+  register: _rpi_wd_conf
+  when: not _rpi_wd_skip | bool
+
+# --- 2. panic= : the half the watchdog cannot cover ----------------------------------------------
+
+- name: Make the kernel reboot itself after a panic
+  # cmdline.txt is a SINGLE LINE — appending a newline-separated entry silently produces a second
+  # line the firmware ignores. So the token is merged into the existing line rather than added.
+  ansible.builtin.shell:
+    cmd: |
+      set -o pipefail
+      f=/boot/firmware/cmdline.txt
+      line=$(tr -d '\n' < "$f")
+      if [ "$(printf '%s' "$line" | grep -cE '(^| )panic=[0-9]+( |$)')" -gt 0 ]; then
+        new=$(echo "$line" | sed -E 's/(^| )panic=[0-9]+( |$)/\1panic={{ rpi_watchdog_panic_sec }}\2/')
+      else
+        new="$line panic={{ rpi_watchdog_panic_sec }}"
+      fi
+      if [ "$new" != "$line" ]; then
+        printf '%s\n' "$new" > "$f"
+        echo CHANGED
+      else
+        echo UNCHANGED
+      fi
+  args:
+    executable: /bin/bash
+  become: true
+  register: _rpi_panic
+  changed_when: "'CHANGED' in _rpi_panic.stdout"
+  when: not _rpi_wd_skip | bool
+
+- name: Reload systemd so the drop-in is read
+  # NOT a handler, deliberately. Handlers run at the END of the play, but the read-back below has
+  # to observe the manager AFTER it has parsed the new drop-in — a handler would make that read
+  # report the pre-change value on every run, i.e. a verification that can never see its own
+  # change. Same reason a fact set only in a handler is read stale by every task before it.
+  ansible.builtin.systemd:
+    daemon_reload: true
+  become: true
+  when: _rpi_wd_conf.changed # noqa: no-handler
+
+# --- 3. verify from the KERNEL, not from the config ----------------------------------------------
+
+- name: Read back the effective configuration
+  # /proc/cmdline, not cmdline.txt: the firmware injects arguments that never appear in the file,
+  # so the config is a claim and /proc is the fact. Same reasoning as the memory cgroup check.
+  ansible.builtin.slurp:
+    src: /proc/cmdline
+  register: _rpi_proc_cmdline
+  when: not _rpi_wd_skip | bool
+
+- name: Read back systemd's live watchdog timeout
+  # `command:` rather than the systemd module, deliberately: the module manages UNIT state and
+  # exposes no way to read a MANAGER property. This is a read of RuntimeWatchdogUSec from the
+  # running manager — exactly the read-back that proves the drop-in was parsed rather than merely
+  # written — and there is no module equivalent.
+  ansible.builtin.command:
+    cmd: systemctl show -p RuntimeWatchdogUSec --value
+  register: _rpi_wd_live
+  changed_when: false
+  # noqa: command-instead-of-module
+  when: not _rpi_wd_skip | bool
+
+- name: Report what is armed now, and what needs a reboot
+  # Deliberately a REPORT, not an assertion. Both settings take effect at the next boot:
+  # dtparam creates /dev/watchdog at boot, and panic= is a kernel parameter. Asserting the live
+  # state here would fail a correct run — the same trap as asserting an overlay before rebooting.
+  ansible.builtin.debug:
+    msg:
+      - "Configured (takes effect at the NEXT BOOT):"
+      - "  dtparam=watchdog=on          -> config.txt {{ 'changed' if _rpi_wd_dtparam.changed else 'already set' }}"
+      - "  panic={{ rpi_watchdog_panic_sec }}                     -> cmdline.txt {{ 'changed' if _rpi_panic.changed else 'already set' }}"
+      - "  RuntimeWatchdogSec={{ rpi_watchdog_runtime_sec }}         -> drop-in {{ 'changed' if _rpi_wd_conf.changed else 'already set' }}"
+      - ""
+      - "Live right now (pre-reboot):"
+      - "  /dev/watchdog present: {{ rpi_probe.watchdog.device_present }}"
+      - "  systemd RuntimeWatchdogUSec: {{ _rpi_wd_live.stdout | default('?') }}"
+      - "  panic= on /proc/cmdline: {{ 'yes' if 'panic=' in (_rpi_proc_cmdline.content | b64decode) else 'not yet' }}"
+      - ""
+      - "Run rpi_boot_action=verify after a reboot to assert these are actually in force."
+  when: not _rpi_wd_skip | bool

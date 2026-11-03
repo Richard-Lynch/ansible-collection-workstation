@@ -1,0 +1,35 @@
+---
+# DISPATCHER for the ASUS TUF GAMING B850M-PLUS WIFI7 W BIOS role.
+#
+#   list      report the known BIOS versions and which is recommended   (read-only)
+#   verify    confirm the pinned ProductID against ASUS's live API      (read-only)
+#   download  fetch a version and verify its SHA-256                    (writes a file)
+#
+# Deliberately NARROW: this role knows one board. ASUS sells seven near-identical B850M variants
+# whose firmware is not interchangeable, so a generic "ASUS BIOS" role would have to carry that
+# ambiguity into every call. Specialising removes it.
+
+- name: Resolve declared options over their generated defaults
+  # GENERATED from meta/argument_specs.py — binds every declared option to its default, so a
+  # default can never be declared-but-dead (the variable evaluating Undefined at run time).
+  ansible.builtin.include_tasks: _resolve_defaults.yml
+
+- name: Apply role defaults
+  ansible.builtin.include_tasks: setup_vars.yml
+
+- name: Assert a known action was requested
+  ansible.builtin.assert:
+    that:
+      - asus_bios_action in _actions
+    fail_msg: >-
+      Unknown asus_bios_action '{{ asus_bios_action | default('(unset)') }}'.
+      Choose one of: {{ _actions | join(', ') }}.
+    quiet: true
+  vars:
+    _actions: [list, verify, download]
+
+- name: Run the requested action
+  ansible.builtin.include_tasks: "{{ _file }}.yml"
+  vars:
+    _file: >-
+      {{ {'list': 'list_versions', 'verify': 'discover_product_id', 'download': 'download'}[asus_bios_action] }}

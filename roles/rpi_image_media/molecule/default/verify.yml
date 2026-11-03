@@ -1,0 +1,58 @@
+---
+# Assert the rendered first-boot config is VALID TOML and carries the right values. A malformed
+# custom.toml does not fail loudly — the Pi boots, ignores it, and sits there with no user and no
+# SSH, which on a headless build means finding a monitor.
+- name: Verify
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    _mount: "{{ lookup('env', 'MOLECULE_EPHEMERAL_DIRECTORY') | default('/tmp', true) }}/bootfs"
+
+  tasks:
+    - name: Read the rendered first-boot config
+      ansible.builtin.slurp:
+        src: "{{ _mount }}/custom.toml"
+      register: toml
+
+    - name: It must parse as TOML and carry the expected values
+      ansible.builtin.command:
+        cmd: >-
+          {{ ansible_playbook_python }} -c
+          "import tomllib,sys;
+          d=tomllib.load(open('{{ _mount }}/custom.toml','rb'));
+          assert d['system']['hostname']=='rpi-a', d;
+          assert d['user']['name']=='operator', d;
+          assert d['user']['password_encrypted'] is True, d;
+          assert d['ssh']['enabled'] is True, d;
+          assert d['ssh']['password_authentication'] is False, d;
+          assert len(d['ssh']['authorized_keys'])==1, d;
+          print('ok')"
+      register: parsed
+      changed_when: false
+
+    - name: Confirm the parse succeeded
+      ansible.builtin.assert:
+        that:
+          - "'ok' in parsed.stdout"
+        success_msg: >-
+          custom.toml is valid TOML, names the right host and user, has SSH enabled and password
+          authentication DISABLED.
+        quiet: true
+
+    - name: The legacy mechanism must be seeded too
+      # Both are written deliberately: current Pi OS reads custom.toml, older images read
+      # userconf.txt + the ssh marker, and upstream calls custom.toml temporary. Seeding one and
+      # guessing wrong fails SILENTLY.
+      ansible.builtin.stat:
+        path: "{{ _mount }}/{{ item }}"
+      register: legacy
+      loop: [userconf.txt, ssh]
+
+    - name: Both legacy files must exist
+      ansible.builtin.assert:
+        that:
+          - legacy.results | rejectattr('stat.exists') | list | length == 0
+        fail_msg: "missing: {{ legacy.results | rejectattr('stat.exists') | map(attribute='item') | list }}"
+        success_msg: "Both provisioning mechanisms are seeded, so the card works on either image."
+        quiet: true

@@ -1,0 +1,31 @@
+---
+# DISPATCHER. Seeds a freshly written Pi card for a headless first boot.
+#
+#   plan    report every file that would be written                  (default, writes nothing)
+#   seed    write the first-boot provisioning files                  (writes to the card)
+#   verify  re-mount and assert each seeded file landed correctly    (read-only)
+#
+# THE WRITE ITSELF IS NOT HERE. The usb_media role owns it, along with the four-condition device gate
+# and the post-write read-back. Sequence:
+#
+#   usb_media (list)                           -> which /dev/diskN is the card
+#   usb_media (health entrypoints)             -> is this card fit to be a RESCUE system
+#   usb_media (write, with .img.xz + confirm)  -> the image lands on the card
+#   THIS ROLE (seed)                           -> the card becomes reachable headlessly
+
+- name: Resolve declared options over their generated defaults
+  ansible.builtin.include_tasks: _resolve_defaults.yml
+
+- name: Assert a known action was requested
+  ansible.builtin.assert:
+    that:
+      - rpi_image_action in _actions
+    fail_msg: >-
+      Unknown rpi_image_action '{{ rpi_image_action | default('(unset)') }}'.
+      Choose one of: {{ _actions | join(', ') }}.
+    quiet: true
+  vars:
+    _actions: [plan, seed, verify]
+
+- name: Run the requested action
+  ansible.builtin.include_tasks: "{{ rpi_image_action }}.yml"

@@ -1,0 +1,124 @@
+---
+# Undo the boot-path changes: BOOT_ORDER back to SD-first, and disarm the watchdog.
+#
+# WHEN TO USE THIS. Two situations, both real:
+#
+#   * The SSD path is misbehaving and you want the board to come up on its rescue card
+#     deliberately, rather than depending on the firmware's fallback (which only covers an
+#     UNREADABLE boot partition, not a corrupt root — see verify.yml).
+#   * A Pi has entered a watchdog-induced reboot loop. Disarming is the escape, and it has to be
+#     possible without a site visit.
+#
+# Note the ROLLBACK ITSELF NEEDS A WORKING BOOT. If the board is already dark, this cannot help —
+# that is what the physical rescue card is for.
+
+- name: Resolve declared options over their generated defaults
+  ansible.builtin.include_tasks: _resolve_defaults.yml
+
+- name: Survey the board
+  ansible.builtin.include_tasks: probe.yml
+
+- name: Report the pending rollback and stop (default — no apply flag)
+  ansible.builtin.debug:
+    msg:
+      - "DRY RUN — would roll this board back to booting from its rescue card:"
+      - "  BOOT_ORDER: {{ rpi_probe.eeprom.boot_order | default('unknown') }}  ->  {{ rpi_boot_rollback_order }}"
+      - "  RuntimeWatchdogSec -> 0 (disarmed)"
+      - "  panic= left in place (it only helps; it never causes a loop)"
+      - ""
+      - "Re-run with rpi_boot_apply=true, then reboot."
+  when: not (rpi_boot_apply | bool)
+
+- name: Decide whether to proceed
+  # A FLAG, NOT `meta: end_host`. end_host terminates the play for this host, including tasks the
+  # CALLER sequenced after the role — so a dry run of a play that does
+  # `include_role: provision_ssd` then reboot then verify would silently skip the last two and
+  # still look clean. A role must be able to decline to act without killing its caller.
+  ansible.builtin.set_fact:
+    _rpi_rb_skip: "{{ not (rpi_boot_apply | bool) }}"
+
+- name: Disarm the systemd watchdog
+  # Done FIRST and without a reboot requirement, because the reason to reach for rollback is often
+  # a reboot loop — and in that case the window in which the play can act is short. `daemon_reload`
+  # applies RuntimeWatchdogSec=0 to the running manager immediately.
+  ansible.builtin.copy:
+    dest: /etc/systemd/system.conf.d/10-watchdog.conf
+    mode: "0644"
+    content: |
+      # DISARMED by the rpi_boot_media role (rpi_boot_action=rollback).
+      # Re-arm with rpi_boot_action=watchdog once the underlying instability is understood.
+      [Manager]
+      RuntimeWatchdogSec=0
+  become: true
+  register: _rpi_disarm
+  when: not _rpi_rb_skip | bool
+
+- name: Apply the disarm to the running manager
+  # NOT a handler: the reason to run rollback is often a watchdog-induced reboot loop, where the
+  # window for the play to act is short. Deferring the disarm to the end of the play could mean it
+  # never happens — the board reboots first. It runs here, immediately.
+  ansible.builtin.systemd:
+    daemon_reload: true
+  become: true
+  when: _rpi_disarm.changed # noqa: no-handler
+
+- name: Restore the previous EEPROM config if one was captured
+  # Prefers the capture taken before the change, so rollback restores a KNOWN value rather than a
+  # guessed one. Falls back to writing the declared SD-first order when no capture exists — which
+  # is the case on a board this role has never changed.
+  ansible.builtin.stat:
+    path: /var/tmp/rpi-eeprom-config.before
+  become: true
+  register: _rpi_capture
+  when: not _rpi_rb_skip | bool
+
+- name: Read the captured config from the TARGET
+  # slurp, NOT lookup('file'). Lookups run on the CONTROLLER; this capture was written on the PI.
+  # The previous version used lookup, which meant this task errored on any board that HAD a
+  # capture — i.e. rollback broke on exactly the boards it had previously changed, during the
+  # emergency it exists for. Worse, on a controller that happened to have a file at that path it
+  # would have restored ANOTHER board's EEPROM config to this one.
+  ansible.builtin.slurp:
+    src: /var/tmp/rpi-eeprom-config.before
+  become: true
+  register: _rpi_capture_content
+  when: _rpi_capture.stat.exists
+
+- name: Build the rollback EEPROM config
+  ansible.builtin.copy:
+    content: |
+      {{ ((_rpi_capture_content.content | b64decode)
+          if _rpi_capture.stat.exists
+          else rpi_probe.eeprom.config)
+         | regex_replace('(?m)^BOOT_ORDER=.*$', 'BOOT_ORDER=' ~ rpi_boot_rollback_order) }}
+    dest: /var/tmp/rpi-eeprom-config.rollback
+    mode: "0644"
+  become: true
+  when: not _rpi_rb_skip | bool
+
+- name: Stage the EEPROM rollback
+  ansible.builtin.command:
+    cmd: "rpi-eeprom-config --apply /var/tmp/rpi-eeprom-config.rollback"
+  become: true
+  register: _rpi_rollback_apply
+  changed_when: _rpi_rollback_apply.rc == 0
+  when: not _rpi_rb_skip | bool
+
+- name: Read the staged rollback config back from the TARGET
+  ansible.builtin.slurp:
+    src: /var/tmp/rpi-eeprom-config.rollback
+  become: true
+  register: _rpi_rollback_content
+  when: not _rpi_rb_skip | bool
+
+- name: HARD GATE — the rollback must be staged
+  ansible.builtin.assert:
+    that:
+      - "'BOOT_ORDER=' ~ rpi_boot_rollback_order in (_rpi_rollback_content.content | b64decode)"
+    fail_msg: >-
+      The rollback config was not written correctly; the live boot order is unchanged.
+    success_msg: >-
+      BOOT_ORDER={{ rpi_boot_rollback_order }} staged (SD card first) and the watchdog is
+      disarmed. REBOOT for the boot order to take effect.
+    quiet: true
+  when: not _rpi_rb_skip | bool

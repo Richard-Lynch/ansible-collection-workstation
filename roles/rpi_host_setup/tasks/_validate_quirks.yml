@@ -1,0 +1,21 @@
+---
+# VALIDATION ONLY — no side effects, so it can be exercised on any machine.
+#
+# Split out of usb_quirks.yml deliberately: a guard that can only be reached by also copying files
+# to /usr/local/sbin cannot be tested without a live Pi, and an untestable guard is one nobody has
+# proved can fire.
+
+- name: Validate the declared quirk entries
+  # A malformed entry does not fail the boot — the kernel simply IGNORES it. So a typo'd quirk is a
+  # data-corruption workaround that never applies, on a disk that then corrupts under load, while
+  # inventory shows it as configured. Checked here rather than discovered later.
+  ansible.builtin.assert:
+    that:
+      - item is match('^[0-9a-fA-F]{4}:[0-9a-fA-F]{4}:[a-z]+$')
+    fail_msg: >-
+      Malformed usb-storage quirk '{{ item }}'. Expected VID:PID:FLAGS, e.g. 152d:0578:u
+      (four hex digits, colon, four hex digits, colon, flag letters; `u` means ignore UAS).
+      The kernel silently IGNORES a malformed entry, so this would be a workaround that never
+      applies while appearing configured.
+    quiet: true
+  loop: "{{ rpi_usb_quirks }}"

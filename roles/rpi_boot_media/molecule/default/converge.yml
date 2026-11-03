@@ -1,0 +1,93 @@
+---
+# Prove the role's guards FIRE. Nothing here converges a real board — there is no EEPROM, no
+# watchdog and no USB disk on a runner — so the scenario tests the parts that can be tested
+# honestly, and the verify step covers the pure decoding logic.
+- name: Converge
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    # --- the watchdog bound: the one setting that can take out the whole fleet -----------------
+    - name: 20s MUST be refused — above 15 the BCM hardware reboot-loops the board
+      block:
+        - name: Run the generated guards with an out-of-range value
+          # The REAL generated guards file, included rather than a hand-copied assertion: a test
+          # that re-implements the check tests the copy against itself (MOLMIRROR-02).
+          ansible.builtin.include_tasks: "{{ playbook_dir }}/../../tasks/_argspec_guards.yml"
+          vars:
+            rpi_watchdog_runtime_sec: 20
+            rpi_watchdog_panic_sec: 10
+        - name: SENTINEL — the guard did not fire
+          ansible.builtin.fail:
+            msg: >-
+              rpi_watchdog_runtime_sec=20 was ACCEPTED. The <=15s bound is what stops a
+              misconfigured watchdog rebooting every Pi in the fleet every 14 seconds.
+      rescue:
+        # NOT `set_fact: fired=true`. The sentinel `fail` below sits INSIDE this block, so a
+        # guard that does NOT fire lets the sentinel run, and the rescue catches THAT — recording
+        # "the guard fired" when nothing fired. Verified: with the guard stubbed out, the old form
+        # passed. Keying on which task actually failed is what makes this test able to fail.
+        - name: Record whether the GUARD failed, not the sentinel
+          ansible.builtin.set_fact:
+            wd_20_refused: "{{ ansible_failed_task.name is not search('^SENTINEL') }}"
+
+    - name: 15s — the exact hardware ceiling — must be ACCEPTED
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/../../tasks/_argspec_guards.yml"
+      vars:
+        rpi_watchdog_runtime_sec: 15
+        rpi_watchdog_panic_sec: 10
+
+    - name: 14s — the fleet default — must be ACCEPTED
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/../../tasks/_argspec_guards.yml"
+      vars:
+        rpi_watchdog_runtime_sec: 14
+        rpi_watchdog_panic_sec: 10
+
+    - name: 0s must be refused — a watchdog with no timeout is not a watchdog
+      block:
+        - name: Run the generated guards with a zero timeout
+          ansible.builtin.include_tasks: "{{ playbook_dir }}/../../tasks/_argspec_guards.yml"
+          vars:
+            rpi_watchdog_runtime_sec: 0
+            rpi_watchdog_panic_sec: 10
+        - name: SENTINEL — the guard did not fire
+          ansible.builtin.fail: {msg: "rpi_watchdog_runtime_sec=0 was accepted"}
+      rescue:
+        - name: Record whether the GUARD failed, not the sentinel
+          ansible.builtin.set_fact:
+            wd_0_refused: "{{ ansible_failed_task.name is not search('^SENTINEL') }}"
+
+    # --- the dispatcher must reject an unknown action rather than silently doing nothing -------
+    - name: An unknown action MUST be refused
+      block:
+        - name: Dispatch a nonsense action
+          ansible.builtin.include_role:
+            name: rpi_boot_media
+          vars:
+            rpi_boot_action: definitely-not-an-action
+            rpi_boot_ssd_by_id: usb-Test_SSD-0:0
+        - name: SENTINEL — the dispatcher did not fire
+          ansible.builtin.fail: {msg: "an unknown rpi_boot_action was accepted"}
+      rescue:
+        - name: Record whether the DISPATCHER failed, not the sentinel
+          ansible.builtin.set_fact:
+            action_refused: "{{ ansible_failed_task.name is not search('^SENTINEL') }}"
+
+    # --- assert HERE, not in verify -------------------------------------------------------------
+    # set_fact does not survive between molecule's converge and verify playbooks: they are separate
+    # ansible-playbook runs with no fact cache, so a fact set here reads as UNDEFINED there.
+    # Asserting in verify looked reasonable and quietly tested `undefined | default(false)` against
+    # itself. Evidence gets asserted where the evidence lives.
+    - name: Every guard fixture must have fired
+      ansible.builtin.assert:
+        that:
+          - wd_20_refused | default(false)
+          - wd_0_refused | default(false)
+          - action_refused | default(false)
+        fail_msg: >-
+          A guard that should have refused its input did not:
+          20s refused={{ wd_20_refused | default(false) }},
+          0s refused={{ wd_0_refused | default(false) }},
+          unknown action refused={{ action_refused | default(false) }}.
+        success_msg: "All three guards refused bad input; the valid values were accepted."
+        quiet: true

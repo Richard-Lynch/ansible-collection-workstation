@@ -1,0 +1,100 @@
+---
+# AUTO-GENERATED defaults file — DO NOT EDIT.
+#
+# Source of truth: roles/rpi_boot_media/meta/argument_specs.py
+# Regenerate:      venv/bin/python tools/argspec/cli.py x generate rpi_boot_media
+#
+# Edits here are silently overwritten on the next generation. To change a value or its
+# documentation, change the OptionSpec in the source file above — descriptions there
+# are emitted as the comments in this file.
+# Entrypoint:      main
+
+# Which entrypoint main.yml dispatches to.
+# probe/eeprom_report/verify are read-only; the rest need rpi_boot_apply.
+rpi_boot_action__default: probe
+
+# Actually make changes. Default false: every writing action reports its
+# plan and stops, because these actions repartition a disk, reflash board
+# firmware, or make the rescue system read-only.
+rpi_boot_apply__default: false
+
+# Desired EEPROM BOOT_ORDER. DO NOT HAND-WRITE THIS VALUE — generate it:
+#   files/rpi_boot_order.py ssd card http   ->   0xf714
+# Nibbles are read RIGHT TO LEFT (4=USB, 1=SD, 7=HTTP, f=restart), which
+# makes the format easy to misread: 0xf14 and 0xf41 differ by one
+# transposition and mean opposite things, and 0xf74 looks like a harmless
+# trim of 0xf714 while DELETING the rescue card from the boot order.
+# 0xf714 = try the USB SSD, then the SD card, then HTTP network install,
+# then loop. The first two are the fleet's normal and rescue paths; HTTP is
+# a last resort that covers the one case the card cannot — a dead SSD with
+# nobody in the building. An unreachable HTTP host simply falls through to
+# the restart, so it adds no dependency.
+# NOT THE FACTORY DEFAULT. Verified against raspberrypi/documentation:
+# the default when BOOT_ORDER is empty is 0xf41 — SD first, USB second.
+# So `eeprom` is a REAL firmware change on a new board, not the assertion
+# an earlier version of this text claimed. Skipping it because 'it's the
+# default anyway' leaves a Pi that never boots its SSD.
+# The trailing f matters: a Pi whose SSD is slow to enumerate on a cold
+# boot keeps retrying instead of sitting dark.
+rpi_boot_order__default: '0xf714'
+
+# BOOT_ORDER written by the rollback action: SD card first, USB second,
+# then restart — which is also the Pi's FACTORY default, so a rollback
+# returns the board to how it shipped.
+# Used to send a board back to its rescue card deliberately, rather than
+# relying on the firmware's automatic fallback — which only covers an
+# UNREADABLE boot partition, not a corrupt root that panics on mount.
+rpi_boot_rollback_order__default: '0xf41'
+
+# Minimum bootloader EEPROM version for USB mass-storage boot.
+# A Pi that has been in a drawer since 2019 will not USB-boot AT ALL until
+# its bootloader is updated, and the symptom reads as 'the SSD is bad'.
+# Asserted before the boot order is touched so the real cause is named.
+rpi_boot_eeprom_min_version__default: '2020-09-03'
+
+# systemd RuntimeWatchdogSec — how long the kernel may go un-petted
+# before the hardware resets the board.
+# HARD CEILING 15: the BCM watchdog cannot accept more, and values above
+# it have produced continuous reboot loops that are difficult to diagnose
+# — i.e. a misconfigured watchdog is itself a fleet-wide outage. The bound
+# is enforced by the generated guards, not left to a comment.
+rpi_watchdog_runtime_sec__default: 14
+
+# Seconds the kernel waits after a panic before rebooting itself
+# (`panic=` on the kernel command line).
+# A SEPARATE MECHANISM from the watchdog above, covering a failure the
+# watchdog cannot: a panic at root-mount happens BEFORE systemd arms the
+# watchdog, so RuntimeWatchdogSec can never fire for it. That is precisely
+# the corrupt-SSD-root case this design cares about — without `panic=` the
+# Pi hangs indefinitely and the firmware re-picks the same SSD forever.
+rpi_watchdog_panic_sec__default: 10
+
+# Tooling the rescue card must carry to be able to REPAIR or re-provision
+# the SSD.
+# Installed before the card is hardened, because afterwards its root is
+# read-only and nothing can ever be added — discovering the rescue system
+# has no fsck happens during an outage, which is the worst possible time.
+rpi_rescue_packages__default:
+  - overlayroot
+  - xz-utils
+  - e2fsprogs
+  - dosfstools
+  - parted
+  - gdisk
+  - rsync
+
+# Timeout for the OS image download, in seconds.
+rpi_boot_download_timeout__default: 1800
+
+# Hard ceiling for the async image write, in seconds.
+# Generous because a slow USB2-negotiated bridge can take well over an
+# hour for a multi-GB image.
+rpi_boot_write_timeout__default: 3600
+
+# Seconds to wait for a Pi to come back after a reboot.
+rpi_boot_reboot_timeout__default: 300
+
+# Second confirmation for provision_ssd, which DESTROYS everything on the
+# target SSD. Separate from rpi_boot_apply so that 'yes, make changes' and
+# 'yes, erase that disk' are two different statements.
+rpi_boot_confirm__default: false

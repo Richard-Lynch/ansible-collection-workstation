@@ -1,0 +1,44 @@
+---
+# Re-read the seeded card and assert every file landed. READ-ONLY.
+#
+# Worth doing BEFORE ejecting: a card that was seeded onto a stale mount, or written while the
+# volume was remounting, produces a Pi that never appears on the network — and by then the only
+# diagnosis is a monitor and keyboard.
+
+- name: Resolve declared options over their generated defaults
+  ansible.builtin.include_tasks: _resolve_defaults.yml
+
+- name: Read back the seeded files
+  ansible.builtin.stat:
+    path: "{{ rpi_image_boot_mount }}/{{ item }}"
+  register: _rpi_seeded
+  loop: [ssh, userconf.txt, custom.toml]
+
+- name: HARD GATE — every provisioning file must be present
+  ansible.builtin.assert:
+    that:
+      - _rpi_seeded.results | selectattr('stat.exists', 'equalto', false) | list | length == 0
+    fail_msg: >-
+      Missing from {{ rpi_image_boot_mount }}:
+      {{ _rpi_seeded.results | rejectattr('stat.exists') | map(attribute='item') | list }}.
+      This card will boot and then sit there with no user and no SSH.
+    success_msg: "All provisioning files are present on the card."
+    quiet: true
+
+- name: Read back the hostname actually seeded
+  # The card's IDENTITY check. Confirms this card is for the Pi you think it is — the only check
+  # that can tell two otherwise-identical cards apart, since the controller sees a USB reader's
+  # serial rather than the card's.
+  ansible.builtin.slurp:
+    src: "{{ rpi_image_boot_mount }}/custom.toml"
+  register: _rpi_toml
+
+- name: HARD GATE — the card must be seeded for the intended host
+  ansible.builtin.assert:
+    that:
+      - "'hostname = \"' ~ rpi_image_hostname ~ '\"' in (_rpi_toml.content | b64decode)"
+    fail_msg: >-
+      This card is NOT seeded for {{ rpi_image_hostname }}. Writing it into that Pi would produce
+      a hostname collision in DNS and monitoring that nothing else on the network detects.
+    success_msg: "Card is seeded for {{ rpi_image_hostname }}."
+    quiet: true

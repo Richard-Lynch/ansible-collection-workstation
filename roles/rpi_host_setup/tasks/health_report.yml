@@ -1,0 +1,55 @@
+---
+# READ-ONLY health summary for one Pi. Safe to run on a schedule.
+
+- name: Resolve declared options over their generated defaults
+  ansible.builtin.include_tasks: _resolve_defaults.yml
+
+- name: Read the throttling bitfield
+  # The STICKY bits (16-19) are the ones that matter: an undervoltage event that has already
+  # passed still explains a corrupted write ten minutes earlier. On a USB-booted Pi this presents
+  # as "the SSD is failing", which sends the investigation to the wrong component entirely.
+  ansible.builtin.command:
+    cmd: vcgencmd get_throttled
+  register: _rpi_thr
+  changed_when: false
+  failed_when: false
+
+- name: Read the SoC temperature
+  ansible.builtin.command:
+    cmd: vcgencmd measure_temp
+  register: _rpi_temp
+  changed_when: false
+  failed_when: false
+
+- name: Read filesystem usage
+  ansible.builtin.command:
+    cmd: df -h /
+  register: _rpi_df
+  changed_when: false
+
+- name: Look for filesystem errors in the journal
+  # Pinned to _TRANSPORT=kernel: a plain `journalctl | grep` matches the grep's own logged command
+  # line, which reports a problem that does not exist.
+  ansible.builtin.command:
+    argv:
+      - journalctl
+      - "-b"
+      - "--no-pager"
+      - "-p"
+      - "err"
+      - "-t"
+      - kernel
+      - "--grep=EXT4-fs error|I/O error|UAS|reset high-speed"
+  register: _rpi_fserr
+  changed_when: false
+  failed_when: false
+
+- name: Report health
+  ansible.builtin.debug:
+    msg:
+      - "{{ inventory_hostname }}"
+      - "  temperature: {{ _rpi_temp.stdout | default('?') | regex_replace('temp=', '') }}"
+      - "  throttling:  {{ _rpi_thr.stdout | default('?') }}{{ '   <- ANY non-zero value needs investigating; check the PSU before the disk' if (_rpi_thr.stdout |
+        default('=0x0')).split('=')[-1] not in ['0x0', '0'] else '' }}"
+      - "  root fs:     {{ _rpi_df.stdout_lines[-1] | default('?') }}"
+      - "  kernel I/O errors this boot: {{ (_rpi_fserr.stdout_lines | default([]) | length) }}"

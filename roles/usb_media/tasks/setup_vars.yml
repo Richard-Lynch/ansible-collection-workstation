@@ -1,0 +1,71 @@
+---
+# Resolve caller-supplied vars over the generated defaults (defaults/main.yml is GENERATED from
+# meta/argument_specs.py and holds `*__default` vars, not the plain names tasks use).
+#
+# usb_media_iso_url / usb_media_checksum_url / usb_media_device carry NO defaults on purpose.
+# They are required by the entrypoints that need them (write needs all three; inspect/benchmark/
+# integrity need the device; list needs none), and each asserts for its own. A missing device
+# must fail loudly rather than resolve to something — writing an image to an undefined device is
+# the failure this whole role exists to prevent.
+- name: Store vars
+  ansible.builtin.set_fact:
+    usb_media_action: "{{ usb_media_action | default(usb_media_action__default) }}"
+    usb_media_apply: "{{ usb_media_apply | default(usb_media_apply__default) }}"
+    usb_media_bench_mb: "{{ usb_media_bench_mb | default(usb_media_bench_mb__default) }}"
+    usb_media_sustained_mb: "{{ usb_media_sustained_mb | default(usb_media_sustained_mb__default) }}"
+    usb_media_samples: "{{ usb_media_samples | default(usb_media_samples__default) }}"
+    usb_media_full: "{{ usb_media_full | default(usb_media_full__default) }}"
+    usb_media_integrity_timeout: "{{ usb_media_integrity_timeout | default(usb_media_integrity_timeout__default) }}"
+    usb_media_random_ops: "{{ usb_media_random_ops | default(usb_media_random_ops__default) }}"
+    usb_media_random_seed: "{{ usb_media_random_seed | default(usb_media_random_seed__default) }}"
+    usb_media_retention_phase: "{{ usb_media_retention_phase | default(usb_media_retention_phase__default) }}"
+    usb_media_retention_wait: "{{ usb_media_retention_wait | default(usb_media_retention_wait__default) }}"
+    usb_media_retention_state: "{{ usb_media_retention_state | default(usb_media_retention_state__default) }}"
+    usb_media_reformat: "{{ usb_media_reformat | default(usb_media_reformat__default) }}"
+    usb_media_reformat_fs: "{{ usb_media_reformat_fs | default(usb_media_reformat_fs__default) }}"
+    usb_media_reformat_scheme: "{{ usb_media_reformat_scheme | default(usb_media_reformat_scheme__default) }}"
+    usb_media_reformat_label: "{{ usb_media_reformat_label | default(usb_media_reformat_label__default) }}"
+    usb_media_python: "{{ usb_media_python | default(usb_media_python__default) }}"
+    usb_media_verify: "{{ usb_media_verify | default(usb_media_verify__default) }}"
+    # EXPANDED HERE, ONCE. `~` is expanded by a SHELL, and Ansible's command module runs without
+    # one — so `dd if=~/.cache/...` looks for a directory literally named "~" and fails. The file
+    # and get_url modules DO expand it, which is what made this survive the whole dry run: every
+    # earlier task found the image happily and only the raw dd could not. Worse under become,
+    # where ~ is /var/root rather than the user who downloaded the image.
+    #
+    # expanduser resolves against the CONNECTION user's home, which is the account that owns the
+    # cache, so this stays correct whether or not a task escalates.
+    usb_media_cache_dir: "{{ usb_media_cache_dir | default(usb_media_cache_dir__default) | expanduser }}"
+    usb_media_iso_ttl_days: "{{ usb_media_iso_ttl_days | default(usb_media_iso_ttl_days__default) }}"
+    usb_media_decompress: "{{ usb_media_decompress | default(usb_media_decompress__default) }}"
+    usb_media_decompress_cmd: "{{ usb_media_decompress_cmd | default(usb_media_decompress_cmd__default) }}"
+    # No `__default` for this one: its OptionSpec default is None, which the generator omits from
+    # defaults/main.yml entirely. Bound to '' here so `| length > 0` on it is a real test rather
+    # than an Undefined error — an optional guard must be absent-safe, not absent-fatal.
+    usb_media_device_confirm: "{{ usb_media_device_confirm | default('') }}"
+    usb_media_download_timeout: "{{ usb_media_download_timeout | default(usb_media_download_timeout__default) }}"
+    usb_media_max_device_bytes: "{{ usb_media_max_device_bytes | default(usb_media_max_device_bytes__default) }}"
+    usb_media_dd_block_size: "{{ usb_media_dd_block_size | default(usb_media_dd_block_size__default) }}"
+    usb_media_write_timeout: "{{ usb_media_write_timeout | default(usb_media_write_timeout__default) }}"
+    usb_media_poll_interval: "{{ usb_media_poll_interval | default(usb_media_poll_interval__default) }}"
+    usb_media_verify_full: "{{ usb_media_verify_full | default(usb_media_verify_full__default) }}"
+    usb_media_verify_published: "{{ usb_media_verify_published | default(usb_media_verify_published__default) }}"
+    usb_media_readback_bytes: "{{ usb_media_readback_bytes | default(usb_media_readback_bytes__default) }}"
+    usb_media_eject: "{{ usb_media_eject | default(usb_media_eject__default) }}"
+    usb_media_become: "{{ usb_media_become | default(usb_media_become__default) }}"
+    usb_media_diskutil: "{{ usb_media_diskutil | default(usb_media_diskutil__default) }}"
+    usb_media_plutil: "{{ usb_media_plutil | default(usb_media_plutil__default) }}"
+    usb_media_dd: "{{ usb_media_dd | default(usb_media_dd__default) }}"
+    usb_media_shasum: "{{ usb_media_shasum | default(usb_media_shasum__default) }}"
+    usb_media_sync: "{{ usb_media_sync | default(usb_media_sync__default) }}"
+
+- name: Derive the raw device node
+  # /dev/rdiskN, not /dev/diskN. The raw node is roughly an order of magnitude faster for linear
+  # bulk I/O on macOS, and for benchmarking it is the only honest one — the buffered node reports
+  # the page cache's speed, which is how a dying USB 2.0 stick can "read" at 2 GB/s.
+  #
+  # Derived once here rather than in each entrypoint, and only when a device was actually given,
+  # so the list entrypoint (which has no device) does not trip over it.
+  ansible.builtin.set_fact:
+    _usb_raw: "{{ usb_media_device | regex_replace('^/dev/disk', '/dev/rdisk') }}"
+  when: usb_media_device is defined and usb_media_device | length > 0

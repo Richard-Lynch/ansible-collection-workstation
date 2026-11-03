@@ -1,0 +1,40 @@
+# Raspberry Pi OS first-boot configuration.
+# Managed by Ansible (rpi_image_media role) — regenerate rather than hand-editing.
+#
+# Read by raspberrypi-sys-mods' firstboot on current Pi OS. The card ALSO carries userconf.txt and
+# an `ssh` marker for older images: upstream calls this format temporary and possibly replaced by
+# cloud-init, and guessing wrong fails silently with no user and no SSH.
+#
+# NOTE ON `| default(none)` BELOW. An OptionSpec whose default is None emits no entry in
+# defaults/main.yml, so the generated resolver has nothing to bind and the variable is genuinely
+# UNDEFINED rather than empty. Testing it without a default therefore raises at render time on
+# every WIRED Pi — the common case. Optional options need an explicit default in the template.
+#
+# (And note this comment cannot quote the tag it describes: a Jinja tag inside a `#` comment is
+# still parsed, because `#` means nothing to Jinja. Writing the example out literally here added a
+# second, unclosed conditional and broke the whole template.)
+config_version = 1
+
+[system]
+hostname = "{{ rpi_image_hostname }}"
+
+[user]
+name = "{{ rpi_image_user }}"
+password = "{{ rpi_image_password_hash }}"
+password_encrypted = true
+
+[ssh]
+enabled = true
+password_authentication = false
+authorized_keys = [ "{{ rpi_image_authorized_key }}" ]
+{% if rpi_image_wifi_ssid | default(none) %}
+
+[wlan]
+ssid = "{{ rpi_image_wifi_ssid }}"
+# The regulatory domain is REQUIRED: without it the radio comes up rfkill-blocked on first boot,
+# so a headless Pi never appears on the network and nothing on it explains why.
+country = "{{ rpi_image_wifi_country }}"
+{% endif %}
+
+[locale]
+timezone = "Etc/UTC"

@@ -1,0 +1,111 @@
+---
+# AUTO-GENERATED defaults resolver — DO NOT EDIT.
+#
+# Source of truth: roles/usb_media/meta/argument_specs.py
+# Regenerate:      venv/bin/python tools/argspec/cli.py x generate usb_media
+#
+# Edits here are silently overwritten on the next generation. To change a value or its
+# documentation, change the OptionSpec in the source file above — descriptions there
+# are emitted as the comments in this file.
+
+# Binds every declared option to its generated default, so a caller-supplied value
+# wins and an unsupplied one falls back rather than evaluating Undefined.
+#
+# Include this FIRST from every entrypoint:
+#   - ansible.builtin.include_tasks: _resolve_defaults.yml
+#
+# Role-specific setup logic belongs in tasks/setup_vars.yml, NOT here — this file is
+# overwritten on every generation.
+#
+# TWO BRANCHES, because `set_fact` persists for the whole play. A role invoked twice in
+# one play would otherwise see its OWN leftover facts on the second call, so a later
+# caller that omitted an option silently inherited the earlier caller's value instead of
+# the declared default. On a repeat call this ignores the role's own facts and rebinds
+# the defaults; an include-level `vars:` shadows the fact, so a value the caller DID
+# supply this time still wins. Roles called once per play only ever run the first branch.
+
+- name: Resolve declared options over their generated defaults
+  ansible.builtin.set_fact:
+    usb_media_action: "{{ usb_media_action | default(usb_media_action__default) if usb_media_action__default is defined else usb_media_action | default(omit) }}"
+    usb_media_bench_mb: "{{ usb_media_bench_mb | default(usb_media_bench_mb__default) if usb_media_bench_mb__default is defined else usb_media_bench_mb | default(omit) }}"
+    usb_media_sustained_mb: "{{ usb_media_sustained_mb | default(usb_media_sustained_mb__default) if usb_media_sustained_mb__default is defined else usb_media_sustained_mb | default(omit) }}"
+    usb_media_samples: "{{ usb_media_samples | default(usb_media_samples__default) if usb_media_samples__default is defined else usb_media_samples | default(omit) }}"
+    usb_media_full: "{{ usb_media_full | default(usb_media_full__default) if usb_media_full__default is defined else usb_media_full | default(omit) }}"
+    usb_media_integrity_timeout: "{{ usb_media_integrity_timeout | default(usb_media_integrity_timeout__default) if usb_media_integrity_timeout__default is defined else usb_media_integrity_timeout | default(omit) }}"
+    usb_media_random_ops: "{{ usb_media_random_ops | default(usb_media_random_ops__default) if usb_media_random_ops__default is defined else usb_media_random_ops | default(omit) }}"
+    usb_media_random_seed: "{{ usb_media_random_seed | default(usb_media_random_seed__default) if usb_media_random_seed__default is defined else usb_media_random_seed | default(omit) }}"
+    usb_media_retention_phase: "{{ usb_media_retention_phase | default(usb_media_retention_phase__default) if usb_media_retention_phase__default is defined else usb_media_retention_phase | default(omit) }}"
+    usb_media_retention_wait: "{{ usb_media_retention_wait | default(usb_media_retention_wait__default) if usb_media_retention_wait__default is defined else usb_media_retention_wait | default(omit) }}"
+    usb_media_retention_state: "{{ usb_media_retention_state | default(usb_media_retention_state__default) if usb_media_retention_state__default is defined else usb_media_retention_state | default(omit) }}"
+    usb_media_reformat: "{{ usb_media_reformat | default(usb_media_reformat__default) if usb_media_reformat__default is defined else usb_media_reformat | default(omit) }}"
+    usb_media_reformat_fs: "{{ usb_media_reformat_fs | default(usb_media_reformat_fs__default) if usb_media_reformat_fs__default is defined else usb_media_reformat_fs | default(omit) }}"
+    usb_media_reformat_scheme: "{{ usb_media_reformat_scheme | default(usb_media_reformat_scheme__default) if usb_media_reformat_scheme__default is defined else usb_media_reformat_scheme | default(omit) }}"
+    usb_media_reformat_label: "{{ usb_media_reformat_label | default(usb_media_reformat_label__default) if usb_media_reformat_label__default is defined else usb_media_reformat_label | default(omit) }}"
+    usb_media_python: "{{ usb_media_python | default(usb_media_python__default) if usb_media_python__default is defined else usb_media_python | default(omit) }}"
+    usb_media_apply: "{{ usb_media_apply | default(usb_media_apply__default) if usb_media_apply__default is defined else usb_media_apply | default(omit) }}"
+    usb_media_verify: "{{ usb_media_verify | default(usb_media_verify__default) if usb_media_verify__default is defined else usb_media_verify | default(omit) }}"
+    usb_media_cache_dir: "{{ usb_media_cache_dir | default(usb_media_cache_dir__default) if usb_media_cache_dir__default is defined else usb_media_cache_dir | default(omit) }}"
+    usb_media_iso_ttl_days: "{{ usb_media_iso_ttl_days | default(usb_media_iso_ttl_days__default) if usb_media_iso_ttl_days__default is defined else usb_media_iso_ttl_days | default(omit) }}"
+    usb_media_decompress: "{{ usb_media_decompress | default(usb_media_decompress__default) if usb_media_decompress__default is defined else usb_media_decompress | default(omit) }}"
+    usb_media_decompress_cmd: "{{ usb_media_decompress_cmd | default(usb_media_decompress_cmd__default) if usb_media_decompress_cmd__default is defined else usb_media_decompress_cmd | default(omit) }}"
+    usb_media_download_timeout: "{{ usb_media_download_timeout | default(usb_media_download_timeout__default) if usb_media_download_timeout__default is defined else usb_media_download_timeout | default(omit) }}"
+    usb_media_max_device_bytes: "{{ usb_media_max_device_bytes | default(usb_media_max_device_bytes__default) if usb_media_max_device_bytes__default is defined else usb_media_max_device_bytes | default(omit) }}"
+    usb_media_dd_block_size: "{{ usb_media_dd_block_size | default(usb_media_dd_block_size__default) if usb_media_dd_block_size__default is defined else usb_media_dd_block_size | default(omit) }}"
+    usb_media_write_timeout: "{{ usb_media_write_timeout | default(usb_media_write_timeout__default) if usb_media_write_timeout__default is defined else usb_media_write_timeout | default(omit) }}"
+    usb_media_poll_interval: "{{ usb_media_poll_interval | default(usb_media_poll_interval__default) if usb_media_poll_interval__default is defined else usb_media_poll_interval | default(omit) }}"
+    usb_media_verify_full: "{{ usb_media_verify_full | default(usb_media_verify_full__default) if usb_media_verify_full__default is defined else usb_media_verify_full | default(omit) }}"
+    usb_media_verify_published: "{{ usb_media_verify_published | default(usb_media_verify_published__default) if usb_media_verify_published__default is defined else usb_media_verify_published | default(omit) }}"
+    usb_media_readback_bytes: "{{ usb_media_readback_bytes | default(usb_media_readback_bytes__default) if usb_media_readback_bytes__default is defined else usb_media_readback_bytes | default(omit) }}"
+    usb_media_eject: "{{ usb_media_eject | default(usb_media_eject__default) if usb_media_eject__default is defined else usb_media_eject | default(omit) }}"
+    usb_media_become: "{{ usb_media_become | default(usb_media_become__default) if usb_media_become__default is defined else usb_media_become | default(omit) }}"
+    usb_media_diskutil: "{{ usb_media_diskutil | default(usb_media_diskutil__default) if usb_media_diskutil__default is defined else usb_media_diskutil | default(omit) }}"
+    usb_media_plutil: "{{ usb_media_plutil | default(usb_media_plutil__default) if usb_media_plutil__default is defined else usb_media_plutil | default(omit) }}"
+    usb_media_dd: "{{ usb_media_dd | default(usb_media_dd__default) if usb_media_dd__default is defined else usb_media_dd | default(omit) }}"
+    usb_media_shasum: "{{ usb_media_shasum | default(usb_media_shasum__default) if usb_media_shasum__default is defined else usb_media_shasum | default(omit) }}"
+    usb_media_sync: "{{ usb_media_sync | default(usb_media_sync__default) if usb_media_sync__default is defined else usb_media_sync | default(omit) }}"
+  when: not (_usb_media__argspec_resolved | default(false))
+
+- name: Rebind the defaults on a repeat call, ignoring this role's own leftover facts
+  ansible.builtin.set_fact:
+    usb_media_action: "{{ usb_media_action__default if usb_media_action__default is defined else usb_media_action | default(omit) }}"
+    usb_media_bench_mb: "{{ usb_media_bench_mb__default if usb_media_bench_mb__default is defined else usb_media_bench_mb | default(omit) }}"
+    usb_media_sustained_mb: "{{ usb_media_sustained_mb__default if usb_media_sustained_mb__default is defined else usb_media_sustained_mb | default(omit) }}"
+    usb_media_samples: "{{ usb_media_samples__default if usb_media_samples__default is defined else usb_media_samples | default(omit) }}"
+    usb_media_full: "{{ usb_media_full__default if usb_media_full__default is defined else usb_media_full | default(omit) }}"
+    usb_media_integrity_timeout: "{{ usb_media_integrity_timeout__default if usb_media_integrity_timeout__default is defined else usb_media_integrity_timeout | default(omit) }}"
+    usb_media_random_ops: "{{ usb_media_random_ops__default if usb_media_random_ops__default is defined else usb_media_random_ops | default(omit) }}"
+    usb_media_random_seed: "{{ usb_media_random_seed__default if usb_media_random_seed__default is defined else usb_media_random_seed | default(omit) }}"
+    usb_media_retention_phase: "{{ usb_media_retention_phase__default if usb_media_retention_phase__default is defined else usb_media_retention_phase | default(omit) }}"
+    usb_media_retention_wait: "{{ usb_media_retention_wait__default if usb_media_retention_wait__default is defined else usb_media_retention_wait | default(omit) }}"
+    usb_media_retention_state: "{{ usb_media_retention_state__default if usb_media_retention_state__default is defined else usb_media_retention_state | default(omit) }}"
+    usb_media_reformat: "{{ usb_media_reformat__default if usb_media_reformat__default is defined else usb_media_reformat | default(omit) }}"
+    usb_media_reformat_fs: "{{ usb_media_reformat_fs__default if usb_media_reformat_fs__default is defined else usb_media_reformat_fs | default(omit) }}"
+    usb_media_reformat_scheme: "{{ usb_media_reformat_scheme__default if usb_media_reformat_scheme__default is defined else usb_media_reformat_scheme | default(omit) }}"
+    usb_media_reformat_label: "{{ usb_media_reformat_label__default if usb_media_reformat_label__default is defined else usb_media_reformat_label | default(omit) }}"
+    usb_media_python: "{{ usb_media_python__default if usb_media_python__default is defined else usb_media_python | default(omit) }}"
+    usb_media_apply: "{{ usb_media_apply__default if usb_media_apply__default is defined else usb_media_apply | default(omit) }}"
+    usb_media_verify: "{{ usb_media_verify__default if usb_media_verify__default is defined else usb_media_verify | default(omit) }}"
+    usb_media_cache_dir: "{{ usb_media_cache_dir__default if usb_media_cache_dir__default is defined else usb_media_cache_dir | default(omit) }}"
+    usb_media_iso_ttl_days: "{{ usb_media_iso_ttl_days__default if usb_media_iso_ttl_days__default is defined else usb_media_iso_ttl_days | default(omit) }}"
+    usb_media_decompress: "{{ usb_media_decompress__default if usb_media_decompress__default is defined else usb_media_decompress | default(omit) }}"
+    usb_media_decompress_cmd: "{{ usb_media_decompress_cmd__default if usb_media_decompress_cmd__default is defined else usb_media_decompress_cmd | default(omit) }}"
+    usb_media_download_timeout: "{{ usb_media_download_timeout__default if usb_media_download_timeout__default is defined else usb_media_download_timeout | default(omit) }}"
+    usb_media_max_device_bytes: "{{ usb_media_max_device_bytes__default if usb_media_max_device_bytes__default is defined else usb_media_max_device_bytes | default(omit) }}"
+    usb_media_dd_block_size: "{{ usb_media_dd_block_size__default if usb_media_dd_block_size__default is defined else usb_media_dd_block_size | default(omit) }}"
+    usb_media_write_timeout: "{{ usb_media_write_timeout__default if usb_media_write_timeout__default is defined else usb_media_write_timeout | default(omit) }}"
+    usb_media_poll_interval: "{{ usb_media_poll_interval__default if usb_media_poll_interval__default is defined else usb_media_poll_interval | default(omit) }}"
+    usb_media_verify_full: "{{ usb_media_verify_full__default if usb_media_verify_full__default is defined else usb_media_verify_full | default(omit) }}"
+    usb_media_verify_published: "{{ usb_media_verify_published__default if usb_media_verify_published__default is defined else usb_media_verify_published | default(omit) }}"
+    usb_media_readback_bytes: "{{ usb_media_readback_bytes__default if usb_media_readback_bytes__default is defined else usb_media_readback_bytes | default(omit) }}"
+    usb_media_eject: "{{ usb_media_eject__default if usb_media_eject__default is defined else usb_media_eject | default(omit) }}"
+    usb_media_become: "{{ usb_media_become__default if usb_media_become__default is defined else usb_media_become | default(omit) }}"
+    usb_media_diskutil: "{{ usb_media_diskutil__default if usb_media_diskutil__default is defined else usb_media_diskutil | default(omit) }}"
+    usb_media_plutil: "{{ usb_media_plutil__default if usb_media_plutil__default is defined else usb_media_plutil | default(omit) }}"
+    usb_media_dd: "{{ usb_media_dd__default if usb_media_dd__default is defined else usb_media_dd | default(omit) }}"
+    usb_media_shasum: "{{ usb_media_shasum__default if usb_media_shasum__default is defined else usb_media_shasum | default(omit) }}"
+    usb_media_sync: "{{ usb_media_sync__default if usb_media_sync__default is defined else usb_media_sync | default(omit) }}"
+  when: _usb_media__argspec_resolved | default(false)
+
+- name: Record that this role has resolved its options in this play
+  ansible.builtin.set_fact:
+    _usb_media__argspec_resolved: true

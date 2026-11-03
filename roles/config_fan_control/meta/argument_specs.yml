@@ -1,0 +1,255 @@
+---
+# AUTO-GENERATED argument spec — DO NOT EDIT.
+#
+# Source of truth: roles/config_fan_control/meta/argument_specs.py
+# Regenerate:      venv/bin/python tools/argspec/cli.py x generate config_fan_control
+#
+# Edits here are silently overwritten on the next generation. To change a value or its
+# documentation, change the OptionSpec in the source file above — descriptions there
+# are emitted as the comments in this file.
+argument_specs:
+  main:
+    short_description: Fan control by normalised per-component thermal demand
+    description:
+      - Deploys a daemon that normalises each sensor to a 0-100 demand against its
+      - OWN floor/ceiling/gamma, and drives each fan group from the MAXIMUM demand
+      - across the sensors it cares about.
+      - Exists because the Super-I/O chip can only steer off its own temp channels —
+      - amdgpu, nvme and k10temp are invisible to it, so GPU-aware case fans are
+      - outside what the hardware can express.
+      - Every machine-specific fact (which sensors, which headers, which are pumps)
+      - 'is site config: a second machine needs an inventory block, not a code change.'
+    version_added: '1.0'
+    author: Collection maintainers
+    options:
+      fand_apply:
+        description:
+          - Gate. Without it the role validates the config against the live
+          - hardware and reports, writing nothing and starting nothing.
+        type: bool
+        required: false
+        default: false
+      fand_enabled:
+        description:
+          - Whether the service should be running. Setting false stops and
+          - disables it, which releases every header to the hardware curve —
+          - the safe direction.
+        type: bool
+        required: false
+        default: true
+      fand_sensors:
+        description:
+          - 'Temperature inputs. Each: `name`, `chip` (hwmon chip name), one of'
+          - '`label` or `index`, `floor`, `ceiling`, `gamma`, and optionally'
+          - '`path_contains` to disambiguate two chips of the same name (a board'
+          - with an iGPU and a discrete card has two `amdgpu`).
+          - 'REQUIRED with no default: a role cannot know what sensors a machine'
+          - has, and guessing would silently monitor the wrong things.
+        type: list
+        required: true
+        elements: dict
+      fand_groups:
+        description:
+          - 'Fan groups. Each: `name`, `header` (pwm index), `chip`, `sensors`'
+          - (which inputs this group follows), `pwm_min`, `pwm_max`, `note`.
+          - "`pwm_min` must clear the fans' measured stall duty."
+          - REQUIRED with no default, for the same reason as the sensors.
+        type: list
+        required: true
+        elements: dict
+      fand_extra_metrics:
+        description:
+          - 'Ancillary sysfs readings collected for CONTEXT, not control:'
+          - "{name: {path, scale, unit}}. A fan graph alone cannot answer 'why did"
+          - it ramp?' — GPU power, utilisation, VRAM, clocks and the card's own
+          - fan are what turn a speed change into an explanation.
+          - Paths rather than hardcoded readings, so another machine collects a
+          - different set without touching the daemon.
+        type: dict
+        required: false
+        default: {}
+      fand_pump_headers:
+        description:
+          - 'Headers driving a pump. The daemon REFUSES to control these: driving'
+          - a pump from a fan curve risks cavitation and loss of coolant flow,
+          - and a pump's RPM says nothing about whether coolant is moving.
+        type: list
+        required: false
+        default: []
+        elements: int
+      fand_chip:
+        description:
+          - The Super-I/O chip carrying the fan headers (e.g. nct6799). Used by
+          - the unit's ExecStopPost fallback, which must name it literally.
+        type: str
+        required: true
+      fand_interval:
+        description: Seconds between control steps.
+        type: float
+        required: false
+        default: 3.0
+      fand_rise_rate:
+        description:
+          - How fast duty rises toward a higher demand, 0-1. Default 1.0 (immediate)
+          - because thermal safety takes priority on the way up.
+        type: float
+        required: false
+        default: 1.0
+      fand_fall_rate:
+        description:
+          - 'How fast duty falls toward a lower demand, 0-1. Deliberately slow: fans'
+          - that chase transients are worse than steady noise, because variation is
+          - what the ear catches.
+        type: float
+        required: false
+        default: 0.08
+      fand_deadband_pwm:
+        description: Duty change below this is not written at all.
+        type: int
+        required: false
+        default: 3
+      fand_sensor_fail_tolerance:
+        description:
+          - Consecutive read failures before a sensor counts as lost. Below this
+          - the last good demand is held — one bad poll is not a reason to act.
+        type: int
+        required: false
+        default: 5
+      fand_failsafe_floor_pwm:
+        description:
+          - On sensor loss the group is released to the hardware curve AND the
+          - curve's low points raised to at least this. The chip's curve only
+          - follows CPU temperature, so a lost GPU sensor would otherwise let it
+          - run quiet while the GPU cooks.
+        type: int
+        required: false
+        default: 140
+      fand_watchdog_sec:
+        description:
+          - systemd watchdog. Catches a hung-but-alive daemon, which neither
+          - ExecStop nor ExecStopPost would ever fire for.
+        type: int
+        required: false
+        default: 30
+      fand_path:
+        description: Where the daemon is installed.
+        type: str
+        required: false
+        default: /usr/local/bin/fand
+      fand_config_path:
+        description: Where the rendered config is written.
+        type: str
+        required: false
+        default: /etc/fand.json
+      fand_metrics_path:
+        description:
+          - Prometheus textfile output. Costs nothing on a host with no scraper —
+          - the file simply waits until Alloy's unix exporter is deployed.
+        type: str
+        required: false
+        default: /var/lib/node_exporter/textfile_collector/fand.prom
+      fand_loadtest:
+        description:
+          - 'One load test: `load_command` (argv), `sensors` (which to watch),'
+          - '`abort_above` (a list of {sensor, celsius} — REQUIRED, a load test'
+          - with no abort temperature is just a way to overheat a machine on a
+          - timer), and optional `cooldown_samples` and `container`.
+          - '`container` names an image to run the load in, rather than layering a'
+          - tool onto an image-based OS where it would slow every update and
+          - re-resolve on each rebase.
+          - Declared per test in its own play, because what stresses a GPU and
+          - what stresses an NVMe have nothing in common.
+        type: dict
+        required: false
+        default: {}
+      fand_loadtest_name:
+        description:
+          - Short name for this test, used in the result filenames so two tests do
+          - not overwrite each other's timeline.
+        type: str
+        required: false
+        default: run
+      fand_loadtest_apply:
+        description: Gate. Without it the test reports and verifies wiring only.
+        type: bool
+        required: false
+        default: false
+      fand_loadtest_duration:
+        description: Maximum seconds of load. An abort can end it sooner.
+        type: int
+        required: false
+        default: 180
+      fand_loadtest_interval:
+        description: Seconds between samples. Also the abort-check period.
+        type: float
+        required: false
+        default: 2.0
+      fand_loadtest_path:
+        description: Where the harness is installed on the target.
+        type: str
+        required: false
+        default: /usr/local/bin/fand-loadtest
+      fand_loadtest_config:
+        description: Where the rendered test config is written.
+        type: str
+        required: false
+        default: /etc/fand-loadtest.json
+      fand_loadtest_results:
+        description: Where the timeline is written on the target.
+        type: str
+        required: false
+        default: /var/tmp/fand-loadtest-{{ fand_loadtest_name | default('run') }}.json
+      fand_loadtest_fetch_to:
+        description:
+          - ABSOLUTE path on the CONTROLLER the load-test timeline is fetched to.
+          - 'Required by the loadtest entrypoint. Name it per test: a shared'
+          - filename means the second run silently overwrites the first.
+          - 'Use an absolute path: delegate_to localhost resolves a relative dest'
+          - against the playbook directory, not the working directory.
+        type: str
+        required: false
+      fand_discover_path:
+        description: Where the discovery helper is installed on the target.
+        type: str
+        required: false
+        default: /usr/local/bin/fand-discover
+      fand_discover_output:
+        description:
+          - ABSOLUTE path ON THE CONTROLLER the proposed inventory draft is written
+          - to. Required by the discover entrypoint when fand_discover_save is true.
+          - 'Local rather than on the target: it is a draft destined for'
+          - inventory, and leaving it on the machine invites treating it as live
+          - 'config. Keep it outside any directory a linter walks: a stray draft'
+          - there is parsed as a playbook and fails the lint run.
+        type: str
+        required: false
+      fand_discover_save:
+        description: Write the draft to fand_discover_output as well as printing it.
+        type: bool
+        required: false
+        default: true
+      fand_discover_modules:
+        description:
+          - Sensor modules to try loading before surveying. Without a Super-I/O
+          - module the fan headers do not exist in sysfs, and the survey would
+          - report no controllable headers when the module simply was not loaded.
+        type: list
+        required: false
+        default:
+          - nct6775
+          - it87
+          - coretemp
+          - k10temp
+          - drivetemp
+          - spd5118
+        elements: str
+      fand_python:
+        description: Interpreter for the daemon. Stdlib only; no packages needed.
+        type: str
+        required: false
+        default: /usr/bin/python3
+      fand_unit:
+        description: systemd unit name.
+        type: str
+        required: false
+        default: fand.service

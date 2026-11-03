@@ -1,0 +1,12 @@
+---
+galaxy_info:
+  namespace: richard_lynch
+  author: Richard Lynch
+  description: >-
+    OS baseline for a Raspberry Pi: board identity probe, hostname, packages, timezone, journald
+    size cap, key-only sshd, unattended security updates, USB storage quirks, the memory cgroup and
+    a health report, with configuration changes behind an apply flag.
+  license: GPL-3.0-or-later
+  min_ansible_version: "2.19"
+  galaxy_tags: [raspberrypi, baseline, ssh, linux]
+dependencies: []

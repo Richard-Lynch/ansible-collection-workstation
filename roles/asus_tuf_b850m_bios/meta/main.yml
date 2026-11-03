@@ -1,0 +1,12 @@
+---
+galaxy_info:
+  namespace: richard_lynch
+  author: Richard Lynch
+  description: >-
+    List, check and download BIOS images for one board, the ASUS TUF GAMING B850M-PLUS WIFI7 W:
+    compare the vendor's live version table with a pinned one, and download a pinned, checksum-
+    verified image. It does not flash the board.
+  license: GPL-3.0-or-later
+  min_ansible_version: "2.19"
+  galaxy_tags: [bios, firmware, asus, motherboard]
+dependencies: []

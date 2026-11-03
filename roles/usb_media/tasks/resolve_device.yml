@@ -1,0 +1,163 @@
+---
+# THE SAFETY GATE. Reads one device's properties and refuses anything that is not a plausible
+# USB stick.
+#
+# THIS FILE IS THE SINGLE SOURCE OF TRUTH for "is it safe to write here". It is included by
+# write.yml, benchmark.yml and integrity.yml rather than reimplemented in each, because a gate
+# that exists in three copies is a gate that will disagree with itself after the third edit —
+# and the disagreement will be discovered by a destroyed disk, not by a test.
+#
+# Sets _usb_dev (the parsed device properties) for the caller.
+#
+# The four conditions each independently prevent a real accident, and none is skippable by a
+# flag: usb_media_apply says "yes, write", never "yes, ignore these".
+
+- name: Assert a device was supplied
+  ansible.builtin.assert:
+    that:
+      - usb_media_device is defined
+      - usb_media_device | length > 0
+    fail_msg: >-
+      No usb_media_device given. Run the list entrypoint first
+      (usb_media_action=list) and pass a WHOLE-disk id,
+      e.g. usb_media_device=/dev/disk4.
+    quiet: true
+
+- name: Reject a partition-shaped device id before asking diskutil
+  # Caught here by SHAPE as well as by the WholeDisk property below, because the two failures
+  # want different messages: /dev/disk4s1 is a typo with an obvious fix, and saying so beats
+  # reporting the generic gate failure that would otherwise catch it a moment later.
+  ansible.builtin.assert:
+    that:
+      - usb_media_device is not match('^/dev/r?disk[0-9]+s[0-9]+$')
+    fail_msg: >-
+      {{ usb_media_device }} is a PARTITION, not a whole disk. Writing an image to a partition
+      produces a stick that silently will not boot. Drop the trailing s<N>
+      (e.g. /dev/disk4, not /dev/disk4s1).
+    quiet: true
+
+- name: Read the target device's own info as JSON
+  # Piped through plutil because ANSIBLE HAS NO from_plist FILTER — `ansible.builtin.from_plist`
+  # does not exist (verified against this venv's ansible-core 2.20; only from_xml/to_xml ship, in
+  # ansible.utils). plutil is part of macOS and gives from_json a dict with real bools and ints.
+  #
+  # `set -o pipefail` matters: without it the pipeline's status is plutil's, so a diskutil that
+  # failed on a nonexistent device would be masked by plutil succeeding on empty input — the
+  # classic "no info" reading as "safe to write".
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: >-
+      set -o pipefail;
+      {{ usb_media_diskutil }} info -plist {{ usb_media_device }}
+      | {{ usb_media_plutil }} -convert json -o - -
+  register: _usb_devinfo
+  changed_when: false
+
+- name: Parse the target device's properties
+  ansible.builtin.set_fact:
+    _usb_dev: "{{ _usb_devinfo.stdout | from_json }}"
+
+- name: Read the negotiated USB link speed
+  # Joins /dev/diskN to its USB parent's Device Speed via IOKit. Reported because a USB 3 stick
+  # negotiating a 2.0 link is the commonest reason a write takes four times as long as expected,
+  # and nothing else in the output would reveal it.
+  ansible.builtin.command:
+    cmd: "{{ usb_media_python }} {{ role_path }}/files/usb_link_speed.py {{ usb_media_device }}"
+  register: _usb_linkraw
+  changed_when: false
+
+- name: Parse the link speed
+  ansible.builtin.set_fact:
+    _usb_link: "{{ _usb_linkraw.stdout | from_json }}"
+
+- name: Report what the target device actually is
+  ansible.builtin.debug:
+    msg:
+      - "device:     {{ usb_media_device }}"
+      - "model:      {{ _usb_dev.MediaName | default('unknown') }}"
+      - "usb name:   {{ _usb_link.name | default('unknown') }} ({{ _usb_link.vendor | default('?') | trim }})"
+      - "size:       {{ (_usb_dev.TotalSize | default(0) | int / 1000 / 1000 / 1000) | round(1) }} GB ({{ _usb_dev.TotalSize | default(0) }} bytes)"
+      - "protocol:   {{ _usb_dev.BusProtocol | default('?') }}"
+      - "link speed: {{ _usb_link.speed | default('unknown') }} {{ _usb_link.speed_detail | default('') }}{{ _slow }}"
+      - "removable:  {{ _usb_dev.Removable | default(_usb_dev.RemovableMedia) | default('?') }}"
+      - "internal:   {{ _usb_dev.Internal | default('?') }}"
+      - "whole disk: {{ _usb_dev.WholeDisk | default('?') }}"
+  vars:
+    _slow: >-
+      {{ '   <-- USB 2.0 link: expect ~20-35 MB/s. Try another port.'
+         if (_usb_link.speed | default('')) == 'high_speed' else '' }}
+
+- name: Assert the target device matches its declared identity token
+  # THE BATCH GUARD. The four conditions below authenticate a CLASS of device — external,
+  # removable, whole-disk, under a size ceiling. They do NOT authenticate an IDENTITY: every card
+  # in a batch of identical SD cards passes all four, so /dev/disk4 vs /dev/disk5 is a
+  # one-character mistake that no other check in this file can catch.
+  #
+  # OPT-IN, so existing callers are unaffected; REQUIRED by anything writing media in batches.
+  #
+  # FAIL-CLOSED, and deliberately so. `_candidates | select('search', ...)` over a list that is
+  # empty when diskutil reports no identity yields no match, so an unreadable device FAILS rather
+  # than silently passing — the same polarity as `Removable | default(false)` below. A guard that
+  # skips when it cannot read its input is a silent guard.
+  #
+  # LIMITATION, stated here rather than only in the argspec because this is where someone reads it
+  # while trusting the gate: for a card in a USB reader, macOS reports the READER's serial, not
+  # the card's. Two cards in the same reader carry the SAME token. This distinguishes devices and
+  # slots, not cards; distinguishing cards requires checking their CONTENT.
+  ansible.builtin.assert:
+    that:
+      - _candidates | select('search', '^' ~ (usb_media_device_confirm | regex_escape) ~ '$') | list | length > 0
+    fail_msg: >-
+      {{ usb_media_device }} does NOT match the declared identity
+      '{{ usb_media_device_confirm }}'.
+      Device reports: {{ _candidates | join(', ') | default('(no identity readable)', true) }}.
+      REFUSING to touch it — this is the guard against writing to the wrong one of several
+      similar devices. Re-run the list entrypoint to confirm which node is which; if the device
+      reports no identity at all, that is also a refusal, not a pass.
+    quiet: true
+  vars:
+    # Several identity fields, because which one a device populates varies by bridge and by
+    # whether the medium is a card in a reader. `| select('string')` drops the nulls diskutil
+    # emits for fields it cannot read, so those can never accidentally match.
+    # DELIBERATELY NOT DeviceIdentifier or VolumeName.
+    #
+    # DeviceIdentifier is "disk4" — it restates the node you just typed and MOVES with
+    # renumbering, so confirming against it authenticates nothing and defeats the entire
+    # disk4-vs-disk5 purpose of this guard. VolumeName is "bootfs" on every card written from the
+    # same image, so it is identical across a whole batch — precisely the case this exists for.
+    # Both were accepted by an earlier version, which made the guard a tautology for the two most
+    # obvious token choices.
+    #
+    # What remains identifies the DEVICE: its USB serial, its IOKit name, its media name, its
+    # disk UUID.
+    _candidates: >-
+      {{ [_usb_dev.IORegistryEntryName | default(None),
+          _usb_dev.MediaName | default(None),
+          _usb_dev.DiskUUID | default(None),
+          _usb_link.serial | default(None)]
+         | select('string') | reject('equalto', '') | list }}
+  when:
+    - usb_media_device_confirm | default('') | length > 0
+
+- name: Assert the target is a removable, external, whole disk of plausible size
+  ansible.builtin.assert:
+    that:
+      # 1. not the boot disk or any other internal media
+      - not (_usb_dev.Internal | default(true) | bool)
+      # 2. positively removable — defaulting to FALSE so an absent key blocks rather than allows
+      - (_usb_dev.Removable | default(_usb_dev.RemovableMedia) | default(false)) | bool
+      # 3. a whole disk (/dev/disk4), never a partition (/dev/disk4s1)
+      - _usb_dev.WholeDisk | default(false) | bool
+      # 4. a real, plausible size — under the ceiling so a mounted external backup drive cannot
+      #    be selected by a one-character typo
+      - (_usb_dev.TotalSize | default(0) | int) > 0
+      - (_usb_dev.TotalSize | default(0) | int) <= (usb_media_max_device_bytes | int)
+    fail_msg: >-
+      REFUSING to use {{ usb_media_device }}.
+      internal={{ _usb_dev.Internal | default('?') }}
+      removable={{ _usb_dev.Removable | default(_usb_dev.RemovableMedia) | default('?') }}
+      whole={{ _usb_dev.WholeDisk | default('?') }}
+      size={{ _usb_dev.TotalSize | default(0) }}B (ceiling {{ usb_media_max_device_bytes }}B).
+      Run the list entrypoint to see eligible devices. Raise usb_media_max_device_bytes only if
+      the stick is genuinely larger than the ceiling.
+    quiet: true

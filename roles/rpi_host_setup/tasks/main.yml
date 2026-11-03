@@ -1,0 +1,41 @@
+---
+# DISPATCHER for the per-Pi OS baseline.
+#
+#   probe          model, serial, throttling, TRIM, what is attached          (read-only)
+#   baseline       hostname, packages, timezone, journald caps, updates       (writes)
+#   usb_quirks     UAS workarounds for known-bad USB-SATA bridges             (writes)
+#   cgroups        the memory controller Docker needs to enforce limits       (writes)
+#   health_report  throttling, SMART, filesystem errors                       (read-only)
+#   all            baseline + usb_quirks + cgroups
+#
+# SCOPE: this role stops at the OS. It deploys no services — containers, log shipping, alert rules and
+# anything fleet-level belong to the roles that own them.
+#
+# ORDERING NOTE: usb_quirks should be applied BEFORE anything writes heavily to the SSD. The
+# largest write this system ever does is imaging the SSD, and doing that through a bridge that
+# mishandles UAS can make a disk that verifies clean fail later.
+
+- name: Resolve declared options over their generated defaults
+  ansible.builtin.include_tasks: _resolve_defaults.yml
+
+- name: Assert a known action was requested
+  ansible.builtin.assert:
+    that:
+      - rpi_host_action in _actions
+    fail_msg: >-
+      Unknown rpi_host_action '{{ rpi_host_action | default('(unset)') }}'.
+      Choose one of: {{ _actions | join(', ') }}.
+    quiet: true
+  vars:
+    _actions: [probe, baseline, usb_quirks, cgroups, health_report, all]
+
+- name: Run the requested action
+  ansible.builtin.include_tasks: "{{ rpi_host_action }}.yml"
+  when: rpi_host_action != 'all'
+
+- name: Run the full baseline
+  # cgroups LAST of the three: it edits cmdline.txt, and doing it after the quirks entry means one
+  # reboot settles both rather than two.
+  ansible.builtin.include_tasks: "{{ item }}.yml"
+  loop: [baseline, usb_quirks, cgroups]
+  when: rpi_host_action == 'all'

@@ -1,0 +1,159 @@
+---
+# Converge the bootloader EEPROM's BOOT_ORDER.
+#
+# RUN THIS *AFTER* THE SSD IS PROVISIONED AND VERIFIED, never before. Pi 4 firmware falls back to
+# the SD card only when it cannot LOAD boot files from USB. Once the SSD's boot partition is
+# loadable, USB-first means the firmware commits to it — and a kernel that cannot mount a
+# half-written root simply hangs, with the perfectly good rescue card sitting in the slot,
+# preempted. Setting the boot order last makes an interrupted provision recoverable by a power
+# cycle instead of a site visit.
+#
+# THIS IS A REAL FIRMWARE CHANGE ON A NEW BOARD. The factory default is 0xf41 (SD first, USB
+# second) — verified against raspberrypi/documentation's BOOT_ORDER table. An earlier version of
+# this file claimed 0xf14 was already the default and that the action was "usually an assertion",
+# which invited skipping it; a skipped eeprom step means the Pi never boots its SSD.
+#
+# It still has to CHECK first, because the EEPROM is a property of the BOARD — it survives
+# re-imaging both disks — so a second-hand or previously tinkered-with Pi can carry anything.
+
+- name: Resolve declared options over their generated defaults
+  ansible.builtin.include_tasks: _resolve_defaults.yml
+
+- name: Survey the board
+  ansible.builtin.include_tasks: probe.yml
+
+- name: HARD GATE — the bootloader must be new enough to boot from USB at all
+  # A Pi whose bootloader predates 2020-09-03 cannot USB-boot, full stop. Without this the symptom
+  # is "the SSD does not work", and the investigation goes to the disk and the adapter rather than
+  # to the firmware.
+  ansible.builtin.assert:
+    that:
+      - rpi_probe.eeprom.version is defined
+      - rpi_probe.eeprom.version is not none
+      - rpi_probe.eeprom.version >= rpi_boot_eeprom_min_version
+    fail_msg: >-
+      Bootloader EEPROM is {{ rpi_probe.eeprom.version | default('unreadable') }}, older than the
+      {{ rpi_boot_eeprom_min_version }} required for USB mass-storage boot. This board CANNOT boot
+      from the SSD until its bootloader is updated — the symptom would otherwise read as a faulty
+      SSD. Update it with the maintenance play, then re-run.
+    success_msg: "Bootloader {{ rpi_probe.eeprom.version }} supports USB boot."
+    quiet: true
+
+- name: HARD GATE — DISABLE_HDMI must not be set
+  # rpi-eeprom#466: with DISABLE_HDMI=1 the firmware has been reported to IGNORE BOOT_ORDER. Since
+  # this action's entire purpose is to set BOOT_ORDER, proceeding would produce a board that looks
+  # correctly configured and whose fallback design is inert. Refuse rather than write a setting
+  # that may not be consulted.
+  ansible.builtin.assert:
+    that:
+      - rpi_probe.eeprom.disable_hdmi in [None, '', '0']
+    fail_msg: >-
+      This board's EEPROM sets DISABLE_HDMI={{ rpi_probe.eeprom.disable_hdmi }}, which has been
+      reported to make the firmware ignore BOOT_ORDER entirely
+      (raspberrypi/rpi-eeprom#466). Setting a boot order now would be a change that may never be
+      consulted — configured-looking and inert. Remove DISABLE_HDMI from the EEPROM config first.
+    quiet: true
+
+- name: Report the boot order and stop if it is already correct
+  ansible.builtin.debug:
+    msg:
+      - "BOOT_ORDER is already {{ rpi_probe.eeprom.boot_order }} — nothing to do."
+      - "tries, in order: {{ rpi_probe.eeprom.boot_order_decoded | join('  ->  ') }}"
+  when: rpi_probe.eeprom.boot_order | default('') == rpi_boot_order
+
+- name: Decide whether there is anything to do
+  # A FLAG, NOT `meta: end_host`. end_host ends the play for this host — including tasks the
+  # CALLER sequenced after the role. A migration play typically runs eeprom, then reboots, then
+  # verifies; with end_host, a board already on 0xf14 (the common case once a fleet is converged)
+  # would silently skip the reboot AND the verification, and the play would still look clean. The role
+  # must be able to say "nothing to do" without terminating its caller's sequence.
+  ansible.builtin.set_fact:
+    _rpi_eeprom_skip: >-
+      {{ (rpi_probe.eeprom.boot_order | default('') == rpi_boot_order)
+         or (not (rpi_boot_apply | bool)) }}
+
+- name: Report the pending EEPROM change (default — no apply flag)
+  ansible.builtin.debug:
+    msg:
+      - "DRY RUN — would change this BOARD's firmware:"
+      - "  BOOT_ORDER: {{ rpi_probe.eeprom.boot_order | default('unknown') }}  ->  {{ rpi_boot_order }}"
+      - "  currently tries: {{ rpi_probe.eeprom.boot_order_decoded | join(' -> ') }}"
+      - ""
+      - "This survives re-imaging BOTH disks. Re-run with rpi_boot_apply=true."
+  when:
+    - not (rpi_boot_apply | bool)
+    - rpi_probe.eeprom.boot_order | default('') != rpi_boot_order
+
+- name: Capture the current EEPROM config before changing it
+  # Captured so a rollback restores a KNOWN value rather than a guessed one, and so an inherited
+  # setting from a previous owner is visible in the run log rather than silently preserved.
+  ansible.builtin.copy:
+    content: "{{ rpi_probe.eeprom.config }}\n"
+    dest: "/var/tmp/rpi-eeprom-config.before"
+    mode: "0644"
+  become: true
+  when: not _rpi_eeprom_skip | bool
+
+- name: Build the new EEPROM config
+  # The FULL config is rewritten with one line substituted, rather than appending — appending a
+  # second BOOT_ORDER line leaves the file with two, and which one wins is not something to
+  # discover on a board in a cupboard.
+  ansible.builtin.copy:
+    content: |
+      {{ rpi_probe.eeprom.config | regex_replace('(?m)^BOOT_ORDER=.*$', 'BOOT_ORDER=' ~ rpi_boot_order) }}
+    dest: "/var/tmp/rpi-eeprom-config.new"
+    mode: "0644"
+  become: true
+  when: not _rpi_eeprom_skip | bool
+  register: _rpi_eeprom_new
+
+- name: Stage the EEPROM update
+  # `--apply` does NOT write the EEPROM: it stages pieeprom.upd + recovery.bin onto the currently
+  # booted medium's boot partition, and the ROM flashes at the NEXT boot. So the assertion below
+  # checks the STAGED FILE, not the live value — re-reading rpi-eeprom-config here would report
+  # the bootloader that booted THIS session, i.e. the old value, on a correct run.
+  ansible.builtin.command:
+    cmd: "rpi-eeprom-config --apply /var/tmp/rpi-eeprom-config.new"
+  become: true
+  when: not _rpi_eeprom_skip | bool
+  register: _rpi_eeprom_apply
+  changed_when: _rpi_eeprom_apply.rc == 0
+
+- name: Confirm an update is genuinely staged
+  ansible.builtin.stat:
+    path: /boot/firmware/pieeprom.upd
+  become: true
+  when: not _rpi_eeprom_skip | bool
+  register: _rpi_staged
+
+- name: Read back the config we asked the tool to stage
+  # slurp, NOT lookup('file'). Lookups run on the CONTROLLER; this file was written on the PI.
+  # A lookup here errors on the controller AFTER `rpi-eeprom-config --apply` has already staged
+  # the update, so "the play failed, so nothing changed" would be wrong: USB-first would flash at
+  # the next reboot — the precise premature boot-order change this design is built to avoid.
+  ansible.builtin.slurp:
+    src: /var/tmp/rpi-eeprom-config.new
+  become: true
+  when: not _rpi_eeprom_skip | bool
+  register: _rpi_staged_content
+
+- name: HARD GATE — the update must be staged, and its content must be what we asked for
+  # Both halves matter: a staged file proves the tool did something, and reading the config back
+  # proves it carries the value we intended rather than silently keeping the old one.
+  #
+  # NOTE this reads back our own INPUT to the tool, which proves what we asked for, not what the
+  # ROM will flash. The authoritative check is the live BOOT_ORDER after a reboot, which is what
+  # `verify` asserts — this gate exists to catch "the tool ran but staged nothing".
+  ansible.builtin.assert:
+    that:
+      - _rpi_staged.stat.exists
+      - "'BOOT_ORDER=' ~ rpi_boot_order in (_rpi_staged_content.content | b64decode)"
+    fail_msg: >-
+      The EEPROM update was not staged correctly (staged file present:
+      {{ _rpi_staged.stat.exists }}). The live BOOT_ORDER is unchanged, which is the safe
+      outcome — do not reboot expecting the new order.
+    success_msg: >-
+      BOOT_ORDER={{ rpi_boot_order }} is STAGED. It flashes at the next boot; run
+      rpi_boot_action=verify afterwards to assert the live value.
+    quiet: true
+  when: not _rpi_eeprom_skip | bool

@@ -1,0 +1,61 @@
+---
+# AUTO-GENERATED defaults resolver — DO NOT EDIT.
+#
+# Source of truth: roles/rpi_boot_media/meta/argument_specs.py
+# Regenerate:      venv/bin/python tools/argspec/cli.py x generate rpi_boot_media
+#
+# Edits here are silently overwritten on the next generation. To change a value or its
+# documentation, change the OptionSpec in the source file above — descriptions there
+# are emitted as the comments in this file.
+
+# Binds every declared option to its generated default, so a caller-supplied value
+# wins and an unsupplied one falls back rather than evaluating Undefined.
+#
+# Include this FIRST from every entrypoint:
+#   - ansible.builtin.include_tasks: _resolve_defaults.yml
+#
+# Role-specific setup logic belongs in tasks/setup_vars.yml, NOT here — this file is
+# overwritten on every generation.
+#
+# TWO BRANCHES, because `set_fact` persists for the whole play. A role invoked twice in
+# one play would otherwise see its OWN leftover facts on the second call, so a later
+# caller that omitted an option silently inherited the earlier caller's value instead of
+# the declared default. On a repeat call this ignores the role's own facts and rebinds
+# the defaults; an include-level `vars:` shadows the fact, so a value the caller DID
+# supply this time still wins. Roles called once per play only ever run the first branch.
+
+- name: Resolve declared options over their generated defaults
+  ansible.builtin.set_fact:
+    rpi_boot_action: "{{ rpi_boot_action | default(rpi_boot_action__default) if rpi_boot_action__default is defined else rpi_boot_action | default(omit) }}"
+    rpi_boot_apply: "{{ rpi_boot_apply | default(rpi_boot_apply__default) if rpi_boot_apply__default is defined else rpi_boot_apply | default(omit) }}"
+    rpi_boot_order: "{{ rpi_boot_order | default(rpi_boot_order__default) if rpi_boot_order__default is defined else rpi_boot_order | default(omit) }}"
+    rpi_boot_rollback_order: "{{ rpi_boot_rollback_order | default(rpi_boot_rollback_order__default) if rpi_boot_rollback_order__default is defined else rpi_boot_rollback_order | default(omit) }}"
+    rpi_boot_eeprom_min_version: "{{ rpi_boot_eeprom_min_version | default(rpi_boot_eeprom_min_version__default) if rpi_boot_eeprom_min_version__default is defined else rpi_boot_eeprom_min_version | default(omit) }}"
+    rpi_watchdog_runtime_sec: "{{ rpi_watchdog_runtime_sec | default(rpi_watchdog_runtime_sec__default) if rpi_watchdog_runtime_sec__default is defined else rpi_watchdog_runtime_sec | default(omit) }}"
+    rpi_watchdog_panic_sec: "{{ rpi_watchdog_panic_sec | default(rpi_watchdog_panic_sec__default) if rpi_watchdog_panic_sec__default is defined else rpi_watchdog_panic_sec | default(omit) }}"
+    rpi_rescue_packages: "{{ rpi_rescue_packages | default(rpi_rescue_packages__default) if rpi_rescue_packages__default is defined else rpi_rescue_packages | default(omit) }}"
+    rpi_boot_download_timeout: "{{ rpi_boot_download_timeout | default(rpi_boot_download_timeout__default) if rpi_boot_download_timeout__default is defined else rpi_boot_download_timeout | default(omit) }}"
+    rpi_boot_write_timeout: "{{ rpi_boot_write_timeout | default(rpi_boot_write_timeout__default) if rpi_boot_write_timeout__default is defined else rpi_boot_write_timeout | default(omit) }}"
+    rpi_boot_reboot_timeout: "{{ rpi_boot_reboot_timeout | default(rpi_boot_reboot_timeout__default) if rpi_boot_reboot_timeout__default is defined else rpi_boot_reboot_timeout | default(omit) }}"
+    rpi_boot_confirm: "{{ rpi_boot_confirm | default(rpi_boot_confirm__default) if rpi_boot_confirm__default is defined else rpi_boot_confirm | default(omit) }}"
+  when: not (_rpi_boot_media__argspec_resolved | default(false))
+
+- name: Rebind the defaults on a repeat call, ignoring this role's own leftover facts
+  ansible.builtin.set_fact:
+    rpi_boot_action: "{{ rpi_boot_action__default if rpi_boot_action__default is defined else rpi_boot_action | default(omit) }}"
+    rpi_boot_apply: "{{ rpi_boot_apply__default if rpi_boot_apply__default is defined else rpi_boot_apply | default(omit) }}"
+    rpi_boot_order: "{{ rpi_boot_order__default if rpi_boot_order__default is defined else rpi_boot_order | default(omit) }}"
+    rpi_boot_rollback_order: "{{ rpi_boot_rollback_order__default if rpi_boot_rollback_order__default is defined else rpi_boot_rollback_order | default(omit) }}"
+    rpi_boot_eeprom_min_version: "{{ rpi_boot_eeprom_min_version__default if rpi_boot_eeprom_min_version__default is defined else rpi_boot_eeprom_min_version | default(omit) }}"
+    rpi_watchdog_runtime_sec: "{{ rpi_watchdog_runtime_sec__default if rpi_watchdog_runtime_sec__default is defined else rpi_watchdog_runtime_sec | default(omit) }}"
+    rpi_watchdog_panic_sec: "{{ rpi_watchdog_panic_sec__default if rpi_watchdog_panic_sec__default is defined else rpi_watchdog_panic_sec | default(omit) }}"
+    rpi_rescue_packages: "{{ rpi_rescue_packages__default if rpi_rescue_packages__default is defined else rpi_rescue_packages | default(omit) }}"
+    rpi_boot_download_timeout: "{{ rpi_boot_download_timeout__default if rpi_boot_download_timeout__default is defined else rpi_boot_download_timeout | default(omit) }}"
+    rpi_boot_write_timeout: "{{ rpi_boot_write_timeout__default if rpi_boot_write_timeout__default is defined else rpi_boot_write_timeout | default(omit) }}"
+    rpi_boot_reboot_timeout: "{{ rpi_boot_reboot_timeout__default if rpi_boot_reboot_timeout__default is defined else rpi_boot_reboot_timeout | default(omit) }}"
+    rpi_boot_confirm: "{{ rpi_boot_confirm__default if rpi_boot_confirm__default is defined else rpi_boot_confirm | default(omit) }}"
+  when: _rpi_boot_media__argspec_resolved | default(false)
+
+- name: Record that this role has resolved its options in this play
+  ansible.builtin.set_fact:
+    _rpi_boot_media__argspec_resolved: true

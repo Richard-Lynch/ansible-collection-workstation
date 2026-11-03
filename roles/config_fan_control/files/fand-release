@@ -1,0 +1,46 @@
+#!/bin/sh
+# Release fan headers to the hardware curve. Called by fand.service's ExecStopPost, so it runs
+# on EVERY exit — crash, SIGKILL, OOM — including the ones the daemon's own handlers cannot.
+#
+# A SEPARATE SCRIPT RATHER THAN AN INLINE ExecStopPost, because an inline multi-line shell
+# command does not survive systemd's parsing: written with `\` continuations it arrives
+# malformed and fails silently, and written on one line it is unreadable and unreviewable.
+# A script can also be TESTED on its own, which an inline unit directive cannot.
+#
+# Usage: fand-release <chip> <header>...
+# Exits non-zero if any header could not be confirmed back on its curve, so systemd shows the
+# failure rather than swallowing it.
+set -u
+
+chip="${1:?usage: fand-release <chip> <header>...}"
+shift
+
+hwmon=""
+for d in /sys/class/hwmon/hwmon*; do
+    if [ "$(cat "$d/name" 2>/dev/null)" = "$chip" ]; then
+        hwmon="$d"
+        break
+    fi
+done
+
+if [ -z "$hwmon" ]; then
+    echo "fand-release: no hwmon chip named '$chip'" >&2
+    exit 1
+fi
+
+rc=0
+for h in "$@"; do
+    target="$hwmon/pwm${h}_enable"
+    [ -w "$target" ] || { echo "fand-release: $target not writable" >&2; rc=1; continue; }
+    echo 5 > "$target" 2>/dev/null
+    # Read back: a write that "succeeded" is not evidence the value landed, because Super-I/O
+    # registers can silently clamp or reject.
+    got="$(cat "$target" 2>/dev/null || echo na)"
+    if [ "$got" = "5" ]; then
+        echo "fand-release: header $h -> automatic (mode 5)"
+    else
+        echo "fand-release: header $h STILL mode=$got -- NOT under thermal control" >&2
+        rc=1
+    fi
+done
+exit $rc

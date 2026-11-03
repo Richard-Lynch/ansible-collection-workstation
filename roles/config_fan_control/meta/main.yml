@@ -1,0 +1,12 @@
+---
+galaxy_info:
+  namespace: richard_lynch
+  author: Richard Lynch
+  description: >-
+    Fan control by per-component thermal demand: survey hwmon sensors and draft a config, install
+    the daemon and its config, and (behind an apply flag) the systemd service that drives each fan
+    group from the worst of its sensors; plus a load test with abort thresholds.
+  license: GPL-3.0-or-later
+  min_ansible_version: "2.19"
+  galaxy_tags: [fans, hwmon, thermal, systemd]
+dependencies: []

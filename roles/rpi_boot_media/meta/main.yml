@@ -1,0 +1,12 @@
+---
+galaxy_info:
+  namespace: richard_lynch
+  author: Richard Lynch
+  description: >-
+    Manage which medium a Raspberry Pi 4 boots from: report and stage the EEPROM boot order,
+    provision a USB SSD as root, seal the SD card as a read-only rescue system, configure the
+    watchdog, verify and roll back, with writes behind an apply flag.
+  license: GPL-3.0-or-later
+  min_ansible_version: "2.19"
+  galaxy_tags: [raspberrypi, boot, eeprom, ssd]
+dependencies: []

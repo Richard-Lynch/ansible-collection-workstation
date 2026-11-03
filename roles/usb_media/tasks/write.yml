@@ -1,0 +1,590 @@
+---
+# ENTRYPOINT: download a hybrid ISO, verify it, and write it to a removable USB device.
+#
+# GENERATE-DON'T-APPLY: every run reports what it WOULD overwrite and stops. The write only
+# happens when usb_media_apply=true is passed explicitly. `dd` to the wrong /dev/diskN eats the
+# controller's own disk, so the default has to be the harmless one.
+
+- name: Apply role defaults
+  ansible.builtin.include_tasks: setup_vars.yml
+
+- name: Assert the verification options are coherent
+  # published-checksum verification compares against the FULL-image hash, so asking for it
+  # without the full check would silently do nothing — a verification flag that cannot fire is
+  # a silent guard. Fail loudly instead.
+  ansible.builtin.assert:
+    that:
+      - not (usb_media_verify_published | bool) or (usb_media_verify_full | bool)
+    fail_msg: >-
+      usb_media_verify_published=true requires usb_media_verify_full=true — the published
+      checksum is compared against the full-image hash, so without it there is nothing to
+      compare and the check would silently pass without verifying anything.
+    quiet: true
+
+- name: Assert the required inputs were supplied
+  # These three have no defaults on purpose (see setup_vars.yml). Asserted together, up front,
+  # so a missing one reports as "you did not say which device" rather than as an undefined-var
+  # traceback from somewhere deep in the write path.
+  ansible.builtin.assert:
+    that:
+      - usb_media_iso_url is defined and usb_media_iso_url | length > 0
+      - usb_media_checksum_url is defined and usb_media_checksum_url | length > 0
+      - usb_media_device is defined and usb_media_device | length > 0
+    fail_msg: >-
+      usb_install_media needs usb_media_iso_url, usb_media_checksum_url and usb_media_device.
+      usb_media_device must be a WHOLE-disk node such as /dev/disk4.
+    quiet: true
+
+- name: Resolve the target image name
+  ansible.builtin.set_fact:
+    _usb_iso_name: "{{ usb_media_iso_url | urlsplit('path') | basename }}"
+
+- name: Resolve the local cache path for the image
+  ansible.builtin.set_fact:
+    _usb_iso_path: "{{ usb_media_cache_dir }}/{{ _usb_iso_name }}"
+
+- name: Resolve the decompressed image path
+  # Strips exactly ONE trailing compression suffix, so `2026-05-13-raspios.img.xz` becomes
+  # `...img` — which is what xz itself writes, and therefore what `creates:` must test for.
+  # `regex_replace` with an anchored, escaped alternation rather than `splitext`, so a dot inside
+  # the image NAME cannot truncate it.
+  ansible.builtin.set_fact:
+    _usb_img_path: "{{ _usb_iso_path | regex_replace('\\.(xz|gz|bz2|zst)$', '') }}"
+  when: usb_media_decompress | bool
+
+- name: Assert decompression would actually change the filename
+  # A compressed file whose name carries no known suffix means `creates:` tests the file we are
+  # decompressing FROM. That task would then always skip, the gate below would pass on the
+  # compressed file, and dd would write an unbootable card — a silent guard, so fail instead.
+  ansible.builtin.assert:
+    that:
+      - _usb_img_path != _usb_iso_path
+    fail_msg: >-
+      usb_media_decompress=true but '{{ _usb_iso_name }}' has no recognised compression suffix
+      (.xz/.gz/.bz2/.zst), so the decompressed name would be identical to the compressed one and
+      the decompression step could not be verified. Either the image is not compressed (unset
+      usb_media_decompress) or its URL needs the real filename.
+    quiet: true
+  when: usb_media_decompress | bool
+
+- name: Assert the image path is absolute
+  # `dd` gets no shell, so it cannot expand `~` — it would look for a directory literally named
+  # "~" and fail. Every OTHER consumer of this path (file, get_url, stat) expands it happily,
+  # which is exactly why an unexpanded path survives a complete dry run and only breaks at the
+  # write itself, after a multi-GB download. Asserted here so the failure is immediate and named.
+  ansible.builtin.assert:
+    that:
+      - _usb_iso_path is match('^/')
+    fail_msg: >-
+      usb_media_cache_dir must resolve to an absolute path; got '{{ _usb_iso_path }}'.
+      A leading '~' is not expanded for the raw dd write (no shell), even though the download
+      and stat tasks accept it.
+    quiet: true
+
+- name: Ensure the image cache directory exists
+  ansible.builtin.file:
+    path: "{{ usb_media_cache_dir }}"
+    state: directory
+    mode: "0755"
+
+# --- 1. the image ------------------------------------------------------------------------------
+
+- name: Fetch the upstream checksum file
+  # Fetched BEFORE the ISO so a broken/moved release fails in seconds rather than after an 8GB
+  # download. Registered rather than written next to the ISO: the only thing wanted from it is
+  # the hash, and a stale on-disk copy is one more thing that can silently disagree.
+  ansible.builtin.uri:
+    url: "{{ usb_media_checksum_url }}"
+    return_content: true
+  register: _usb_checksum_raw
+  when: usb_media_verify | bool
+
+- name: Extract the expected SHA256 from the checksum file
+  # Parsed with a regex rather than handed to `sha256sum -c`, for three reasons that have each
+  # bitten this exact file:
+  #   1. macOS has no GNU coreutils `sha256sum` guaranteed on PATH (some releases ship
+  #      /sbin/sha256sum, but that is a Darwin extra, not a given on any controller).
+  #   2. ublue-os/bazzite#3793: the CHECKSUM file shipped for several releases with the BUILD
+  #      RUNNER'S absolute path in the filename field
+  #      ("/home/runner/work/bazzite/bazzite/upload/bazzite-...iso"), which makes `-c` fail on a
+  #      perfectly good download. Upstream has since fixed it, but the format has proven unstable
+  #      and the filename field is not worth depending on.
+  #   3. the file may carry more than one line (multiple variants) — so the line is selected by
+  #      the ISO NAME, not by position.
+  #
+  # 64 hex chars on the line naming this ISO, with NO \b word-boundary token — deliberately.
+  # Verified experimentally (ansible-core 2.20): inside a FOLDED (`>-`) scalar
+  # `'\\b'` reaches the regex engine as a literal double-backslash and the search returns None,
+  # silently, while the SAME `'\\b'` in a double-quoted scalar is correct (only YAML's
+  # double-quoted style processes backslash escapes), and its failure mode here is an empty parse — i.e. a verification step
+  # that can never pass. `[0-9a-f]{64}` needs no boundary anyway: the line was already selected by
+  # ISO name, and a 64-char hex run is unambiguous. Anchoring bought nothing and cost correctness.
+  #
+  # The rest of the parse is defensive for reasons that have each occurred upstream:
+  #   - `select('search', ...)` picks the line by ISO NAME, so a multi-variant checksum file
+  #     cannot yield another image's hash (which would fail as a "corrupt download").
+  #   - the filename FIELD is never compared, so the #3793 build-path form still parses.
+  #   - `reject('none')` drops non-matching lines; regex_search returns None, and None must not
+  #     reach `first`.
+  ansible.builtin.set_fact:
+    _usb_expected_sha: >-
+      {{ (_usb_checksum_raw.content.splitlines()
+          | select('search', _usb_iso_name | regex_escape)
+          | map('regex_search', '[0-9a-f]{64}')
+          | reject('none') | list | first | default('')) }}
+  when: usb_media_verify | bool
+
+- name: Assert a usable checksum was actually parsed
+  # Without this, an empty parse would flow into the comparison below and compare '' to a real
+  # hash — which fails loudly, but with a message about a hash mismatch rather than about a
+  # checksum file whose format changed. Distinguishing the two saves the next debugging session.
+  ansible.builtin.assert:
+    that:
+      - _usb_expected_sha | length == 64
+    fail_msg: >-
+      Could not parse a SHA256 for '{{ _usb_iso_name }}' out of {{ usb_media_checksum_url }}.
+      The upstream checksum format may have changed again (see ublue-os/bazzite#3793).
+      Re-check by hand, or pass usb_media_verify=false to skip verification deliberately.
+    quiet: true
+  when: usb_media_verify | bool
+
+- name: Stat any already-cached copy of THIS image
+  ansible.builtin.stat:
+    path: "{{ _usb_iso_path }}"
+  register: _usb_cached
+
+- name: Clear any stale download-age fact before calling the downloader
+  # utils_file_download decides whether to fetch from `file_days_since_download`, which it sets
+  # ONLY `when: file_stat.stat.exists`. So if anything earlier in the same play already set that
+  # fact, a call for a DIFFERENT and ABSENT file reuses the previous file's age and skips the
+  # download entirely — leaving the caller with no file and no error. Without the reset, a
+  # second image in the same run is never fetched, and the failure surfaces several tasks later
+  # as "image is missing or corrupt".
+  #
+  # Reset here rather than patched there because that role is shared with other callers; the
+  # cheap, local fix is to guarantee the precondition it actually depends on.
+  # Set from a REAL stat of the image this run actually wants, so the cache still works: an
+  # existing, fresh copy keeps its true age and is not re-fetched (these images are ~8GB), while
+  # an absent one gets the "ancient" sentinel and is downloaded.
+  #
+  # NOT set to null: `default()` only substitutes for an UNDEFINED value, so a null would survive
+  # the downloader's `| default(1000000) | int` and evaluate to 0 — "downloaded today" — which
+  # would skip the fetch forever. Verified: `none | default(1000000) | int` is 0, not 1000000.
+  ansible.builtin.set_fact:
+    file_days_since_download: >-
+      {{ ((now() - ('%Y-%m-%d %H:%M:%S' | strftime(second=_usb_cached.stat.ctime) | to_datetime)).days)
+         if _usb_cached.stat.exists else 999999 }}
+
+- name: Download the installer image (cached)
+  # Reuses the repo's generic downloader rather than a second get_url. Its TTL logic means a
+  # re-run does not re-pull 8GB; the checksum below is what proves the cached copy is still good.
+  ansible.builtin.include_role:
+    name: richard_lynch.common.utils_file_download
+  vars:
+    file_download_url: "{{ usb_media_iso_url }}"
+    file_download_path: "{{ _usb_iso_path }}"
+    file_download_ttl_days: "{{ usb_media_iso_ttl_days }}"
+    file_download_timeout: "{{ usb_media_download_timeout }}"
+
+- name: Checksum the downloaded image
+  # ansible.builtin.stat rather than shelling out, so this does not depend on which checksum
+  # binary the controller happens to have.
+  ansible.builtin.stat:
+    path: "{{ _usb_iso_path }}"
+    checksum_algorithm: sha256
+    get_checksum: true
+  register: _usb_iso_stat
+
+- name: Assert the image exists and matches the upstream checksum
+  # Gated on the read-back, not on the download task's changed status: a cached file that was
+  # never re-downloaded this run still has to be proven intact, and a truncated download is
+  # exactly the failure that produces an unbootable stick with no other symptom.
+  ansible.builtin.assert:
+    that:
+      - _usb_iso_stat.stat.exists
+      - not (usb_media_verify | bool) or _usb_iso_stat.stat.checksum == _usb_expected_sha
+    fail_msg: >-
+      Image at {{ _usb_iso_path }} is missing or corrupt.
+      exists={{ _usb_iso_stat.stat.exists }}
+      got={{ _usb_iso_stat.stat.checksum | default('none') }}
+      want={{ _usb_expected_sha | default('(verification disabled)') }}
+      Delete the file and re-run to re-download.
+    quiet: true
+
+# --- 1b. decompression (opt-in) ------------------------------------------------------------------
+# WHY THIS EXISTS AT ALL: Raspberry Pi OS ships as .img.xz, and `dd`-ing the COMPRESSED file
+# produces a card that simply does not boot, with no other symptom. This role was written for
+# isohybrid ISOs, which need no such step.
+#
+# WHY IT SITS *HERE*, between the checksum and the device work — the ordering is the whole design:
+#   download -> verify the ARCHIVE against the published sha -> decompress -> write -> read back
+#              against the DECOMPRESSED image.
+# The published checksum is of the compressed file, so it can only be checked before this point.
+# Everything downstream (the size-vs-device check, the dd, the leading-bytes read-back and the full
+# read-back verification) then operates on the decompressed image, because that is what actually
+# gets written.
+#
+# WHY NOT `xz -dc | dd`: a stream discards the decompressed SIZE and HASH, which are precisely what
+# the post-write verification needs to prove the write landed; and a failure mid-pipe is masked by
+# dd's exit status. Decompressing to the cache first keeps every existing guarantee intact.
+
+- name: Check whether the decompressed image is already cached
+  ansible.builtin.stat:
+    path: "{{ _usb_img_path }}"
+    get_checksum: false
+  register: _usb_decompressed
+  when: usb_media_decompress | bool
+
+- name: Decompress the image
+  # `creates:` makes this idempotent, so a re-run does not spend minutes re-expanding a 5GB image.
+  # -k keeps the compressed original: it is the thing the published checksum refers to, so deleting
+  # it would force a full re-download on the next run just to re-verify.
+  #
+  # Resolved through PATH (no absolute path) — an absolute path baked in here is the
+  # CI-vs-dev-machine trap: Homebrew and a Linux runner put xz in different places.
+  ansible.builtin.command:
+    cmd: "{{ usb_media_decompress_cmd }} -dk --force {{ _usb_iso_path }}"
+    creates: "{{ _usb_img_path }}"
+  register: _usb_decompress
+  when:
+    - usb_media_decompress | bool
+    - not (_usb_decompressed.stat.exists | default(false))
+
+- name: Re-stat the decompressed image
+  # Read back rather than trusting the command's exit code: `xz` can exit 0 having written a
+  # truncated file if the filesystem filled, and the size is what the device-capacity check below
+  # depends on being real.
+  ansible.builtin.stat:
+    path: "{{ _usb_img_path }}"
+    checksum_algorithm: sha256
+    get_checksum: "{{ usb_media_verify_full | bool }}"
+  register: _usb_img_stat
+  when: usb_media_decompress | bool
+
+- name: Ask the archive how large the decompressed image should be
+  # THE CHECK THAT MAKES THE CACHE SAFE. Decompression is skipped whenever a file with the
+  # decompressed NAME exists, which is right for a completed one and catastrophic for a partial:
+  # an xz killed by a power cut or ENOSPC leaves a truncated .img that every later run reuses.
+  # A size>0 check passes it, the head read-back passes (the first megabytes are fine), and the
+  # FULL read-back compares the device against that same truncated file's own checksum — so a
+  # permanently unbootable card verifies GREEN, forever, until someone deletes the file by hand.
+  #
+  # `xz --robot -l` reports the true uncompressed size from the archive's own index, so the
+  # decompressed file can be checked against what it is SUPPOSED to be rather than against
+  # itself. Field 5 of the "totals" line.
+  ansible.builtin.shell:
+    cmd: >-
+      set -o pipefail;
+      {{ usb_media_decompress_cmd }} --robot -l {{ _usb_iso_path | quote }}
+      | awk '/^totals/ {print $5}'
+    executable: /bin/bash
+  register: _usb_expected_size
+  changed_when: false
+  when: usb_media_decompress | bool
+
+- name: HARD GATE — the decompressed image must exist and be the size the archive declares
+  ansible.builtin.assert:
+    that:
+      - _usb_img_stat.stat.exists | default(false)
+      - (_usb_img_stat.stat.size | default(0) | int) > 0
+      # Skipped only if xz could not report a size — in which case say so rather than pretend.
+      - (_usb_expected_size.stdout | default('') | trim | length == 0) or ((_usb_img_stat.stat.size | int) == (_usb_expected_size.stdout | trim | int))
+    fail_msg: >-
+      The decompressed image at {{ _usb_img_path }} is not what {{ _usb_iso_path }} says it should
+      be: on disk {{ _usb_img_stat.stat.size | default(0) }}B, archive declares
+      {{ _usb_expected_size.stdout | default('(unknown)') | trim }}B.
+      This is what a decompression killed partway leaves behind, and it would be reused on every
+      future run — writing a truncated image that then VERIFIES against its own checksum.
+      Delete {{ _usb_img_path }} and re-run.
+    success_msg: >-
+      Decompressed image is {{ _usb_img_stat.stat.size }}B, matching the archive's declared size.
+    quiet: true
+  when: usb_media_decompress | bool
+
+- name: Bind the write source to the image that will actually be written
+  # ONE fact for everything downstream, so the dd, the capacity check and both read-back
+  # verifications can never disagree about which file the card is supposed to contain.
+  ansible.builtin.set_fact:
+    _usb_src_path: "{{ _usb_img_path if (usb_media_decompress | bool) else _usb_iso_path }}"
+    _usb_src_stat: "{{ _usb_img_stat.stat if (usb_media_decompress | bool) else _usb_iso_stat.stat }}"
+
+# --- 2. the target device -----------------------------------------------------------------------
+# THE SAFETY GATE, included rather than inlined: resolve_device.yml is the single source of truth
+# for "is it safe to write here", shared with the benchmark and integrity entrypoints. Sets
+# _usb_dev for the size check below.
+
+- name: Resolve and vet the target device
+  ansible.builtin.include_tasks: resolve_device.yml
+
+- name: Assert the device is big enough for this image
+  # Size-vs-image is checked HERE rather than in the shared gate because only the write path has
+  # an image to compare against; the benchmark and integrity paths legitimately have none.
+  ansible.builtin.assert:
+    that:
+      - (_usb_dev.TotalSize | default(0) | int) >= (_usb_src_stat.size | int)
+    fail_msg: >-
+      {{ usb_media_device }} holds {{ _usb_dev.TotalSize | default(0) }}B but the image needs
+      {{ _usb_src_stat.size }}B. Use a larger stick.
+    quiet: true
+
+# --- 3. the write ------------------------------------------------------------------------------
+
+- name: Report the pending write and stop (default — no apply flag)
+  ansible.builtin.debug:
+    msg: >-
+      DRY RUN — would write {{ _usb_src_path }}
+      ({{ (_usb_src_stat.size | int / 1024 / 1024 / 1024) | round(2) }} GB)
+      to {{ usb_media_device }} ({{ _usb_dev.MediaName | default('unknown') }}),
+      DESTROYING everything on it.
+      Re-run with usb_media_apply=true to actually write.
+  when: not (usb_media_apply | bool)
+
+- name: Unmount the device before writing
+  # diskutil unmountDisk, not `umount`: the whole disk's volumes must all be released or dd gets
+  # "Resource busy". This is the documented macOS path and it leaves the device node present.
+  ansible.builtin.command:
+    cmd: "{{ usb_media_diskutil }} unmountDisk {{ usb_media_device }}"
+  register: _usb_unmount
+  changed_when: true
+  become: "{{ usb_media_become | bool }}"
+  when: usb_media_apply | bool
+
+- name: Write the image to the raw device
+  # /dev/rdiskN (raw) not /dev/diskN (buffered): the raw node is roughly an order of magnitude
+  # faster on macOS for a linear bulk write. The device id is rewritten here rather than asked
+  # for as an rdisk up front, because every safety check above queries diskutil, which only knows
+  # the buffered name.
+  #
+  # Bazzite ships an isohybrid image, so a flat block copy IS the supported write method — no
+  # partitioning, no bootloader install, nothing to do for UEFI beyond this.
+  #
+  # RUN ASYNC so the progress loop below can report while it works. `status=progress` alone does
+  # NOT give live output through Ansible: dd writes those lines to stderr once a second, but
+  # Ansible buffers a task's output and hands it over only when the task ENDS — verified, only
+  # the final summary line survives. An 8GB write to a USB 2.0 stick is 15+ silent minutes that
+  # looks indistinguishable from a hang, so the write is backgrounded and polled instead.
+  #
+  # poll:0 starts it and returns immediately; async is the hard ceiling after which Ansible kills
+  # it, derived from the configured timeout.
+  ansible.builtin.command:
+    cmd: >-
+      {{ usb_media_dd }} if={{ _usb_src_path }}
+      of={{ _usb_raw }}
+      bs={{ usb_media_dd_block_size }}
+  # ANSIBLE-BREAK-GLASS is NOT needed here: this is the codified play, which is the point.
+  register: _usb_dd_async
+  changed_when: true
+  become: "{{ usb_media_become | bool }}"
+  when: usb_media_apply | bool
+  async: "{{ usb_media_write_timeout | int }}"
+  poll: 0
+
+- name: Report write progress until it finishes
+  # Polls the async job and prints how far along the device is. The size is read from the DEVICE
+  # rather than from dd, because dd's own progress is unreachable (see above) — and a device-side
+  # read is the more honest number anyway.
+  #
+  # This loop is NOT a silent guard: `until` is paired with an explicit assert immediately after
+  # (an `until:` that exhausts its retries otherwise continues and the run exits green).
+  ansible.builtin.async_status:
+    jid: "{{ _usb_dd_async.ansible_job_id }}"
+  register: _usb_dd
+  until: _usb_dd.finished
+  retries: "{{ ((usb_media_write_timeout | int) / (usb_media_poll_interval | int)) | round(0, 'ceil') | int }}"
+  delay: "{{ usb_media_poll_interval | int }}"
+  become: "{{ usb_media_become | bool }}"
+  when: usb_media_apply | bool
+
+- name: Assert the write actually completed and succeeded
+  # The explicit re-check the `until:` loop requires. A loop that exhausts its retries does NOT
+  # fail the play by itself, so without this a timed-out write would sail on to the read-back and
+  # report a confusing byte mismatch instead of "the write never finished".
+  ansible.builtin.assert:
+    that:
+      - _usb_dd.finished | default(false) | bool
+      - (_usb_dd.rc | default(1) | int) == 0
+    fail_msg: >-
+      The write did not complete successfully.
+      finished={{ _usb_dd.finished | default(false) }} rc={{ _usb_dd.rc | default('unknown') }}
+      stderr={{ _usb_dd.stderr | default('') | truncate(300) }}
+      If it timed out, raise usb_media_write_timeout (currently
+      {{ usb_media_write_timeout }}s) — a slow USB 2.0 stick can need well over an hour.
+    quiet: true
+  when: usb_media_apply | bool
+
+- name: Flush buffers to the device
+  ansible.builtin.command:
+    cmd: "{{ usb_media_sync }}"
+  changed_when: true
+  become: "{{ usb_media_become | bool }}"
+  when: usb_media_apply | bool
+
+# --- 4. prove it landed --------------------------------------------------------------------------
+
+# --- 4. prove it landed --------------------------------------------------------------------------
+#
+# THREE TIERS, because they answer different questions and cost very different amounts:
+#
+#   head  (always)   the first N bytes of the device match the image. Seconds. Catches the common
+#                    failures — nothing written, written to a partition instead of the whole disk,
+#                    a dd that exited 0 after silently short-writing.
+#   full  (default)  every byte of the image, re-read off the device and hashed. Takes about as
+#                    long as reading the image back (~2 min for 8GB on USB 3). This is what proves
+#                    the WHOLE image landed, not just its start — a stick that fails partway
+#                    through passes the head check and still will not install.
+#   published (opt-in) the device hash also equals the checksum the vendor publishes. Requires a
+#                    network fetch and only means anything when the image came from a source that
+#                    publishes one, so it is off by default.
+#
+# The full tier is the default because a verified-unbootable stick discovered at the target
+# machine costs far more than two minutes here. Set usb_media_verify_full=false to skip it.
+
+- name: Read back the first bytes of the written device
+  # A read-back rather than trusting dd's exit code. dd returns 0 on a short write to a device
+  # that silently stopped accepting data, which is a real failure mode on failing sticks and
+  # produces a stick that appears written and will not boot.
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: >-
+      set -o pipefail;
+      {{ usb_media_dd }}
+      if={{ _usb_raw }}
+      bs={{ usb_media_readback_bytes }} count=1 2>/dev/null
+      | {{ usb_media_shasum }} -a 256 | cut -d' ' -f1
+  register: _usb_readback
+  changed_when: false
+  become: "{{ usb_media_become | bool }}"
+  when: usb_media_apply | bool
+
+- name: Read the same leading bytes from the source image
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: >-
+      set -o pipefail;
+      {{ usb_media_dd }} if={{ _usb_src_path }}
+      bs={{ usb_media_readback_bytes }} count=1 2>/dev/null
+      | {{ usb_media_shasum }} -a 256 | cut -d' ' -f1
+  register: _usb_srchead
+  changed_when: false
+  when: usb_media_apply | bool
+
+- name: Assert the device's leading bytes match the image
+  ansible.builtin.assert:
+    that:
+      - _usb_readback.stdout | trim == _usb_srchead.stdout | trim
+      - (_usb_readback.stdout | trim) | length == 64
+    fail_msg: >-
+      Read-back MISMATCH — {{ usb_media_device }} does not begin with the image's bytes.
+      device={{ _usb_readback.stdout | default('') | trim }}
+      image={{ _usb_srchead.stdout | default('') | trim }}
+      The stick is NOT bootable. Re-run, or try another USB device.
+    quiet: true
+  when: usb_media_apply | bool
+
+# --- tier 2: the whole image -----------------------------------------------------------------
+- name: Hash the full image as written to the device
+  # Reads back EXACTLY the image's byte count and no more. The device is larger than the image, so
+  # hashing the whole device would include trailing bytes the image never covered and could never
+  # match. `head -c` bounds it; count= alone rounds up to a block boundary.
+  #
+  # Async + poll: this reads gigabytes and Ansible buffers task output until completion, so a
+  # synchronous call would sit silent for minutes with no way to tell progress from a hang.
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: >-
+      set -o pipefail;
+      {{ usb_media_dd }} if={{ _usb_raw }} bs=1m
+      count={{ (_usb_src_stat.size | int / 1048576) | round(0, 'ceil') | int }} 2>/dev/null
+      | head -c {{ _usb_src_stat.size | int }}
+      | {{ usb_media_shasum }} -a 256 | cut -d' ' -f1
+  register: _usb_fullhash_async
+  changed_when: false
+  become: "{{ usb_media_become | bool }}"
+  async: "{{ usb_media_write_timeout | int }}"
+  poll: 0
+  when:
+    - usb_media_apply | bool
+    - usb_media_verify_full | bool
+
+- name: Wait for the full-image hash
+  ansible.builtin.async_status:
+    jid: "{{ _usb_fullhash_async.ansible_job_id }}"
+  register: _usb_fullhash
+  until: _usb_fullhash.finished
+  # Quiet: each unfinished poll would otherwise print "FAILED - RETRYING", which reads like an
+  # error while the job is working normally.
+  changed_when: false
+  retries: "{{ ((usb_media_write_timeout | int) / (usb_media_poll_interval | int)) | round(0, 'ceil') | int }}"
+  delay: "{{ usb_media_poll_interval | int }}"
+  become: "{{ usb_media_become | bool }}"
+  when:
+    - usb_media_apply | bool
+    - usb_media_verify_full | bool
+
+- name: Assert the ENTIRE written image matches the source
+  # The explicit re-check the `until:` loop requires — a loop that exhausts its retries continues
+  # rather than failing, so without this a timed-out hash would compare an empty string and
+  # report a mismatch that is really a timeout.
+  ansible.builtin.assert:
+    that:
+      - _usb_fullhash.finished | default(false) | bool
+      - (_usb_fullhash.stdout | default('') | trim) | length == 64
+      - (_usb_fullhash.stdout | trim) == _usb_src_stat.checksum
+    fail_msg: >-
+      FULL-IMAGE MISMATCH on {{ usb_media_device }}.
+      device={{ _usb_fullhash.stdout | default('(no output)') | trim }}
+      image={{ _usb_src_stat.checksum }}
+      finished={{ _usb_fullhash.finished | default(false) }}
+      The first bytes matched but the whole image does not, so the write failed partway —
+      the stick will start to boot and then fail. Re-run, or try another USB device.
+    quiet: true
+  when:
+    - usb_media_apply | bool
+    - usb_media_verify_full | bool
+
+# --- tier 3: the vendor's published checksum (opt-in) ------------------------------------------
+- name: Assert the device also matches the PUBLISHED checksum
+  # Closes the chain end to end: vendor's published hash -> downloaded image -> bytes on the
+  # device. The image was already checked against this hash before writing, so this adds the last
+  # link rather than repeating the first.
+  #
+  # OPT-IN because it is only meaningful when the image came from a source that publishes a
+  # checksum, and _usb_expected_sha is only populated when usb_media_verify is on. A build from a
+  # local file has nothing to compare against, and failing such a run would be wrong.
+  ansible.builtin.assert:
+    that:
+      - _usb_expected_sha | default('') | length == 64
+      - (_usb_fullhash.stdout | trim) == _usb_expected_sha
+    fail_msg: >-
+      PUBLISHED-CHECKSUM MISMATCH on {{ usb_media_device }}.
+      device={{ _usb_fullhash.stdout | default('') | trim }}
+      published={{ _usb_expected_sha | default('(none parsed — was usb_media_verify enabled?)') }}
+      The bytes on the stick do not match what the vendor published.
+    quiet: true
+  when:
+    - usb_media_apply | bool
+    - usb_media_verify_full | bool
+    - usb_media_verify_published | bool
+
+- name: Report what was verified
+  # States which tiers actually ran, so a pass is never read as more than it proved.
+  ansible.builtin.debug:
+    msg: >-
+      VERIFIED {{ usb_media_device }}:
+      first {{ usb_media_readback_bytes }} bytes match the image{{
+        ', full ' ~ _usb_src_stat.size ~ ' bytes match the image'
+        if (usb_media_verify_full | bool) else
+        ' (full-image check SKIPPED — usb_media_verify_full=false)' }}{{
+        ', and match the vendor-published checksum'
+        if (usb_media_verify_full | bool and usb_media_verify_published | bool) else
+        '. Published-checksum check not run (usb_media_verify_published=false).' }}
+  when: usb_media_apply | bool
+
+- name: Eject the finished device
+  ansible.builtin.command:
+    cmd: "{{ usb_media_diskutil }} eject {{ usb_media_device }}"
+  changed_when: true
+  become: "{{ usb_media_become | bool }}"
+  when:
+    - usb_media_apply | bool
+    - usb_media_eject | bool

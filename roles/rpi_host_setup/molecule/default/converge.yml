@@ -1,0 +1,44 @@
+---
+# Tests the pure logic that edits the file deciding whether a Pi boots at all, and the guards that
+# reject a malformed USB quirk. No Pi required.
+- name: Converge
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - name: A malformed USB quirk MUST be refused
+      # The kernel silently IGNORES a malformed usb-storage.quirks entry. So a typo'd quirk is a
+      # data-corruption workaround that never applies, on a disk that then corrupts under load,
+      # with the inventory showing it as configured. This guard is the only thing between those.
+      block:
+        - name: Apply a quirk with a missing flag
+          ansible.builtin.include_role:
+            name: rpi_host_setup
+            tasks_from: _validate_quirks
+          vars:
+            rpi_usb_quirks: ["152d:0578"]        # no ':u'
+        - name: SENTINEL — the guard did not fire
+          ansible.builtin.fail:
+            msg: "A malformed quirk '152d:0578' was accepted — the kernel would ignore it silently."
+      rescue:
+        # NOT `set_fact: fired=true`. The sentinel `fail` below sits INSIDE this block, so a
+        # guard that does NOT fire lets the sentinel run, and the rescue catches THAT — recording
+        # "the guard fired" when nothing fired. Verified: with the guard stubbed out, the old form
+        # passed. Keying on which task actually failed is what makes this test able to fail.
+        - ansible.builtin.set_fact:
+            quirk_refused: "{{ ansible_failed_task.name is not search('^SENTINEL') }}"
+
+    - name: A well-formed quirk must be ACCEPTED
+      ansible.builtin.include_role:
+        name: rpi_host_setup
+        tasks_from: _validate_quirks
+      vars:
+        rpi_usb_quirks: ["152d:0578:u", "174c:55aa:u"]
+
+    - name: Both quirk fixtures must have behaved as declared
+      ansible.builtin.assert:
+        that:
+          - quirk_refused | default(false)
+        fail_msg: "The malformed-quirk guard did not fire."
+        success_msg: "Malformed quirks are refused; well-formed ones pass."
+        quiet: true

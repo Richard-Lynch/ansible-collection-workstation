@@ -1,0 +1,142 @@
+---
+# ENTRYPOINT: data-retention test — write a pattern, wait, verify it survived.
+#
+# DESTRUCTIVE: requires usb_media_apply=true.
+#
+# WHAT THIS ADDS, and why nothing else here can. Every other check writes and reads back
+# immediately, so it can only see faults present at that instant. Worn or counterfeit flash has a
+# failure mode those cannot detect: cells that ACCEPT a write, return it correctly seconds later,
+# and lose their charge over minutes to hours. Such a stick passes every immediate test and still
+# hands back corrupted data the next day.
+#
+# For install media that is not academic. A stick written on Monday and booted on Friday has had
+# four days for weak cells to decay, and the symptom — an installer dying partway with a checksum
+# error — looks like a bad image rather than bad flash.
+#
+# TWO PHASES, and the wait between them is the whole point:
+#
+#   usb_media_retention_phase=write   stamp blocks, record state, exit
+#   usb_media_retention_phase=wait    write, sleep usb_media_retention_wait, verify  (default)
+#   usb_media_retention_phase=verify  compare against a state file from an earlier run
+#
+# The `wait` phase is the convenient one but bounded by how long you are willing to sit there.
+# For a genuinely meaningful interval, run `write` today and `verify` tomorrow — the state file
+# survives between runs precisely so the delay can be days rather than minutes.
+#
+# A PASS BOUNDS ITS OWN CLAIM: it proves the sampled blocks survived THAT interval, and the report
+# says which. Retention faults are time- and temperature-dependent, so a longer wait is a stronger
+# result and no wait proves nothing at all.
+
+- name: Apply role defaults
+  ansible.builtin.include_tasks: setup_vars.yml
+
+- name: Resolve and vet the target device
+  ansible.builtin.include_tasks: resolve_device.yml
+
+- name: Assert a known retention phase was requested
+  ansible.builtin.assert:
+    that:
+      - usb_media_retention_phase in ['write', 'wait', 'verify']
+    fail_msg: >-
+      Unknown usb_media_retention_phase '{{ usb_media_retention_phase }}'.
+      Choose write, wait or verify.
+    quiet: true
+
+- name: Require the apply flag for the writing phases
+  ansible.builtin.assert:
+    that:
+      - usb_media_apply | bool
+    fail_msg: >-
+      The retention test writes to {{ usb_media_device }} and destroys its contents.
+      Re-run with usb_media_apply=true if that is what you want.
+    quiet: true
+  when: usb_media_retention_phase in ['write', 'wait']
+
+- name: Unmount the device before writing
+  ansible.builtin.command:
+    cmd: "{{ usb_media_diskutil }} unmountDisk {{ usb_media_device }}"
+  changed_when: true
+  become: "{{ usb_media_become | bool }}"
+  when: usb_media_retention_phase in ['write', 'wait']
+
+- name: Write the retention pattern
+  ansible.builtin.command:
+    cmd: >-
+      {{ usb_media_python }} {{ role_path }}/files/usb_retention.py write
+      {{ _usb_raw }} {{ _usb_dev.TotalSize | int }} {{ usb_media_samples | int }}
+      {{ usb_media_retention_state }}
+  register: _usb_ret_write
+  changed_when: true
+  become: "{{ usb_media_become | bool }}"
+  when: usb_media_retention_phase in ['write', 'wait']
+
+- name: Report the write phase
+  ansible.builtin.debug:
+    msg: "{{ (_usb_ret_write.stdout | from_json).report }}"
+  when: usb_media_retention_phase in ['write', 'wait']
+
+- name: Explain how to verify later
+  ansible.builtin.debug:
+    msg: >-
+      Pattern written. Come back later — hours or days is a far stronger test than minutes — and
+      run with usb_media_retention_phase=verify and the same
+      usb_media_retention_state={{ usb_media_retention_state }}.
+      Do not write anything else to {{ usb_media_device }} in the meantime.
+  when: usb_media_retention_phase == 'write'
+
+- name: Wait before re-reading
+  # ansible.builtin.pause rather than a shell sleep: it is interruptible, reports the remaining
+  # time, and does not hold a subprocess open.
+  ansible.builtin.pause:
+    seconds: "{{ usb_media_retention_wait | int }}"
+  when: usb_media_retention_phase == 'wait'
+
+- name: Verify the pattern survived
+  ansible.builtin.command:
+    cmd: >-
+      {{ usb_media_python }} {{ role_path }}/files/usb_retention.py verify
+      {{ _usb_raw }} {{ usb_media_retention_state }}
+  register: _usb_ret_verify
+  changed_when: false
+  become: "{{ usb_media_become | bool }}"
+  when: usb_media_retention_phase in ['wait', 'verify']
+
+- name: Report the retention result
+  ansible.builtin.debug:
+    msg: "{{ (_usb_ret_verify.stdout | from_json).report }}"
+  when: usb_media_retention_phase in ['wait', 'verify']
+
+- name: Deliver the verdict, then leave the device usable either way
+  # block/always: a stick that LOST data is one you especially want returned usable rather than
+  # left as raw unpartitioned media, and the assert below would otherwise abort first.
+  block:
+    - name: Assert the data survived the interval
+      # The failure message distinguishes a SPOILED test from a failing stick. If the blocks carry a
+      # different nonce, something else wrote to the device between the phases — another run of this
+      # test against the same device is the usual cause, since the wait looks like idle time when it
+      # is actually the measurement. Condemning good hardware for that would be the worse error.
+      ansible.builtin.assert:
+        that:
+          - (_usb_ret_verify.stdout | from_json).ok | bool
+        fail_msg: >-
+          {{ 'RETENTION TEST SPOILED on ' ~ usb_media_device ~ ' — the blocks were overwritten by
+          something else between the write and the verify (most often a second run of this test
+          against the same device). This says nothing about the hardware. Re-run and leave the
+          device untouched during the wait.'
+          if (_usb_ret_verify.stdout | from_json).inconclusive | default(false)
+          else 'RETENTION FAILURE on ' ~ usb_media_device ~ ' — data written earlier did not
+          survive. This stick loses data over time: it will pass an immediate write-and-verify and
+          then hand back corruption later. Do not use it for anything you care about.' }}
+        quiet: true
+      when: usb_media_retention_phase in ['wait', 'verify']
+
+  always:
+    - name: Leave the device usable again
+      # NOT after the bare 'write' phase: that deliberately leaves the pattern on the device for a
+      # verify run later — possibly days later — and reformatting would erase the very thing under
+      # test. Only the phases that have finished verifying clean up.
+      ansible.builtin.include_tasks: reformat.yml
+      when:
+        - usb_media_apply | bool
+        - usb_media_reformat | bool
+        - usb_media_retention_phase in ['wait', 'verify']

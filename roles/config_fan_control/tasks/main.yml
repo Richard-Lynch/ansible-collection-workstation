@@ -1,0 +1,157 @@
+---
+# Deploy the per-component fan control daemon. Generate-don't-apply: without `fand_apply=true`
+# this VALIDATES the declared config against the live hardware and reports; it installs the daemon and its config, and only the systemd unit and start sit behind the apply flag.
+
+- name: Apply role defaults
+  ansible.builtin.include_tasks: setup_vars.yml
+
+- name: Refuse to drive a pump header
+  # Checked here as well as in the daemon. The daemon's own check is what protects a hand-run
+  # invocation; this one fails the PLAY, so a bad inventory change cannot reach the machine at
+  # all. A pump driven from a fan curve risks cavitation and loss of coolant flow.
+  ansible.builtin.assert:
+    that:
+      - "(fand_groups | map(attribute='header') | map('int') | select('in', fand_pump_headers | map('int') | list) | list | length) == 0"
+    fail_msg: >-
+      A fan group targets a header declared as a pump ({{ fand_pump_headers }}).
+      Driving a pump by demand risks cavitation and loss of coolant flow.
+    quiet: true
+
+- name: Install the daemon
+  ansible.builtin.copy:
+    src: fand.py
+    dest: "{{ fand_path }}"
+    mode: "0755"
+  become: true
+  notify: Restart fand
+
+- name: Install the release helper
+  # Used by the unit's ExecStopPost, so it must exist BEFORE the unit is installed. It is what
+  # returns the headers to the hardware curve on a crash or SIGKILL — the paths the daemon's own
+  # handlers cannot cover.
+  ansible.builtin.copy:
+    src: fand-release
+    dest: /usr/local/bin/fand-release
+    mode: "0755"
+  become: true
+
+- name: Render the config
+  # The daemon reads JSON so the whole site-config surface is data, never code. A second
+  # machine differs only in this file's contents.
+  ansible.builtin.copy:
+    content: "{{ _fand_config | to_nice_json }}\n"
+    dest: "{{ fand_config_path }}"
+    mode: "0644"
+  become: true
+  vars:
+    _fand_config:
+      interval: "{{ fand_interval | float }}"
+      rise_rate: "{{ fand_rise_rate | float }}"
+      fall_rate: "{{ fand_fall_rate | float }}"
+      deadband_pwm: "{{ fand_deadband_pwm | int }}"
+      sensor_fail_tolerance: "{{ fand_sensor_fail_tolerance | int }}"
+      failsafe_floor_pwm: "{{ fand_failsafe_floor_pwm | int }}"
+      metrics_path: "{{ fand_metrics_path }}"
+      pump_headers: "{{ fand_pump_headers }}"
+      extra_metrics: "{{ fand_extra_metrics }}"
+      sensors: "{{ fand_sensors }}"
+      groups: "{{ fand_groups }}"
+  notify: Restart fand
+
+- name: Validate the config against the live hardware
+  # --check resolves every sensor and group and writes NOTHING. Running it before the service
+  # starts means a bad declaration fails here, visibly, rather than as a service that flaps.
+  ansible.builtin.command:
+    argv:
+      - "{{ fand_python }}"
+      - "{{ fand_path }}"
+      - --config
+      - "{{ fand_config_path }}"
+      - --check
+      - --foreground
+  become: true
+  register: _fand_check
+  changed_when: false
+
+- name: Show what resolved
+  ansible.builtin.debug:
+    msg: "{{ _fand_check.stdout_lines | default([]) }}"
+
+- name: Report and stop unless applying
+  ansible.builtin.debug:
+    msg:
+      - "Config validates against this machine's hardware. Nothing has been started."
+      - "Set fand_apply=true to install the service and take over the fans."
+  when: not (fand_apply | bool)
+
+- name: Install and run the service
+  when: fand_apply | bool
+  block:
+    - name: Create the metrics directory
+      # Alloy's unix exporter collects from here. Created even when no scraper exists, because
+      # the daemon writes the file regardless and a missing directory would be a silent failure.
+      ansible.builtin.file:
+        path: "{{ fand_metrics_path | dirname }}"
+        state: directory
+        mode: "0755"
+      become: true
+
+    - name: Install the unit
+      ansible.builtin.template:
+        src: fand.service.j2
+        dest: "/etc/systemd/system/{{ fand_unit }}"
+        mode: "0644"
+      become: true
+      vars:
+        fand_release_headers: "{{ fand_groups | map(attribute='header') | list }}"
+      notify: Restart fand
+
+    - name: Start and enable it
+      ansible.builtin.systemd_service:
+        name: "{{ fand_unit }}"
+        state: "{{ 'started' if (fand_enabled | bool) else 'stopped' }}"
+        enabled: "{{ fand_enabled | bool }}"
+        daemon_reload: true
+      become: true
+
+    - name: Flush handlers so the verification below sees the new state
+      # Without this the restart handler runs at play end, AFTER the read-back — which would
+      # verify the OLD process.
+      ansible.builtin.meta: flush_handlers
+
+    - name: Read back what the service is actually doing
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: |
+          set -o pipefail
+          printf 'active=%s\n' "$(systemctl is-active {{ fand_unit }} 2>/dev/null || echo inactive)"
+          h=""
+          for d in /sys/class/hwmon/hwmon*; do
+            [ "$(cat "$d/name" 2>/dev/null)" = "{{ fand_chip }}" ] && h="$d"
+          done
+          for i in {{ fand_groups | map(attribute='header') | join(' ') }}; do
+            printf 'hdr%s mode=%s pwm=%s rpm=%s\n' "$i" \
+              "$(cat "$h/pwm${i}_enable" 2>/dev/null || echo na)" \
+              "$(cat "$h/pwm${i}" 2>/dev/null || echo na)" \
+              "$(cat "$h/fan${i}_input" 2>/dev/null || echo na)"
+          done
+      become: true
+      register: _fand_state
+      changed_when: false
+
+    - name: The service must be running when it is meant to be
+      # Read-back, not the systemd module's own report: a unit that starts and immediately dies
+      # can still report changed, and a daemon that is not running controls nothing.
+      ansible.builtin.assert:
+        that:
+          - "'active=active' in _fand_state.stdout"
+        fail_msg: >-
+          {{ fand_unit }} is not active: {{ _fand_state.stdout | trim }}.
+          Check `journalctl -u {{ fand_unit }}`.
+        success_msg: "{{ fand_unit }} is running."
+        quiet: true
+      when: fand_enabled | bool
+
+    - name: Show the live state
+      ansible.builtin.debug:
+        msg: "{{ _fand_state.stdout_lines | default([]) }}"

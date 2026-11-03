@@ -1,0 +1,86 @@
+---
+# Apply usb-storage quirks for known-bad USB-SATA bridges.
+#
+# REACTIVE BY DESIGN. rpi_usb_quirks is empty by default and inventory-declared: several widely sold
+# USB3-SATA bridges (JMicron and ASMedia among them) implement UAS incorrectly on the Pi, producing
+# anything from poor throughput to data corruption under load — but blanket-disabling UAS costs
+# real throughput on the adapters that are fine. So probe reports each bridge's VID:PID, and an
+# entry is declared here only when a specific adapter misbehaves.
+#
+# APPLY THIS BEFORE ANY LARGE WRITE TO THE SSD. The biggest write this system ever performs is
+# imaging the SSD; doing that through a bridge that mishandles UAS is how a disk that verifies
+# clean fails later.
+#
+# With identical nodes, a bad bridge shows up as ONE Pi behaving differently from its twins,
+# which is a far easier signal to read than a lone machine doing something odd.
+
+- name: Resolve declared options over their generated defaults
+  ansible.builtin.include_tasks: _resolve_defaults.yml
+
+- name: Report that no quirks are declared, and stop
+  # Not an error: empty is the correct and common state. Reported so a run that does nothing says
+  # why, rather than looking like it silently skipped.
+  ansible.builtin.debug:
+    msg: >-
+      No USB quirks declared for {{ inventory_hostname }} (rpi_usb_quirks is empty) — nothing to
+      do. If this Pi's SSD is unreliable, run rpi_boot_action=probe to read its bridge VID:PID and
+      declare e.g. rpi_usb_quirks: ["152d:0578:u"] in host_vars.
+  when: rpi_usb_quirks | length == 0
+
+- name: Validate the declared quirk entries
+  ansible.builtin.include_tasks: _validate_quirks.yml
+  when: rpi_usb_quirks | length > 0
+
+- name: Copy the cmdline editor
+  ansible.builtin.copy:
+    src: rpi_cmdline.py
+    dest: /usr/local/sbin/rpi_cmdline.py
+    mode: "0755"
+  become: true
+  when: rpi_usb_quirks | length > 0
+
+- name: Plan the quirks change
+  ansible.builtin.command:
+    cmd: >-
+      /usr/local/sbin/rpi_cmdline.py --file /boot/firmware/cmdline.txt --check
+      --set usb-storage.quirks={{ rpi_usb_quirks | join(',') }}
+  become: true
+  register: _rpi_q_plan
+  changed_when: false
+  when: rpi_usb_quirks | length > 0
+
+- name: Report the pending quirks change and stop (default — no apply flag)
+  ansible.builtin.debug:
+    msg:
+      - "DRY RUN — usb-storage quirks:"
+      - "  {{ _rpi_q_plan.stdout_lines[0] }}"
+      - "  cmdline would become: {{ _rpi_q_plan.stdout_lines[-1] }}"
+      - "Re-run with rpi_host_apply=true. Takes effect at the next reboot."
+  when:
+    - rpi_usb_quirks | length > 0
+    - not (rpi_host_apply | bool)
+
+- name: Apply the usb-storage quirks
+  # A SINGLE comma-separated token, not one per adapter: the kernel takes
+  # usb-storage.quirks=vid:pid:u,vid:pid:u — repeating the parameter would leave only the last
+  # one in effect.
+  ansible.builtin.command:
+    cmd: >-
+      /usr/local/sbin/rpi_cmdline.py --file /boot/firmware/cmdline.txt
+      --set usb-storage.quirks={{ rpi_usb_quirks | join(',') }}
+  become: true
+  register: _rpi_q
+  changed_when: "'CHANGED' in _rpi_q.stdout"
+  when:
+    - rpi_usb_quirks | length > 0
+    - rpi_host_apply | bool
+
+- name: Report the quirks state
+  ansible.builtin.debug:
+    msg:
+      - "declared: {{ rpi_usb_quirks | join(',') }}"
+      - "cmdline:  {{ _rpi_q.stdout_lines[-1] | default('(unchanged)') }}"
+      - "Takes effect at the next reboot; rpi_boot_action=probe reports the live UAS state."
+  when:
+    - rpi_usb_quirks | length > 0
+    - rpi_host_apply | bool

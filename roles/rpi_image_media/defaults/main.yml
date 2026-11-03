@@ -1,0 +1,22 @@
+---
+# AUTO-GENERATED defaults file — DO NOT EDIT.
+#
+# Source of truth: roles/rpi_image_media/meta/argument_specs.py
+# Regenerate:      venv/bin/python tools/argspec/cli.py x generate rpi_image_media
+#
+# Edits here are silently overwritten on the next generation. To change a value or its
+# documentation, change the OptionSpec in the source file above — descriptions there
+# are emitted as the comments in this file.
+# Entrypoint:      main
+
+# plan   — report every file that would be written (default, writes nothing)
+# seed   — mount the card's boot partition and write the provisioning files
+# verify — re-mount and assert each seeded file is present and correct
+rpi_image_action__default: plan
+
+# Actually write. Default false: report the plan and stop.
+rpi_image_apply__default: false
+
+# Where the card's FAT boot partition is mounted on the controller.
+# macOS automounts a freshly written Pi image here by its volume label.
+rpi_image_boot_mount__default: /Volumes/bootfs

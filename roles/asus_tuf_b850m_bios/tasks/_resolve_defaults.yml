@@ -1,0 +1,67 @@
+---
+# AUTO-GENERATED defaults resolver — DO NOT EDIT.
+#
+# Source of truth: roles/asus_tuf_b850m_bios/meta/argument_specs.py
+# Regenerate:      venv/bin/python tools/argspec/cli.py x generate asus_tuf_b850m_bios
+#
+# Edits here are silently overwritten on the next generation. To change a value or its
+# documentation, change the OptionSpec in the source file above — descriptions there
+# are emitted as the comments in this file.
+
+# Binds every declared option to its generated default, so a caller-supplied value
+# wins and an unsupplied one falls back rather than evaluating Undefined.
+#
+# Include this FIRST from every entrypoint:
+#   - ansible.builtin.include_tasks: _resolve_defaults.yml
+#
+# Role-specific setup logic belongs in tasks/setup_vars.yml, NOT here — this file is
+# overwritten on every generation.
+#
+# TWO BRANCHES, because `set_fact` persists for the whole play. A role invoked twice in
+# one play would otherwise see its OWN leftover facts on the second call, so a later
+# caller that omitted an option silently inherited the earlier caller's value instead of
+# the declared default. On a repeat call this ignores the role's own facts and rebinds
+# the defaults; an include-level `vars:` shadows the fact, so a value the caller DID
+# supply this time still wins. Roles called once per play only ever run the first branch.
+
+- name: Resolve declared options over their generated defaults
+  ansible.builtin.set_fact:
+    asus_bios_action: "{{ asus_bios_action | default(asus_bios_action__default) if asus_bios_action__default is defined else asus_bios_action | default(omit) }}"
+    asus_bios_apply: "{{ asus_bios_apply | default(asus_bios_apply__default) if asus_bios_apply__default is defined else asus_bios_apply | default(omit) }}"
+    asus_bios_board: "{{ asus_bios_board | default(asus_bios_board__default) if asus_bios_board__default is defined else asus_bios_board | default(omit) }}"
+    asus_bios_product_id: "{{ asus_bios_product_id | default(asus_bios_product_id__default) if asus_bios_product_id__default is defined else asus_bios_product_id | default(omit) }}"
+    asus_bios_support_url: "{{ asus_bios_support_url | default(asus_bios_support_url__default) if asus_bios_support_url__default is defined else asus_bios_support_url | default(omit) }}"
+    asus_bios_versions: "{{ asus_bios_versions | default(asus_bios_versions__default) if asus_bios_versions__default is defined else asus_bios_versions | default(omit) }}"
+    asus_bios_recommended: "{{ asus_bios_recommended | default(asus_bios_recommended__default) if asus_bios_recommended__default is defined else asus_bios_recommended | default(omit) }}"
+    asus_bios_version: "{{ asus_bios_version | default(asus_bios_version__default) if asus_bios_version__default is defined else asus_bios_version | default(omit) }}"
+    asus_bios_allow_beta: "{{ asus_bios_allow_beta | default(asus_bios_allow_beta__default) if asus_bios_allow_beta__default is defined else asus_bios_allow_beta | default(omit) }}"
+    asus_bios_dest: "{{ asus_bios_dest | default(asus_bios_dest__default) if asus_bios_dest__default is defined else asus_bios_dest | default(omit) }}"
+    asus_bios_check_live: "{{ asus_bios_check_live | default(asus_bios_check_live__default) if asus_bios_check_live__default is defined else asus_bios_check_live | default(omit) }}"
+    asus_bios_model2_name: "{{ asus_bios_model2_name | default(asus_bios_model2_name__default) if asus_bios_model2_name__default is defined else asus_bios_model2_name | default(omit) }}"
+    asus_bios_python: "{{ asus_bios_python | default(asus_bios_python__default) if asus_bios_python__default is defined else asus_bios_python | default(omit) }}"
+    asus_bios_data_checked: "{{ asus_bios_data_checked | default(asus_bios_data_checked__default) if asus_bios_data_checked__default is defined else asus_bios_data_checked | default(omit) }}"
+    asus_bios_stale_days: "{{ asus_bios_stale_days | default(asus_bios_stale_days__default) if asus_bios_stale_days__default is defined else asus_bios_stale_days | default(omit) }}"
+  when: not (_asus_tuf_b850m_bios__argspec_resolved | default(false))
+
+- name: Rebind the defaults on a repeat call, ignoring this role's own leftover facts
+  ansible.builtin.set_fact:
+    asus_bios_action: "{{ asus_bios_action__default if asus_bios_action__default is defined else asus_bios_action | default(omit) }}"
+    asus_bios_apply: "{{ asus_bios_apply__default if asus_bios_apply__default is defined else asus_bios_apply | default(omit) }}"
+    asus_bios_board: "{{ asus_bios_board__default if asus_bios_board__default is defined else asus_bios_board | default(omit) }}"
+    asus_bios_product_id: "{{ asus_bios_product_id__default if asus_bios_product_id__default is defined else asus_bios_product_id | default(omit) }}"
+    asus_bios_support_url: "{{ asus_bios_support_url__default if asus_bios_support_url__default is defined else asus_bios_support_url | default(omit) }}"
+    asus_bios_versions: "{{ asus_bios_versions__default if asus_bios_versions__default is defined else asus_bios_versions | default(omit) }}"
+    asus_bios_recommended: "{{ asus_bios_recommended__default if asus_bios_recommended__default is defined else asus_bios_recommended | default(omit) }}"
+    asus_bios_version: "{{ asus_bios_version__default if asus_bios_version__default is defined else asus_bios_version | default(omit) }}"
+    asus_bios_allow_beta: "{{ asus_bios_allow_beta__default if asus_bios_allow_beta__default is defined else asus_bios_allow_beta | default(omit) }}"
+    asus_bios_dest: "{{ asus_bios_dest__default if asus_bios_dest__default is defined else asus_bios_dest | default(omit) }}"
+    asus_bios_check_live: "{{ asus_bios_check_live__default if asus_bios_check_live__default is defined else asus_bios_check_live | default(omit) }}"
+    asus_bios_model2_name: "{{ asus_bios_model2_name__default if asus_bios_model2_name__default is defined else asus_bios_model2_name | default(omit) }}"
+    asus_bios_python: "{{ asus_bios_python__default if asus_bios_python__default is defined else asus_bios_python | default(omit) }}"
+    asus_bios_data_checked: "{{ asus_bios_data_checked__default if asus_bios_data_checked__default is defined else asus_bios_data_checked | default(omit) }}"
+    asus_bios_stale_days: "{{ asus_bios_stale_days__default if asus_bios_stale_days__default is defined else asus_bios_stale_days | default(omit) }}"
+  when: _asus_tuf_b850m_bios__argspec_resolved | default(false)
+
+- name: Record that this role has resolved its options in this play
+  ansible.builtin.set_fact:
+    _asus_tuf_b850m_bios__argspec_resolved: true

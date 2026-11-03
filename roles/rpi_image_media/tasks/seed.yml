@@ -1,0 +1,100 @@
+---
+# Write the first-boot provisioning files onto a freshly imaged card.
+#
+# BOTH MECHANISMS ARE SEEDED, deliberately. Raspberry Pi OS has changed how it provisions a
+# headless first boot: current images read `custom.toml`, older ones read `userconf.txt` plus an
+# empty `ssh` marker — and upstream describes custom.toml as a temporary system that may be
+# replaced by cloud-init. Seeding one and guessing wrong FAILS SILENTLY: the card boots, ignores
+# the config, and leaves a Pi with no user and no SSH, which on a headless build means finding a
+# monitor and keyboard. They do not conflict and cost a few hundred bytes, so both go on.
+#
+# `verify` reports which one actually took effect, because belt-and-braces is only honest if you
+# know which strap held.
+
+- name: Resolve declared options over their generated defaults
+  ansible.builtin.include_tasks: _resolve_defaults.yml
+
+- name: HARD GATE — the card's boot partition must be mounted
+  ansible.builtin.stat:
+    path: "{{ rpi_image_boot_mount }}"
+  register: _rpi_mount
+  failed_when: not _rpi_mount.stat.exists
+
+- name: HARD GATE — refuse to seed anything private-key-shaped
+  # An SD card is readable by anyone who physically takes it. The fact that a card carries only a
+  # password HASH and a PUBLIC key is what makes an SD-based rescue system acceptable at all, and
+  # it is easy to erode by accident — someone seeds a private key "to make things easier" and the
+  # property is gone with nothing to notice. Checked rather than trusted.
+  ansible.builtin.assert:
+    that:
+      - rpi_image_authorized_key is not search('PRIVATE KEY')
+      - rpi_image_authorized_key is match('^(ssh-|ecdsa-|sk-)')
+    fail_msg: >-
+      rpi_image_authorized_key does not look like an SSH PUBLIC key (expected it to start with
+      ssh-/ecdsa-/sk- and to contain no PRIVATE KEY header).
+      REFUSING to seed — a private key on a rescue card is readable by anyone who picks the card
+      up, and that property is the reason this design is acceptable.
+    quiet: true
+
+- name: HARD GATE — the password must be a hash, not plaintext
+  # A crypt hash starts with $<id>$. Plaintext would be readable on a card that is, by design,
+  # handled physically.
+  ansible.builtin.assert:
+    that:
+      - rpi_image_password_hash is match('^\$[0-9a-z]+\$')
+    fail_msg: >-
+      rpi_image_password_hash does not look like a crypt hash (expected it to start with $id$).
+      REFUSING to seed a plaintext password onto removable media.
+      Resolve it from 1Password with richard_lynch.common.onepassword_cached.
+    quiet: true
+
+- name: HARD GATE — a WiFi network needs its regulatory domain
+  ansible.builtin.assert:
+    that:
+      - rpi_image_wifi_country is defined
+      - rpi_image_wifi_country is match('^[A-Z]{2}$')
+    fail_msg: >-
+      rpi_image_wifi_ssid is set but rpi_image_wifi_country is not a two-letter country code.
+      Without it the radio comes up rfkill-blocked on first boot.
+    quiet: true
+  when: (rpi_image_wifi_ssid | default('', true) | length) > 0
+
+- name: Report and stop (default — no apply flag)
+  ansible.builtin.debug:
+    msg: "DRY RUN — would seed {{ rpi_image_boot_mount }}. Re-run with rpi_image_apply=true."
+  when: not (rpi_image_apply | bool)
+
+- name: End the run — not applying
+  ansible.builtin.meta: end_host
+  when: not (rpi_image_apply | bool)
+
+- name: Enable SSH on first boot
+  ansible.builtin.file:
+    path: "{{ rpi_image_boot_mount }}/ssh"
+    state: touch
+    mode: "0644"
+
+- name: Seed the first-boot user (legacy mechanism)
+  # No trailing newline issues: the file is one line, `username:hash`.
+  ansible.builtin.copy:
+    dest: "{{ rpi_image_boot_mount }}/userconf.txt"
+    content: "{{ rpi_image_user }}:{{ rpi_image_password_hash }}\n"
+    mode: "0644"
+  no_log: true
+
+- name: Seed the first-boot configuration (current mechanism)
+  ansible.builtin.template:
+    src: custom.toml.j2
+    dest: "{{ rpi_image_boot_mount }}/custom.toml"
+    mode: "0644"
+  no_log: true
+
+- name: Report what was seeded
+  ansible.builtin.debug:
+    msg:
+      - "Seeded {{ rpi_image_boot_mount }} for {{ rpi_image_hostname }}:"
+      - "  ssh marker, userconf.txt, custom.toml"
+      - ""
+      - "Eject the card, put it in the Pi, and power on. Then:"
+      - "  rpi_image_action=verify   (before ejecting — asserts the files landed)"
+      - "  your bootstrap play       (first contact, once it is up)"

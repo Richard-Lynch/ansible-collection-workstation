@@ -1,0 +1,87 @@
+---
+# Enable the kernel memory cgroup controller.
+#
+# THE SILENT FAILURE THIS FIXES. On stock Raspberry Pi OS the memory controller is DISABLED, so
+# `docker run --memory=512m`, systemd's MemoryMax= and k3s pod limits are all accepted without
+# complaint and enforced not at all — the kernel has nowhere to write the limit. Every layer
+# reports success; nothing is limited. On a small fleet running shared services that means one
+# container can take the whole board down while every limit you set looks applied.
+#
+# THE VERIFICATION TRAP, which is worse than the bug. The disable originates from a
+# `cgroup_disable=memory` that the FIRMWARE injects ahead of cmdline.txt — and which never appears
+# in that file. So reading cmdline.txt back and finding cgroup_enable=memory present proves
+# nothing at all. The only honest check is from the kernel's own view:
+#   /proc/cmdline            — the EFFECTIVE line, including firmware injections
+#   /sys/fs/cgroup/cgroup.controllers — whether the controller is actually available
+# Both are read below. Note kernel 6.12+ dropped cgroup v1, so current Pi OS is v2-only.
+
+- name: Resolve declared options over their generated defaults
+  ansible.builtin.include_tasks: _resolve_defaults.yml
+
+- name: Copy the cmdline editor
+  ansible.builtin.copy:
+    src: rpi_cmdline.py
+    dest: /usr/local/sbin/rpi_cmdline.py
+    mode: "0755"
+  become: true
+
+- name: Plan the cmdline change
+  # --check so the plan can be reported without writing. The script reports CHANGED/UNCHANGED plus
+  # the resulting line, so the dry run shows exactly what would land.
+  ansible.builtin.command:
+    cmd: >-
+      /usr/local/sbin/rpi_cmdline.py --file /boot/firmware/cmdline.txt --check
+      --set cgroup_enable=memory --set cgroup_memory=1 --remove cgroup_disable
+  become: true
+  register: _rpi_cg_plan
+  changed_when: false
+
+- name: Report the pending cgroup change and stop (default — no apply flag)
+  ansible.builtin.debug:
+    msg:
+      - "DRY RUN — memory cgroup:"
+      - "  verdict: {{ _rpi_cg_plan.stdout_lines[0] }}"
+      - "  cmdline would become: {{ _rpi_cg_plan.stdout_lines[-1] }}"
+      - "Re-run with rpi_host_apply=true. Takes effect at the next reboot."
+  when: not (rpi_host_apply | bool)
+
+- name: Enable the memory cgroup on the kernel command line
+  ansible.builtin.command:
+    cmd: >-
+      /usr/local/sbin/rpi_cmdline.py --file /boot/firmware/cmdline.txt
+      --set cgroup_enable=memory --set cgroup_memory=1 --remove cgroup_disable
+  become: true
+  register: _rpi_cg
+  changed_when: "'CHANGED' in _rpi_cg.stdout"
+  when:
+    - rpi_host_apply | bool
+    - rpi_cgroup_memory | bool
+
+- name: Read the EFFECTIVE kernel command line
+  # /proc/cmdline, never cmdline.txt — see the header. This is the line the running kernel was
+  # actually given, firmware injections included.
+  ansible.builtin.slurp:
+    src: /proc/cmdline
+  register: _rpi_proc_cmdline
+
+- name: Read which cgroup controllers are available
+  ansible.builtin.slurp:
+    src: /sys/fs/cgroup/cgroup.controllers
+  register: _rpi_controllers
+  failed_when: false
+
+- name: Report the memory cgroup's REAL state
+  # A report rather than an assertion: the change takes effect at the next boot, so asserting the
+  # controller is present immediately after enabling it would fail a correct run. rpi_boot_action
+  # =verify asserts it post-reboot, and the health_report surfaces it continuously.
+  ansible.builtin.debug:
+    msg:
+      - "cgroup_enable=memory on /proc/cmdline: {{ 'yes' if 'cgroup_enable=memory' in (_rpi_proc_cmdline.content | b64decode) else 'no (pending reboot, or overridden)'
+        }}"
+      - "cgroup_disable=memory injected:        {{ 'YES — the firmware is overriding this' if 'cgroup_disable=memory' in (_rpi_proc_cmdline.content | b64decode) else
+        'no' }}"
+      - "memory controller AVAILABLE NOW:       {{ 'yes' if 'memory' in ((_rpi_controllers.content | default('') | b64decode).split()) else 'NO — container memory
+        limits are silently unenforced' }}"
+      - ""
+      - "Until that last line says yes, every --memory / MemoryMax limit on this board is accepted"
+      - "and ignored. Verify it after the next reboot; do not trust cmdline.txt for this."

@@ -1,0 +1,93 @@
+---
+# READ-ONLY whole-fleet drift report.
+#
+# Two things here are worth more than the rest of the output combined:
+#
+#   1. BOOT SOURCE. A Pi that has silently fallen back to its rescue card is running fine today on
+#      a card that will wear out, with no signal until it does. Nothing else reports it.
+#   2. STATELESSNESS. The entire recovery story is "Ansible is the backup" — true only for as long
+#      as nothing important lives outside the repo. Docker volumes and hand-seeded tokens are
+#      state regardless of how a service was deployed, so the assumption is CHECKED rather than
+#      asserted once and trusted for a year.
+
+- name: Resolve declared options over their generated defaults
+  ansible.builtin.include_tasks: _resolve_defaults.yml
+
+- name: Survey each board
+  ansible.builtin.include_role:
+    name: richard_lynch.workstation.rpi_boot_media
+    tasks_from: probe
+  vars:
+    rpi_boot_action: probe
+
+- name: Look for state that should not exist on a stateless node
+  # Non-empty Docker volumes and bind-mounts outside the declared set. `failed_when: false` is
+  # safe here because the RESULT is reported, not branched on — the docker binary being absent is
+  # itself a legitimate answer on a node that runs no containers.
+  ansible.builtin.shell:
+    cmd: |
+      set -o pipefail
+      if command -v docker >/dev/null 2>&1; then
+        docker volume ls --quiet 2>/dev/null | while read -r v; do
+          mp=$(docker volume inspect "$v" --format '{{ "{{.Mountpoint}}" }}' 2>/dev/null)
+          [ -n "$mp" ] && [ -d "$mp" ] || continue
+          sz=$(du -sk "$mp" 2>/dev/null | awk '{print $1}')
+          [ "${sz:-0}" -gt 64 ] && echo "volume:$v:${sz}KiB"
+        done
+      fi
+      exit 0
+  args:
+    executable: /bin/bash
+  become: true
+  register: _rpi_state
+  changed_when: false
+  failed_when: false
+
+- name: Build this host's report line
+  ansible.builtin.set_fact:
+    rpi_report: >-
+      {{ {
+        'host': inventory_hostname,
+        'serial': rpi_probe.soc_serial,
+        'root_medium': rpi_probe.root.medium,
+        'root_by_id': rpi_probe.root.by_id,
+        'boot_order': rpi_probe.eeprom.boot_order,
+        'eeprom_version': rpi_probe.eeprom.version,
+        'overlay_configured': rpi_probe.cmdline.boot_overlay,
+        'root_read_only': rpi_probe.overlay.live_read_only,
+        'watchdog': rpi_probe.watchdog.device_present,
+        'panic': rpi_probe.cmdline.panic,
+        'cgroup_memory': rpi_probe.cmdline.cgroup_memory_available,
+        'throttling': rpi_probe.throttling.flags,
+        'stateful_volumes': (_rpi_state.stdout_lines | default([])),
+      } }}
+
+- name: Report this node
+  ansible.builtin.debug:
+    msg:
+      - "{{ rpi_report.host }}  ({{ rpi_report.serial | default('?') }})"
+      - "  root:      {{ rpi_report.root_medium }} {{ rpi_report.root_by_id | default('') }}{{ '   <-- RUNNING FROM THE RESCUE CARD' if (rpi_report.root_medium !=
+        'usb-or-nvme' and rpi_report_expect_ssd_root) else '' }}"
+      - "  BOOT_ORDER {{ rpi_report.boot_order | default('?') }}   bootloader {{ rpi_report.eeprom_version | default('?') }}"
+      - "  watchdog   {{ rpi_report.watchdog }}   panic={{ rpi_report.panic | default('UNSET') }}"
+      - "  memory cgroup available: {{ rpi_report.cgroup_memory }}"
+      - "  throttling: {{ rpi_report.throttling | join('; ') | default('none', true) }}"
+      - "  stateful:   {{ rpi_report.stateful_volumes | join(', ') | default('none — statelessness holds', true) }}"
+
+- name: Fail on drift, when asked to
+  # Opt-in so the report is safe to run ad hoc: by default it prints the whole picture rather than
+  # stopping at the first problem, which is what you want when surveying. CI and scheduled runs
+  # turn it on.
+  ansible.builtin.assert:
+    that:
+      - not rpi_report_expect_ssd_root or rpi_report.root_medium == 'usb-or-nvme'
+      - rpi_report.throttling | length == 0
+      - rpi_report.stateful_volumes | length == 0
+    fail_msg: >-
+      {{ inventory_hostname }} has drifted:
+      {{ 'running from the rescue card; ' if (rpi_report_expect_ssd_root and rpi_report.root_medium != 'usb-or-nvme') else '' }}
+      {{ 'throttling recorded (' ~ (rpi_report.throttling | join('; ')) ~ '); ' if rpi_report.throttling | length else '' }}
+      {{ 'carries state Ansible cannot rebuild (' ~ (rpi_report.stateful_volumes | join(', ')) ~ ') — "Ansible is the backup" no longer holds for this node' if rpi_report.stateful_volumes
+      | length else '' }}
+    quiet: true
+  when: rpi_report_fail_on_drift | bool

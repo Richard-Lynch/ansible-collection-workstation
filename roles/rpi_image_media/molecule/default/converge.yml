@@ -1,0 +1,125 @@
+---
+# The two refusals here are the reason an SD-card rescue system is acceptable at all: a card is
+# readable by anyone who physically picks it up, so it may carry a password HASH and a PUBLIC key
+# and nothing else. Both properties are easy to erode by accident — someone seeds a private key
+# "to make cloning easier" — so both are checked rather than trusted, and both are proved to fire.
+- name: Converge
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    _mount: "{{ lookup('env', 'MOLECULE_EPHEMERAL_DIRECTORY') | default('/tmp', true) }}/bootfs"
+    _good_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAItest test@example"
+    _good_hash: "$6$rounds=656000$abcdefgh$ijklmnop"
+
+  tasks:
+    - name: Create a fake card boot partition
+      ansible.builtin.file:
+        path: "{{ _mount }}"
+        state: directory
+        mode: "0755"
+
+    - name: A PRIVATE key MUST be refused
+      block:
+        - name: Try to seed a private key
+          ansible.builtin.include_role:
+            name: rpi_image_media
+            tasks_from: seed
+          vars:
+            rpi_image_boot_mount: "{{ _mount }}"
+            rpi_image_hostname: rpi-a
+            rpi_image_user: operator
+            rpi_image_password_hash: "{{ _good_hash }}"
+            rpi_image_authorized_key: "-----BEGIN OPENSSH PRIVATE KEY-----\nb3Blb\n-----END OPENSSH PRIVATE KEY-----"
+            rpi_image_apply: true
+        - name: SENTINEL — the guard did not fire
+          ansible.builtin.fail:
+            msg: >-
+              A PRIVATE key was accepted for seeding onto removable media. An SD card is readable
+              by anyone who picks it up.
+      rescue:
+        # NOT `set_fact: fired=true`. The sentinel `fail` below sits INSIDE this block, so a
+        # guard that does NOT fire lets the sentinel run, and the rescue catches THAT — recording
+        # "the guard fired" when nothing fired. Verified: with the guard stubbed out, the old form
+        # passed. Keying on which task actually failed is what makes this test able to fail.
+        - ansible.builtin.set_fact:
+            privkey_refused: "{{ ansible_failed_task.name is not search('^SENTINEL') }}"
+
+    - name: A PLAINTEXT password MUST be refused
+      block:
+        - name: Try to seed a plaintext password
+          ansible.builtin.include_role:
+            name: rpi_image_media
+            tasks_from: seed
+          vars:
+            rpi_image_boot_mount: "{{ _mount }}"
+            rpi_image_hostname: rpi-a
+            rpi_image_user: operator
+            rpi_image_password_hash: "hunter2"        # not a crypt hash
+            rpi_image_authorized_key: "{{ _good_key }}"
+            rpi_image_apply: true
+        - name: SENTINEL — the guard did not fire
+          ansible.builtin.fail:
+            msg: "A plaintext password was accepted — a plaintext password must be refused."
+      rescue:
+        - ansible.builtin.set_fact:
+            plaintext_refused: "{{ ansible_failed_task.name is not search('^SENTINEL') }}"
+
+    - name: A correct seed must SUCCEED and write every provisioning file
+      ansible.builtin.include_role:
+        name: rpi_image_media
+        tasks_from: seed
+      vars:
+        rpi_image_boot_mount: "{{ _mount }}"
+        rpi_image_hostname: rpi-a
+        rpi_image_user: operator
+        rpi_image_password_hash: "{{ _good_hash }}"
+        rpi_image_authorized_key: "{{ _good_key }}"
+        rpi_image_apply: true
+
+    - name: Both refusals must have fired, and the good seed must have landed
+      ansible.builtin.assert:
+        that:
+          - privkey_refused | default(false)
+          - plaintext_refused | default(false)
+        fail_msg: >-
+          private key refused={{ privkey_refused | default(false) }},
+          plaintext refused={{ plaintext_refused | default(false) }} — both must be true.
+        success_msg: "Private keys and plaintext passwords are both refused; a correct seed works."
+        quiet: true
+
+    - name: The card must now verify as seeded for THIS host
+      # The card-identity check — the only thing that can tell two otherwise-identical cards apart,
+      # since the controller sees a USB reader's serial rather than the card's.
+      ansible.builtin.include_role:
+        name: rpi_image_media
+        tasks_from: verify
+      vars:
+        rpi_image_boot_mount: "{{ _mount }}"
+        rpi_image_hostname: rpi-a
+
+    - name: A card seeded for ANOTHER host must be refused
+      block:
+        - name: Verify the rpi-a card as though it were rpi-b's
+          ansible.builtin.include_role:
+            name: rpi_image_media
+            tasks_from: verify
+          vars:
+            rpi_image_boot_mount: "{{ _mount }}"
+            rpi_image_hostname: rpi-b
+        - name: SENTINEL — the guard did not fire
+          ansible.builtin.fail:
+            msg: >-
+              A card seeded for rpi-a verified as rpi-b's. A hostname collision in DNS and
+              monitoring is invisible to everything else on the network.
+      rescue:
+        - ansible.builtin.set_fact:
+            wrong_host_refused: "{{ ansible_failed_task.name is not search('^SENTINEL') }}"
+
+    - name: The wrong-host refusal must have fired
+      ansible.builtin.assert:
+        that:
+          - wrong_host_refused | default(false)
+        fail_msg: "A card seeded for another host was accepted."
+        success_msg: "A card seeded for the wrong host is refused."
+        quiet: true

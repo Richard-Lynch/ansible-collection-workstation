@@ -1,0 +1,43 @@
+---
+# READ-ONLY: decode this board's BOOT_ORDER into plain English.
+#
+# Exists as its own entrypoint because 0xf14 and 0xf41 look almost identical and mean opposite
+# things — "USB first, card as fallback" versus "card first, USB as fallback". A hex value in a
+# report is something a human has to decode correctly under pressure; a list of attempts in order
+# is not.
+
+- name: Resolve declared options over their generated defaults
+  ansible.builtin.include_tasks: _resolve_defaults.yml
+
+- name: Survey the board
+  ansible.builtin.include_tasks: probe.yml
+
+- name: Report the boot order in plain English
+  ansible.builtin.debug:
+    msg:
+      - "{{ inventory_hostname }} — bootloader {{ rpi_probe.eeprom.version | default('unknown') }}"
+      - ""
+      - "BOOT_ORDER = {{ rpi_probe.eeprom.boot_order | default('unreadable') }}"
+      - "the firmware tries, in this order:"
+      - "{{ rpi_probe.eeprom.boot_order_decoded | default(['(could not decode)']) }}"
+      - ""
+      - "declared in inventory: {{ rpi_boot_order }}"
+      - "MATCHES: {{ 'yes' if rpi_probe.eeprom.boot_order | default('') == rpi_boot_order else 'NO — run rpi_boot_action=eeprom' }}"
+      - ""
+      - "currently booted from: {{ rpi_probe.root.medium }} ({{ rpi_probe.root.by_id | default(rpi_probe.root.kernel) }})"
+
+- name: Report anything that would make the boot order moot
+  # A board can have a perfect BOOT_ORDER and still not honour it. Both conditions below are
+  # silent in every other report, which is why they are surfaced here next to the value they
+  # invalidate.
+  ansible.builtin.debug:
+    msg:
+      - "DISABLE_HDMI: {{ rpi_probe.eeprom.disable_hdmi | default('(not set — good)') }}"
+      - "{{ 'WARNING: with DISABLE_HDMI set the firmware has been reported to IGNORE BOOT_ORDER (rpi-eeprom#466) — the fallback design would be inert.' if rpi_probe.eeprom.disable_hdmi
+        not in [None, '', '0'] else '' }}"
+      - ""
+      - "bootloader >= {{ rpi_boot_eeprom_min_version }} (needed for USB boot):"
+      # `default(..., true)` — the second arg makes it replace None as well as undefined. Without
+      # it an unparsed version is None, and `None >= '2020-09-03'` is a TypeError, not a False.
+      - "  {{ 'yes' if (rpi_probe.eeprom.version | default('0000-00-00', true)) >= rpi_boot_eeprom_min_version else 'NO — this board cannot USB-boot until its bootloader
+        is updated' }}"

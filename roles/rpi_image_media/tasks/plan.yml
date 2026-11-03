@@ -1,0 +1,28 @@
+---
+# Report exactly what would be seeded. Writes nothing.
+
+- name: Resolve declared options over their generated defaults
+  ansible.builtin.include_tasks: _resolve_defaults.yml
+
+- name: Check whether a card is mounted
+  ansible.builtin.stat:
+    path: "{{ rpi_image_boot_mount }}"
+  register: _rpi_mount
+
+- name: Report the seeding plan
+  ansible.builtin.debug:
+    msg:
+      - "Card boot partition: {{ rpi_image_boot_mount }} ({{ 'MOUNTED' if _rpi_mount.stat.exists else 'NOT MOUNTED — write the image first' }})"
+      - ""
+      - "Would seed, for a headless first boot:"
+      - "  userconf.txt   {{ rpi_image_user }}:<hash from 1Password, never plaintext>"
+      - "  ssh            (empty marker file — enables sshd on first boot)"
+      - "  custom.toml    hostname={{ rpi_image_hostname }}, user, ssh key{{ ', wifi ' ~ rpi_image_wifi_ssid if rpi_image_wifi_ssid | default(none) else '' }}"
+      - ""
+      - "BOTH mechanisms are seeded deliberately: current Pi OS reads custom.toml, older images"
+      - "read userconf.txt + the ssh marker, and upstream describes custom.toml as temporary and"
+      - "possibly replaced by cloud-init. They do not conflict, they cost a few hundred bytes, and"
+      - "seeding one and guessing wrong produces a Pi with no user and no SSH — which on a headless"
+      - "build means a monitor hunt."
+      - ""
+      - "Re-run with rpi_image_action=seed rpi_image_apply=true."

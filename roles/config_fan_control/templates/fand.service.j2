@@ -1,0 +1,49 @@
+# {{ ansible_managed }}
+# Fan control by normalised per-component demand.
+[Unit]
+Description=Fan control by per-component thermal demand
+Documentation=file://{{ fand_config_path }}
+After=multi-user.target
+
+[Service]
+Type=notify
+# notify, not simple: the daemon signals READY only AFTER every declared sensor has resolved,
+# so a failed resolution is a failed START rather than a service that reports up and controls
+# nothing.
+NotifyAccess=main
+ExecStart={{ fand_python }} {{ fand_path }} --config {{ fand_config_path }}
+
+# THE FAIL-TO-HARDWARE CONTRACT. While this runs, the headers are in MANUAL mode and the
+# hardware curve is not protecting them. Every path out of that state has to be covered:
+#
+#   ExecStop      clean shutdown
+#   ExecStopPost  crash, kill, OOM -- runs even when ExecStop did not
+#   WatchdogSec   hung-but-alive, which neither of the above catches
+#
+# The daemon also releases in its own `finally`; these are the belt to that's braces, because a
+# header left in manual is silent, invisible, and only noticed when something overheats.
+ExecStop={{ fand_python }} {{ fand_path }} --config {{ fand_config_path }} --release-only
+# ONE LINE, NO CONTINUATIONS. systemd does not process shell-style `\` line continuations the
+# way a shell does: written across lines, this arrives as a malformed command that fails
+# SILENTLY: after a SIGKILL both headers stay in manual while the unit reports nothing wrong.
+#
+# Also note there is no `-` prefix any more. It was there to "ignore failure", which is exactly
+# backwards for the mechanism standing between a crashed daemon and an unregulated fan: a
+# failure here MUST be visible in `systemctl status`, not swallowed.
+ExecStopPost=/usr/local/bin/fand-release {{ fand_chip }} {{ fand_release_headers | join(" ") }}
+WatchdogSec={{ fand_watchdog_sec }}
+Restart=on-failure
+RestartSec=5
+
+# A restart loop must not hammer the hardware. If it cannot stay up, stopping and leaving the
+# headers on the hardware curve is the correct outcome -- ExecStopPost has already released them.
+StartLimitBurst=5
+StartLimitIntervalSec=120
+
+# It writes to sysfs and one metrics file; nothing else needs to be reachable.
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

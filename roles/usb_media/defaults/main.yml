@@ -1,0 +1,177 @@
+---
+# AUTO-GENERATED defaults file — DO NOT EDIT.
+#
+# Source of truth: roles/usb_media/meta/argument_specs.py
+# Regenerate:      venv/bin/python tools/argspec/cli.py x generate usb_media
+#
+# Edits here are silently overwritten on the next generation. To change a value or its
+# documentation, change the OptionSpec in the source file above — descriptions there
+# are emitted as the comments in this file.
+# Entrypoint:      main
+
+# Which entrypoint main.yml dispatches to.
+# Callers may bypass this with tasks_from instead.
+usb_media_action__default: list
+
+# MB moved per throughput measurement. Large enough to get past a
+# stick's SLC write cache, which flatters short benchmarks.
+usb_media_bench_mb__default: 256
+
+# MB written for the SUSTAINED throughput measurement — the figure that
+# predicts a real image write.
+# Consumer flash absorbs roughly the first GB into a fast SLC cache and
+# then drops to its native rate; measured on one USB 3 stick,
+# 69 MB/s at 256MB and 1GB, then 40 MB/s at 2GB.
+# 2048 is past the cliff on every stick tested (~50s) without the ~30
+# minutes a full-capacity pass costs. Set 0 to skip.
+usb_media_sustained_mb__default: 2048
+
+# Probe points for the sparse integrity check.
+usb_media_samples__default: 16
+
+# Integrity check writes and verifies the ENTIRE capacity.
+# The only mode that proves the reported size; takes two full passes.
+usb_media_full__default: false
+
+# Hard ceiling for the integrity check, in seconds (default 4 hours).
+# Full mode on a large slow stick genuinely needs hours.
+usb_media_integrity_timeout__default: 14400
+
+# 4KiB operations for the random I/O test (each written then re-read).
+usb_media_random_ops__default: 400
+
+# Seed for the random offsets, so a run is reproducible and
+# comparable against a later run on the same device.
+usb_media_random_seed__default: 1
+
+# write: stamp blocks and exit, to be verified in a later run.
+# wait: write, sleep usb_media_retention_wait, then verify.
+# verify: compare against a state file from an earlier run.
+# Running write today and verify tomorrow is far stronger than wait.
+usb_media_retention_phase__default: wait
+
+# Seconds to wait in the 'wait' phase before re-reading.
+# Minutes catch only gross faults; a real retention test wants hours.
+usb_media_retention_wait__default: 300
+
+# Where the write phase records what it wrote, so a verify run days
+# later can compare against it.
+# A ROOT-OWNED directory, deliberately NOT /tmp: the write phase runs as
+# root, and a plain open() in a world-writable directory can be aimed at
+# any file via a pre-planted symlink (arbitrary root overwrite), while a
+# verify would trust JSON any local user could have replaced.
+# Not under ~ either: with become, ~ is /var/root.
+usb_media_retention_state__default: /var/lib/iaac-usb-media/retention-state.json
+
+# After a destructive test, repartition and format the device so it is
+# usable again.
+# Defaults ON: the tests necessarily destroy the partition table, and a
+# raw device is one the desktop cannot use — macOS reports that state as
+# a misleading 'lacks the proper privileges' error in Disk Utility.
+# Never applied by the write entrypoint, which leaves a bootable image.
+usb_media_reformat__default: true
+
+# Filesystem for the post-test reformat. ExFAT is readable and writable
+# on macOS, Windows and Linux without extra drivers.
+usb_media_reformat_fs__default: ExFAT
+
+# Partition scheme for the post-test reformat.
+usb_media_reformat_scheme__default: GPT
+
+# Volume label applied by the post-test reformat.
+usb_media_reformat_label__default: USB
+
+# Interpreter used for the role's helper scripts.
+usb_media_python__default: /usr/bin/python3
+
+# Actually write. Default false reports the pending destructive write
+# and stops. Does NOT bypass the safety assertions.
+usb_media_apply__default: false
+
+# Verify the downloaded ISO against the upstream checksum.
+# Only disable for an image with no published checksum.
+usb_media_verify__default: true
+
+# Local directory the ISO is cached in between runs.
+usb_media_cache_dir__default: ~/.cache/iaac-install-media
+
+# Re-download the cached ISO once it is older than this.
+usb_media_iso_ttl_days__default: 30
+
+# Decompress the downloaded file before writing it.
+# Raspberry Pi OS ships as .img.xz; dd-ing the COMPRESSED file produces a
+# card that is not bootable and gives no other symptom, so this is opt-in
+# per image rather than guessed from the extension.
+# ORDER MATTERS, and it is why this is a flag rather than a pipe: the
+# published checksum is of the COMPRESSED file, so the chain must be
+# download -> verify the archive -> decompress -> write -> read back
+# against the DECOMPRESSED image. Streaming `xz -d | dd` would discard
+# the decompressed size and hash that the post-write verification needs,
+# and would hide a mid-pipe failure behind dd's exit status.
+usb_media_decompress__default: false
+
+# Decompressor binary, resolved through PATH.
+# Resolved through PATH deliberately: an absolute path baked in here is
+# the CI-vs-dev-machine trap (a tool present on the developer's Mac and
+# absent on a runner, or at a different prefix under Homebrew).
+usb_media_decompress_cmd__default: xz
+
+# Timeout for the ISO download, in seconds. These images are ~8GB.
+usb_media_download_timeout__default: 3600
+
+# Upper size bound for an acceptable target device (default 128GB).
+# A typo selecting a large external backup drive is rejected by this.
+usb_media_max_device_bytes__default: 137438953472
+
+# Block size passed to dd. macOS dd takes the lowercase 'm' suffix.
+usb_media_dd_block_size__default: 4m
+
+# Hard ceiling for the async dd write, in seconds (default 2 hours).
+# A slow USB 2.0 stick can take well over an hour for an 8GB image.
+usb_media_write_timeout__default: 7200
+
+# How often to poll the running write and report progress, in seconds.
+usb_media_poll_interval__default: 15
+
+# After writing, re-read the ENTIRE image off the device and compare its
+# SHA256 against the source. Costs roughly one read pass (~2 min for 8GB
+# on USB 3).
+# Defaults ON: the leading-bytes check cannot see a write that failed
+# partway, which produces a stick that starts to boot and then fails.
+usb_media_verify_full__default: true
+
+# Also assert the device's full-image hash equals the vendor's PUBLISHED
+# checksum, closing the chain published -> downloaded -> written.
+# Opt-in: only meaningful when the image came from a source that
+# publishes one and usb_media_verify was on, so it is not a safe default
+# for a locally-supplied image.
+# Requires usb_media_verify_full.
+usb_media_verify_published__default: false
+
+# How many leading bytes to read back off the device and compare
+# against the image, to prove the write actually landed at offset 0.
+usb_media_readback_bytes__default: 4194304
+
+# Eject the device once the read-back has passed.
+usb_media_eject__default: true
+
+# Use become for the unmount/dd/eject steps. Writing to a raw disk
+# node needs root. Set false only in a test fixture.
+usb_media_become__default: true
+
+# Path to diskutil. Overridable so molecule can substitute a fake.
+usb_media_diskutil__default: /usr/sbin/diskutil
+
+# Path to plutil, used to convert diskutil's plist output to JSON.
+# Ansible has no from_plist filter, so this conversion is required.
+usb_media_plutil__default: /usr/bin/plutil
+
+# Path to dd. Overridable so molecule can substitute a fake.
+usb_media_dd__default: /bin/dd
+
+# Path to shasum, used for the read-back comparison.
+# shasum ships with macOS; GNU sha256sum does not.
+usb_media_shasum__default: /usr/bin/shasum
+
+# Path to sync. Overridable so molecule can substitute a fake.
+usb_media_sync__default: /bin/sync

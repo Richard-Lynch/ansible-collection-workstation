@@ -1,0 +1,159 @@
+---
+# AUTO-GENERATED defaults file — DO NOT EDIT.
+#
+# Source of truth: roles/asus_tuf_b850m_bios/meta/argument_specs.py
+# Regenerate:      venv/bin/python tools/argspec/cli.py x generate asus_tuf_b850m_bios
+#
+# Edits here are silently overwritten on the next generation. To change a value or its
+# documentation, change the OptionSpec in the source file above — descriptions there
+# are emitted as the comments in this file.
+# Entrypoint:      main
+
+# list: report known versions. verify: check the pinned ProductID against
+# ASUS's live search API. download: fetch and checksum a version.
+asus_bios_action__default: list
+
+# Actually download. Default false reports the plan and stops.
+asus_bios_apply__default: false
+
+# Exact ASUS product name. The trailing 'W' matters.
+asus_bios_board__default: TUF GAMING B850M-PLUS WIFI7 W
+
+# ASUS ProductID for this board; verified by the verify action.
+asus_bios_product_id__default: 32356
+
+# Vendor page the pinned version table is maintained from.
+asus_bios_support_url__default: https://www.asus.com/uk/motherboards-components/motherboards/tuf-gaming/tuf-gaming-b850m-plus-wifi7-w/helpdesk_bios/
+
+# Pinned version table with ASUS's published SHA-256 per release.
+# Pinned because ASUS's BIOS API ignores the product id and returns a
+# hardcoded default board — see tasks/list_versions.yml.
+asus_bios_versions__default:
+  - version: '1686'
+    beta: true
+    released: '2026-07-02'
+    size: 17.97 MB
+    sha256: FC7BBCA50F371B7A2511B7B6C4CB3930CD892033B8141BAA6171D48D3D268C2B
+    filename: TUF-GAMING-B850M-PLUS-WIFI7-W-ASUS-1686.ZIP
+    url: https://dlcdnets.asus.com/pub/ASUS/mb/BIOS/TUF-GAMING-B850M-PLUS-WIFI7-W-ASUS-1686.ZIP
+    notes: AGESA ComboAM5 PI 1.3.0.1b Patch A — GNR Transparent Secure Memory Encryption (TSME).
+    no_rollback: false
+  - version: '1681'
+    beta: false
+    released: '2026-06-22'
+    size: 17.97 MB
+    sha256: E3FF50224C1569D9232C8A972F09D707FEE68606EFA79E35C09CEBDF88C2BB81
+    filename: TUF-GAMING-B850M-PLUS-WIFI7-W-ASUS-1681.ZIP
+    url: https://dlcdnets.asus.com/pub/ASUS/mb/BIOS/TUF-GAMING-B850M-PLUS-WIFI7-W-ASUS-1681.ZIP
+    notes: AGESA ComboAM5 PI 1.3.0.1b. Adds EXPO ULL memory profiles. Optimises ECC-UDIMM performance.
+    no_rollback: false
+  - version: '1670'
+    beta: true
+    released: '2026-04-29'
+    size: 17.95 MB
+    sha256: 7960F3AD804B2EDC7AA3093134FD6C9C958F2988BC50932DF35E0960C9B84FD4
+    filename: TUF-GAMING-B850M-PLUS-WIFI7-W-ASUS-1670.ZIP
+    url: https://dlcdnets.asus.com/pub/ASUS/mb/BIOS/TUF-GAMING-B850M-PLUS-WIFI7-W-ASUS-1670.ZIP
+    notes: New memory profile support.
+    no_rollback: false
+  - version: '1654'
+    beta: false
+    released: '2026-04-27'
+    size: 17.95 MB
+    sha256: 46E7B23F318C88CA968AE4DA67C6A3446C158CD3D96DECFEBC41980F23EE1E7A
+    filename: TUF-GAMING-B850M-PLUS-WIFI7-W-ASUS-1654.ZIP
+    url: https://dlcdnets.asus.com/pub/ASUS/mb/BIOS/TUF-GAMING-B850M-PLUS-WIFI7-W-ASUS-1654.ZIP
+    notes: AGESA ComboAM5 PI 1.3.0.1. Ryzen 9 9950X3D2 Dual Edition compatibility.
+    no_rollback: true
+  - version: '1644'
+    beta: false
+    released: '2026-03-19'
+    size: 17.9 MB
+    sha256: 9A98DA9FD8D7B386EE300654A27BD00B06F52E94F91BA85BCF7EA4DC8A408873
+    filename: TUF-GAMING-B850M-PLUS-WIFI7-W-ASUS-1644.ZIP
+    url: https://dlcdnets.asus.com/pub/ASUS/mb/BIOS/TUF-GAMING-B850M-PLUS-WIFI7-W-ASUS-1644.ZIP
+    notes: AGESA ComboAM5 PI 1.3.0.0a. DDR5 training stability. Resolves a BitLocker recovery-key issue.
+    no_rollback: false
+  - version: '1627'
+    beta: false
+    released: '2026-02-11'
+    size: 17.89 MB
+    sha256: 516B1D1EF84693F300D1F16C7A34E5A1F359F5C3F30E4E012B706B5137F6E8EA
+    filename: TUF-GAMING-B850M-PLUS-WIFI7-W-ASUS-1627.ZIP
+    url: https://dlcdnets.asus.com/pub/ASUS/mb/BIOS/TUF-GAMING-B850M-PLUS-WIFI7-W-ASUS-1627.ZIP
+    notes: AGESA ComboAM5 PI_Pre1.3.0.0. Memory compatibility for JEDEC modules.
+    no_rollback: false
+  - version: '1402'
+    beta: false
+    released: '2025-12-04'
+    size: 17.9 MB
+    sha256: 6F788EAAB5403E913A4A58CA9F6E76A505D45E1424C92B10B0860BD65E602321
+    filename: TUF-GAMING-B850M-PLUS-WIFI7-W-ASUS-1402.ZIP
+    url: https://dlcdnets.asus.com/pub/ASUS/mb/BIOS/TUF-GAMING-B850M-PLUS-WIFI7-W-ASUS-1402.ZIP
+    notes: AGESA ComboAM5 PI 1.2.7.0. Broader CPU and device compatibility.
+    no_rollback: true
+    url_unverified: true
+  - version: '1087'
+    beta: false
+    released: '2025-10-22'
+    size: 15.43 MB
+    sha256: C66FC74B1787DF06AABE332E1B4404494F552083841D9AEE8EF3270EFBF3CFA9
+    filename: TUF-GAMING-B850M-PLUS-WIFI7-W-ASUS-1087.ZIP
+    url: https://dlcdnets.asus.com/pub/ASUS/mb/BIOS/TUF-GAMING-B850M-PLUS-WIFI7-W-ASUS-1087.ZIP
+    notes: AGESA ComboAM5 PI 1.2.0.3g.
+    no_rollback: false
+    url_unverified: true
+  - version: '1078'
+    beta: false
+    released: '2025-07-22'
+    size: 15.42 MB
+    sha256: B91B10837FEAECF1F1776C660485D0E63B045C16CD178EAFB60223B8C20935B1
+    filename: TUF-GAMING-B850M-PLUS-WIFI7-W-ASUS-1078.ZIP
+    url: https://dlcdnets.asus.com/pub/ASUS/mb/BIOS/TUF-GAMING-B850M-PLUS-WIFI7-W-ASUS-1078.ZIP
+    notes: AGESA ComboAM5 PI 1.2.0.3f. Performance, stability and overclocking support.
+    no_rollback: false
+    url_unverified: true
+  - version: '0401'
+    beta: false
+    released: '2025-06-23'
+    size: 15.39 MB
+    sha256: C386C8F3CF2C592EC8FCBFB0E9D8D7312A4E26E6F8F074E942A595FD4CD08140
+    filename: TUF-GAMING-B850M-PLUS-WIFI7-W-ASUS-0401.ZIP
+    url: https://dlcdnets.asus.com/pub/ASUS/mb/BIOS/TUF-GAMING-B850M-PLUS-WIFI7-W-ASUS-0401.ZIP
+    notes: First release.
+    no_rollback: false
+    url_unverified: true
+
+# Version this role recommends: the newest stable, not the newest beta.
+asus_bios_recommended__default: '1681'
+
+# Version to download. Defaults to the recommended stable.
+asus_bios_version__default: '1681'
+
+# Permit downloading a beta release. Off by default: several versions of
+# this BIOS cannot be rolled back, making a beta flash permanent.
+asus_bios_allow_beta__default: false
+
+# Where to write the verified image — normally the FAT32 flash stick.
+asus_bios_dest__default: /Volumes/BIOS/bios.zip
+
+# Fetch ASUS's support page and compare it against the pinned table.
+# On by default: pinned firmware data that nobody revisits looks
+# authoritative while quietly ageing, and a new BIOS should announce
+# itself. A failed fetch is reported, never treated as 'no new versions'.
+asus_bios_check_live__default: true
+
+# The model2Name query parameter. WITHOUT it ASUS returns a ~17KB
+# client-rendered shell; WITH it, the full ~566KB server-rendered page
+# containing every version and its SHA-256. That one parameter is the
+# difference between no data and all of it.
+asus_bios_model2_name__default: TUF-GAMING-B850M-PLUS-WIFI7-W
+
+# Interpreter used for the role's page parser.
+asus_bios_python__default: /usr/bin/python3
+
+# Date the pinned table was last checked against the vendor page.
+asus_bios_data_checked__default: '2026-09-08'
+
+# Warn when the pinned table is older than this many days.
+asus_bios_stale_days__default: 90

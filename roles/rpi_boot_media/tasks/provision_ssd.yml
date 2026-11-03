@@ -1,0 +1,336 @@
+---
+# Write the pinned OS image to the SSD and expand its root. DESTROYS everything on the target.
+#
+# WHY IMAGE RATHER THAN CLONE. An earlier design cloned the running SD system onto the SSD. That
+# is the conventional Pi recipe and it carries a whole hazard class: the clone inherits the SD's
+# PARTUUIDs, so unless all THREE identifiers (cmdline root=, fstab /, fstab /boot/firmware) are
+# rewritten on the DESTINATION copy, the Pi boots the SSD's kernel and mounts the SD's root — a
+# hybrid that works, looks right, and writes everything to the card. It also duplicates the
+# filesystem LABELs and machine-id.
+#
+# Because these hosts are stateless (Ansible is the backup), imaging from the same pinned image
+# the card came from gives a better guarantee with none of that: both media derive from declared,
+# version-pinned inputs in the repo, so the REPO is the source of truth rather than a disk. The
+# most dangerous logic in the original plan is removed by a decision rather than guarded.
+#
+# TWO CONFIRMATIONS, because "yes, make changes" and "yes, erase that disk" are different
+# statements: rpi_boot_apply AND rpi_boot_confirm.
+
+- name: Resolve declared options over their generated defaults
+  ansible.builtin.include_tasks: _resolve_defaults.yml
+
+- name: Survey the board before touching anything
+  ansible.builtin.include_tasks: probe.yml
+
+# --- 1. identify the target, and prove it is not the thing we are running from -------------------
+
+- name: Resolve the declared SSD to its current kernel device
+  # follow: FALSE, and this is load-bearing. With follow:true the stat module os.stat()s the
+  # TARGET, so `islnk` is false and `lnk_source` is NEVER returned — verified empirically against
+  # this venv's ansible-core. The previous version used follow:true, so `_rpi_ssd_dev` evaluated
+  # to the literal string "/dev/" on every run, and the "refuse to overwrite the running disk"
+  # gate below compared '' against the root device and passed for EVERY input. A guard in front of
+  # a whole-disk dd that could never fire — the exact shape THE OTHER RULE exists to ban.
+  ansible.builtin.stat:
+    path: "/dev/disk/by-id/{{ rpi_boot_ssd_by_id }}"
+    follow: false
+  register: _rpi_ssd_stat
+
+- name: HARD GATE — the declared SSD must actually be present, and be a symlink we can resolve
+  ansible.builtin.assert:
+    that:
+      - _rpi_ssd_stat.stat.exists
+      - _rpi_ssd_stat.stat.islnk | default(false)
+      - (_rpi_ssd_stat.stat.lnk_source | default('')) is match('^/dev/')
+    fail_msg: >-
+      /dev/disk/by-id/{{ rpi_boot_ssd_by_id }} is not a resolvable device link on
+      {{ inventory_hostname }} (exists={{ _rpi_ssd_stat.stat.exists }},
+      islnk={{ _rpi_ssd_stat.stat.islnk | default(false) }},
+      target={{ _rpi_ssd_stat.stat.lnk_source | default('(none)') }}).
+      Either the SSD is not attached, or rpi_boot_ssd_by_id in inventory does not match this
+      board's disk. Run rpi_boot_action=probe to list what is actually present.
+      REFUSING to guess — the alternative is repartitioning whatever /dev/sda happens to be today.
+    quiet: true
+
+- name: Identify the SSD's kernel name
+  ansible.builtin.set_fact:
+    _rpi_ssd_dev: "{{ _rpi_ssd_stat.stat.lnk_source }}"
+
+- name: HARD GATE — the resolved node must be a WHOLE DISK, not a partition
+  # A by-id name ending in -partN resolves to a partition. Every other gate here would still
+  # pass — `^usb-` matches, and comparing "sda2" against the root's whole-disk "sda" succeeds —
+  # so a declared partition would let dd write a whole-disk image over a live filesystem.
+  # Asked of the kernel (lsblk TYPE) rather than inferred from the name, because the name is the
+  # thing that might be wrong.
+  ansible.builtin.command:
+    cmd: "lsblk -no TYPE {{ _rpi_ssd_dev }}"
+  register: _rpi_ssd_type
+  changed_when: false
+
+- name: Assert it is a disk
+  ansible.builtin.assert:
+    that:
+      - (_rpi_ssd_type.stdout_lines | first | default('')) | trim == 'disk'
+    fail_msg: >-
+      {{ rpi_boot_ssd_by_id }} resolves to {{ _rpi_ssd_dev }}, which the kernel reports as
+      '{{ _rpi_ssd_type.stdout_lines | first | default('unknown') | trim }}', not a whole disk.
+      A by-id name ending in -partN points at a PARTITION; writing a whole-disk image into one
+      destroys whatever filesystem is there. Declare the whole-disk by-id name.
+    quiet: true
+
+- name: HARD GATE — refuse to overwrite the disk this Pi is currently running from
+  # THE CHECK THAT PREVENTS THE CATASTROPHE. If the declared "SSD" resolves to the running root's
+  # disk — a mistyped by-id, or a board that already migrated — imaging it destroys the live
+  # system mid-write.
+  #
+  # Compared via the kernel's own PKNAME for the root device rather than by stripping digits off
+  # a name: `regex_replace('p?\d+$','')` turns "sda2" into "sda" but would also turn a whole disk
+  # legitimately ending in a digit into something else, and it cannot see through a partition.
+  ansible.builtin.command:
+    cmd: "findmnt -n -o SOURCE --target /"
+  register: _rpi_root_src
+  changed_when: false
+
+- name: Resolve the root device's parent disk
+  ansible.builtin.command:
+    cmd: "lsblk -no PKNAME {{ _rpi_root_src.stdout | trim }}"
+  register: _rpi_root_pk
+  changed_when: false
+  failed_when: false
+
+- name: Assert the target is not the running root's disk
+  ansible.builtin.assert:
+    that:
+      - _rpi_ssd_dev | basename != (_rpi_root_pk.stdout_lines | first | default('') | trim)
+      - _rpi_ssd_dev != (_rpi_root_src.stdout | trim)
+    fail_msg: >-
+      REFUSING: {{ rpi_boot_ssd_by_id }} resolves to {{ _rpi_ssd_dev }}, which is the disk this Pi
+      is CURRENTLY RUNNING FROM (root={{ _rpi_root_src.stdout | trim }},
+      parent={{ _rpi_root_pk.stdout_lines | first | default('?') | trim }}).
+      Imaging it would destroy the running system mid-write.
+      provision_ssd must run while the Pi is booted from its SD card.
+    success_msg: >-
+      Target {{ _rpi_ssd_dev }} is a whole disk and is not the running root
+      ({{ _rpi_root_src.stdout | trim }}).
+    quiet: true
+
+- name: HARD GATE — the target must be a USB-attached disk, not the card
+  ansible.builtin.assert:
+    that:
+      - rpi_boot_ssd_by_id is search('^usb-')
+      - rpi_boot_ssd_by_id is not search('-part[0-9]+$')
+    fail_msg: >-
+      rpi_boot_ssd_by_id is '{{ rpi_boot_ssd_by_id }}', which is not a whole USB device (expected
+      a usb-* by-id name with no -partN suffix). REFUSING — this action images the SSD, and
+      pointing it at the rescue card or at a partition would destroy the fallback this whole
+      design depends on.
+    quiet: true
+
+- name: Describe the target device
+  ansible.builtin.set_fact:
+    _rpi_ssd_info: >-
+      {{ rpi_probe.block_devices | default([])
+         | selectattr('kernel', 'equalto', _rpi_ssd_dev | basename)
+         | list | first | default({}) }}
+
+# --- 2. report, and stop unless BOTH flags are set ------------------------------------------------
+
+- name: Report the pending provision and stop (default — no apply flag)
+  ansible.builtin.debug:
+    msg:
+      - "DRY RUN — would DESTROY everything on:"
+      - "  {{ rpi_boot_ssd_by_id }}  ->  {{ _rpi_ssd_dev }}"
+      - "  {{ _rpi_ssd_info.model | default('unknown model') }}, {{ _rpi_ssd_info.size_gb | default('?') }}GB"
+      - "  transport: {{ _rpi_ssd_info.transport | default('?') }}"
+      - ""
+      - "and write {{ rpi_boot_image_url | default('(rpi_boot_image_url not set)') }} to it."
+      - ""
+      - "Re-run with BOTH rpi_boot_apply=true AND rpi_boot_confirm=true."
+  when: not (rpi_boot_apply | bool and rpi_boot_confirm | bool)
+
+- name: Decide whether to proceed
+  # A FLAG, NOT `meta: end_host`. end_host terminates the play for this host, including tasks the
+  # CALLER sequenced after the role — so a dry run of a play that does
+  # `include_role: provision_ssd` then reboot then verify would silently skip the last two and
+  # still look clean. A role must be able to decline to act without killing its caller.
+  ansible.builtin.set_fact:
+    _rpi_provision_skip: "{{ not (rpi_boot_apply | bool and rpi_boot_confirm | bool) }}"
+
+# --- 3. fetch and verify the image ---------------------------------------------------------------
+
+- name: Assert an image and checksum were declared
+  ansible.builtin.assert:
+    that:
+      - rpi_boot_image_url | default('') | length > 0
+      - rpi_boot_image_checksum | default('') | length > 0
+    fail_msg: >-
+      provision_ssd needs rpi_boot_image_url and rpi_boot_image_checksum, declared in inventory
+      (group_vars for the Pi hosts). PIN THE VERSION rather than tracking "latest": the first-boot
+      provisioning format has changed between Pi OS releases, so an unpinned image can silently
+      change what a freshly provisioned disk does.
+    quiet: true
+  when: not _rpi_provision_skip | bool
+
+- name: Download the OS image onto the Pi
+  ansible.builtin.get_url:
+    url: "{{ rpi_boot_image_url }}"
+    dest: "/var/tmp/{{ rpi_boot_image_url | urlsplit('path') | basename }}"
+    checksum: "sha256:{{ rpi_boot_image_checksum }}"
+    mode: "0644"
+    timeout: "{{ rpi_boot_download_timeout }}"
+  become: true
+  register: _rpi_image
+  when: not _rpi_provision_skip | bool
+
+- name: Unmount anything currently mounted from the target
+  # A partition still mounted makes the write fail partway, which is the worst outcome: a
+  # half-written disk whose boot partition may still be loadable. Failure is tolerated because
+  # "nothing was mounted" is the common and correct case.
+  ansible.builtin.shell:
+    cmd: |
+      set -o pipefail
+      for part in $(lsblk -ln -o NAME {{ _rpi_ssd_dev }} | tail -n +2); do
+        umount -f "/dev/$part" 2>/dev/null || true
+      done
+      exit 0
+  args:
+    executable: /bin/bash
+  become: true
+  changed_when: true
+  when: not _rpi_provision_skip | bool
+
+# --- 4. the write --------------------------------------------------------------------------------
+
+- name: Write the image to the SSD
+  # Decompressed through xz into dd. Unlike the controller-side usb_media path there is no
+  # published-checksum-of-the-decompressed-image to compare against here, so the verification
+  # below is structural (partitions present, filesystems mountable, PARTUUIDs the disk's own)
+  # rather than a whole-device hash — which on a multi-GB SSD over USB2 would cost more than it
+  # proves, given the image was already checksum-verified on arrival.
+  ansible.builtin.shell:
+    # LITERAL block (`|`), NOT folded (`>-`). A folded scalar joins these lines into ONE, so the
+    # first `#` comments out everything after it — including the variable assignments and the
+    # `|| {` that opens the guard. The surviving statements were then `echo "REFUSING..."; exit 1`,
+    # unconditionally, with empty variables: the task always failed with a lying "the device
+    # changed underneath us" message and the image write could never run.
+    #
+    # A folded scalar joins the lines of a shell script into one, so a multi-line script needs a
+    # literal (|) scalar — in the most dangerous task in the role most of all.
+    cmd: |
+      set -o pipefail
+      set -e
+      # RE-ASSERT IMMEDIATELY BEFORE THE WRITE. The device was resolved and vetted minutes ago,
+      # with a multi-hundred-MB download in between — and this role's own probe warns that
+      # undervoltage drops USB devices, which renames sdX on re-enumeration. Between resolution
+      # and here, /dev/sda can legitimately have become a different disk.
+      #
+      # dd targets the BY-ID PATH, not the cached kernel name, so the symlink is resolved by the
+      # kernel at open() time rather than trusted from a stale fact. The check below then proves
+      # that path still points where we vetted, and that it is still not the running root.
+      by_id="/dev/disk/by-id/{{ rpi_boot_ssd_by_id }}"
+      now="$(readlink -f "$by_id")"
+      [ "$now" = "{{ _rpi_ssd_dev }}" ] || {
+        echo "REFUSING: $by_id now resolves to $now, not {{ _rpi_ssd_dev }} as vetted." >&2
+        exit 1
+      }
+      root_src="$(findmnt -n -o SOURCE --target /)"
+      root_disk="/dev/$(lsblk -no PKNAME "$root_src" 2>/dev/null | head -1 | tr -d ' ')"
+      [ "$now" != "$root_disk" ] && [ "$now" != "$root_src" ] || {
+        echo "REFUSING: $now is the running root ($root_src)." >&2
+        exit 1
+      }
+      xz -dc {{ _rpi_image.dest | quote }} | dd of="$by_id" bs=4M conv=fsync status=none
+  args:
+    executable: /bin/bash
+  become: true
+  register: _rpi_dd
+  changed_when: _rpi_dd.rc == 0
+  async: "{{ rpi_boot_write_timeout }}"
+  poll: 15
+  when: not _rpi_provision_skip | bool
+
+- name: Re-read the partition table
+  ansible.builtin.command:
+    cmd: "partprobe {{ _rpi_ssd_dev }}"
+  become: true
+  changed_when: true
+  failed_when: false
+  when: not _rpi_provision_skip | bool
+
+- name: Settle udev so the new partitions appear
+  ansible.builtin.command:
+    cmd: udevadm settle
+  become: true
+  changed_when: false
+  when: not _rpi_provision_skip | bool
+
+# --- 5. verify the write by CONTENT, not by dd's exit code ----------------------------------------
+
+- name: Read back the SSD's partition table
+  ansible.builtin.command:
+    cmd: "lsblk -J -b -o NAME,SIZE,FSTYPE,PARTUUID {{ _rpi_ssd_dev }}"
+  become: true
+  register: _rpi_after
+  changed_when: false
+  when: not _rpi_provision_skip | bool
+
+- name: Parse the partition table
+  ansible.builtin.set_fact:
+    _rpi_parts: >-
+      {{ (_rpi_after.stdout | from_json).blockdevices | first
+         | json_query('children') | default([], true) }}
+  when: not _rpi_provision_skip | bool
+
+- name: HARD GATE — the SSD must now carry a boot and a root partition
+  # `dd` exits 0 on a short write, so the exit code proves nothing. This asserts the disk actually
+  # holds what a Pi OS image produces: a FAT boot partition and an ext4 root.
+  ansible.builtin.assert:
+    that:
+      - _rpi_parts | length >= 2
+      - _rpi_parts | selectattr('fstype', 'defined') | selectattr('fstype', 'search', 'vfat') | list | length >= 1
+      - _rpi_parts | selectattr('fstype', 'defined') | selectattr('fstype', 'search', 'ext4') | list | length >= 1
+    fail_msg: >-
+      The SSD does not hold a usable Pi OS layout after the write:
+      {{ _rpi_parts | map(attribute='fstype') | list }}.
+      Expected at least one vfat (boot) and one ext4 (root) partition. `dd` exits 0 on a short
+      write, so this is the check that actually proves the image landed. DO NOT set the boot
+      order until this passes — a half-written SSD whose boot partition is loadable will preempt
+      the rescue card and leave the Pi dark.
+    success_msg: >-
+      SSD carries a boot and root partition: {{ _rpi_parts | map(attribute='fstype') | list }}.
+    quiet: true
+  when: not _rpi_provision_skip | bool
+
+- name: Expand the root partition to fill the SSD
+  # The image's root is sized for the smallest supported card; without this the SSD's extra
+  # capacity is simply unused. Pi OS's own init_resize does this on FIRST BOOT for the medium it
+  # boots from, but this disk will be booted only after the EEPROM step, so it is done here where
+  # the result can be verified before anything depends on it.
+  ansible.builtin.shell:
+    cmd: |
+      set -o pipefail
+      root_num=$(lsblk -ln -o NAME,FSTYPE {{ _rpi_ssd_dev }} | awk '$2=="ext4"{print $1; exit}' | grep -o '[0-9]*$')
+      [ -n "$root_num" ] || { echo "no ext4 partition found"; exit 1; }
+      parted -s {{ _rpi_ssd_dev }} resizepart "$root_num" 100%
+      partprobe {{ _rpi_ssd_dev }} || true
+      udevadm settle
+      part=$(lsblk -ln -o NAME,FSTYPE {{ _rpi_ssd_dev }} | awk '$2=="ext4"{print $1; exit}')
+      e2fsck -fp "/dev/$part" || true
+      resize2fs "/dev/$part"
+  args:
+    executable: /bin/bash
+  become: true
+  register: _rpi_resize
+  changed_when: _rpi_resize.rc == 0
+  when: not _rpi_provision_skip | bool
+
+- name: Report the provisioned SSD
+  ansible.builtin.debug:
+    msg:
+      - "SSD {{ rpi_boot_ssd_by_id }} provisioned and verified."
+      - ""
+      - "NEXT: seed it (rpi_image_media), then set the boot order — IN THAT ORDER."
+      - "Setting BOOT_ORDER before the SSD is complete preempts the rescue card: once the SSD's"
+      - "boot partition is loadable the firmware stops falling back, and a kernel that cannot"
+      - "mount its root just hangs."
+  when: not _rpi_provision_skip | bool

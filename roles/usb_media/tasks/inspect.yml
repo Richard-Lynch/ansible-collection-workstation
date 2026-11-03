@@ -1,0 +1,22 @@
+---
+# ENTRYPOINT: identify and vet ONE device, then stop.
+#
+# Read-only. This is resolve_device.yml on its own — the identity report plus the safety verdict,
+# with nothing done afterwards. Useful for answering "is this the right stick, and would the write
+# path accept it?" without committing to anything.
+#
+# A refusal here fails the play, deliberately: "would the gate accept this device" is the question
+# being asked, and a green run that quietly meant "no" would be the wrong answer to it.
+
+- name: Apply role defaults
+  ansible.builtin.include_tasks: setup_vars.yml
+
+- name: Resolve and vet the target device
+  ansible.builtin.include_tasks: resolve_device.yml
+
+- name: Confirm the device passed every check
+  ansible.builtin.debug:
+    msg: >-
+      {{ usb_media_device }} is an ELIGIBLE target: external, removable, a whole disk, and within
+      the {{ (usb_media_max_device_bytes | int / 1000 / 1000 / 1000) | round(0) }} GB ceiling.
+      The write path would accept it.

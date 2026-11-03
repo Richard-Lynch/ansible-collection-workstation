@@ -1,0 +1,53 @@
+---
+# AUTO-GENERATED defaults resolver — DO NOT EDIT.
+#
+# Source of truth: roles/rpi_host_setup/meta/argument_specs.py
+# Regenerate:      venv/bin/python tools/argspec/cli.py x generate rpi_host_setup
+#
+# Edits here are silently overwritten on the next generation. To change a value or its
+# documentation, change the OptionSpec in the source file above — descriptions there
+# are emitted as the comments in this file.
+
+# Binds every declared option to its generated default, so a caller-supplied value
+# wins and an unsupplied one falls back rather than evaluating Undefined.
+#
+# Include this FIRST from every entrypoint:
+#   - ansible.builtin.include_tasks: _resolve_defaults.yml
+#
+# Role-specific setup logic belongs in tasks/setup_vars.yml, NOT here — this file is
+# overwritten on every generation.
+#
+# TWO BRANCHES, because `set_fact` persists for the whole play. A role invoked twice in
+# one play would otherwise see its OWN leftover facts on the second call, so a later
+# caller that omitted an option silently inherited the earlier caller's value instead of
+# the declared default. On a repeat call this ignores the role's own facts and rebinds
+# the defaults; an include-level `vars:` shadows the fact, so a value the caller DID
+# supply this time still wins. Roles called once per play only ever run the first branch.
+
+- name: Resolve declared options over their generated defaults
+  ansible.builtin.set_fact:
+    rpi_host_action: "{{ rpi_host_action | default(rpi_host_action__default) if rpi_host_action__default is defined else rpi_host_action | default(omit) }}"
+    rpi_host_apply: "{{ rpi_host_apply | default(rpi_host_apply__default) if rpi_host_apply__default is defined else rpi_host_apply | default(omit) }}"
+    rpi_usb_quirks: "{{ rpi_usb_quirks | default(rpi_usb_quirks__default) if rpi_usb_quirks__default is defined else rpi_usb_quirks | default(omit) }}"
+    rpi_cgroup_memory: "{{ rpi_cgroup_memory | default(rpi_cgroup_memory__default) if rpi_cgroup_memory__default is defined else rpi_cgroup_memory | default(omit) }}"
+    rpi_journald_max_use: "{{ rpi_journald_max_use | default(rpi_journald_max_use__default) if rpi_journald_max_use__default is defined else rpi_journald_max_use | default(omit) }}"
+    rpi_timezone: "{{ rpi_timezone | default(rpi_timezone__default) if rpi_timezone__default is defined else rpi_timezone | default(omit) }}"
+    rpi_host_packages: "{{ rpi_host_packages | default(rpi_host_packages__default) if rpi_host_packages__default is defined else rpi_host_packages | default(omit) }}"
+    rpi_unattended_security: "{{ rpi_unattended_security | default(rpi_unattended_security__default) if rpi_unattended_security__default is defined else rpi_unattended_security | default(omit) }}"
+  when: not (_rpi_host_setup__argspec_resolved | default(false))
+
+- name: Rebind the defaults on a repeat call, ignoring this role's own leftover facts
+  ansible.builtin.set_fact:
+    rpi_host_action: "{{ rpi_host_action__default if rpi_host_action__default is defined else rpi_host_action | default(omit) }}"
+    rpi_host_apply: "{{ rpi_host_apply__default if rpi_host_apply__default is defined else rpi_host_apply | default(omit) }}"
+    rpi_usb_quirks: "{{ rpi_usb_quirks__default if rpi_usb_quirks__default is defined else rpi_usb_quirks | default(omit) }}"
+    rpi_cgroup_memory: "{{ rpi_cgroup_memory__default if rpi_cgroup_memory__default is defined else rpi_cgroup_memory | default(omit) }}"
+    rpi_journald_max_use: "{{ rpi_journald_max_use__default if rpi_journald_max_use__default is defined else rpi_journald_max_use | default(omit) }}"
+    rpi_timezone: "{{ rpi_timezone__default if rpi_timezone__default is defined else rpi_timezone | default(omit) }}"
+    rpi_host_packages: "{{ rpi_host_packages__default if rpi_host_packages__default is defined else rpi_host_packages | default(omit) }}"
+    rpi_unattended_security: "{{ rpi_unattended_security__default if rpi_unattended_security__default is defined else rpi_unattended_security | default(omit) }}"
+  when: _rpi_host_setup__argspec_resolved | default(false)
+
+- name: Record that this role has resolved its options in this play
+  ansible.builtin.set_fact:
+    _rpi_host_setup__argspec_resolved: true

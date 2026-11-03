@@ -1,0 +1,95 @@
+---
+# Leave a tested device USABLE again: partition it and lay down a filesystem.
+#
+# WHY THIS EXISTS. Every destructive test here writes raw patterns across the device, which
+# necessarily destroys its partition table — that is inherent to proving blocks store what was
+# written, not a side effect that could be avoided. But a stick left as raw unpartitioned media
+# is one the desktop cannot use, and macOS reports that state confusingly: Disk Utility's erase
+# fails with "The calling process or user lacks the proper privileges to perform", which reads
+# like a permissions bug and is really "there is no partition scheme here to replace". Someone
+# hits that, concludes the health test broke their drive, and they are reasonably annoyed.
+#
+# So the tests clean up after themselves. A health check that hands back an unusable device has
+# not finished its job.
+#
+# NOT used by the write entrypoint — that one deliberately leaves a bootable image in place, and
+# reformatting it would destroy exactly what it just wrote.
+#
+# exFAT + GPT by default: readable and writable on macOS, Windows and Linux without extra
+# drivers, which is what "usable again" means for a stick that moves between machines.
+
+- name: Unmount the device before repartitioning
+  # eraseDisk needs every volume released; a mounted one fails the operation partway and leaves
+  # the device in a worse state than before.
+  ansible.builtin.command:
+    cmd: "{{ usb_media_diskutil }} unmountDisk force {{ usb_media_device }}"
+  changed_when: true
+  become: "{{ usb_media_become | bool }}"
+
+- name: Repartition and format the device
+  # eraseDisk writes a fresh partition scheme AND a filesystem in one step, which is what the raw
+  # device needs — `diskutil partitionDisk` on media with no existing scheme is the case that
+  # produces the misleading privileges error.
+  #
+  # THE FILESYSTEM NAME IS QUOTED because several are MULTI-WORD — "MS-DOS FAT32" is one token to
+  # diskutil, but an unquoted template splits it into two arguments and every later argument
+  # shifts by one. The observed result: a request for FAT32/MBR/BIOS silently produced GPT with an
+  # EFI partition and a volume named "FAT32", because "MS-DOS" was read as the format and "FAT32"
+  # as the volume name. eraseDisk exits 0 doing it, so nothing reports the mistake.
+  #
+  # Uses the argv form rather than a shell string: each element is one argument by construction,
+  # so no amount of whitespace in a variable can re-split them.
+  ansible.builtin.command:
+    argv:
+      - "{{ usb_media_diskutil }}"
+      - eraseDisk
+      - "{{ usb_media_reformat_fs }}"
+      - "{{ usb_media_reformat_label }}"
+      - "{{ usb_media_reformat_scheme }}"
+      - "{{ usb_media_device }}"
+  register: _usb_reformat
+  changed_when: true
+  become: "{{ usb_media_become | bool }}"
+
+- name: Confirm the device now carries a usable filesystem
+  # A read-back, not a trust of the exit code: eraseDisk can report success while leaving the
+  # volume unmounted or unwritable, and "it said it worked" is not evidence. Re-reads the device's own properties rather than the command's output.
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: >-
+      set -o pipefail;
+      {{ usb_media_diskutil }} list -plist {{ usb_media_device }}
+      | {{ usb_media_plutil }} -convert json -o - -
+  register: _usb_postfmt
+  changed_when: false
+
+- name: Assert the requested scheme and filesystem actually landed
+  # Checks WHAT was created, not merely that something was — the argument-shift bug above
+  # produced a perfectly valid partition of entirely the wrong kind, and an assertion that only
+  # counted partitions passed it happily. For firmware media the scheme IS the requirement.
+  ansible.builtin.assert:
+    that:
+      - _fs.AllDisksAndPartitions | default([]) | length > 0
+      - (_parts | length) > 0
+      - not (usb_media_reformat_scheme == 'MBR') or _content == 'FDisk_partition_scheme'
+      - not (usb_media_reformat_scheme == 'GPT') or _content == 'GUID_partition_scheme'
+      - (_parts | selectattr('VolumeName', 'defined') | selectattr('VolumeName', 'equalto', usb_media_reformat_label) | list | length) > 0
+    fail_msg: >-
+      {{ usb_media_device }} was reformatted, but not as asked.
+      wanted scheme={{ usb_media_reformat_scheme }} label='{{ usb_media_reformat_label }}'
+      got scheme={{ _content | default('none') }}
+      volumes={{ _parts | map(attribute='VolumeName') | select('string') | list }}
+      A multi-word filesystem name that is not quoted shifts every later argument — check
+      usb_media_reformat_fs. Reformat by hand before relying on this device.
+    quiet: true
+  vars:
+    _fs: "{{ _usb_postfmt.stdout | from_json }}"
+    _content: "{{ _fs.AllDisksAndPartitions[0].Content | default('') }}"
+    _parts: "{{ _fs.AllDisksAndPartitions[0].Partitions | default([]) }}"
+
+- name: Report the device is usable again
+  ansible.builtin.debug:
+    msg: >-
+      {{ usb_media_device }} reformatted as {{ usb_media_reformat_fs }}
+      ({{ usb_media_reformat_scheme }}) labelled '{{ usb_media_reformat_label }}' —
+      mountable on macOS, Windows and Linux. The test patterns written during this run are gone.

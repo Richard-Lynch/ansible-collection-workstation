@@ -1,0 +1,62 @@
+---
+# Verify the guards fired, and test the pure logic that decides whether a board boots at all.
+- name: Verify
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    # --- BOOT_ORDER decoding: 0xf14 and 0xf41 look alike and mean opposite things ---------------
+    - name: Decode BOOT_ORDER with the role's own helper
+      # The REAL script, not a re-implementation. This is the logic that decides whether a report
+      # tells an operator "USB first" or "SD first" during an incident, and the two values differ
+      # by one transposed character.
+      ansible.builtin.command:
+        cmd: >-
+          {{ ansible_playbook_python }} -c
+          "import sys; sys.path.insert(0, '{{ playbook_dir }}/../../files');
+          from rpi_boot_probe import decode_boot_order;
+          print(decode_boot_order('0xf14')[0]);
+          print(decode_boot_order('0xf41')[0])"
+      register: decoded
+      changed_when: false
+
+    - name: 0xf14 must try USB FIRST and 0xf41 must try the SD card first
+      ansible.builtin.assert:
+        that:
+          - "'USB mass storage' in decoded.stdout_lines[0]"
+          - "'SD card' in decoded.stdout_lines[1]"
+        fail_msg: >-
+          BOOT_ORDER decoding is wrong: 0xf14 decoded to '{{ decoded.stdout_lines[0] }}' and
+          0xf41 to '{{ decoded.stdout_lines[1] }}'. Nibbles are read RIGHT TO LEFT; getting this
+          backwards would report the opposite boot order to an operator mid-incident.
+        success_msg: "0xf14 tries USB first; 0xf41 tries the SD card first."
+        quiet: true
+
+    # --- the rw-mount detection that guards the rescue card ------------------------------------
+    - name: A read-only card mount must NOT be flagged, and a writable one MUST be
+      # Both directions, because the first version of this expression flagged every read-only
+      # mount as a violation: findmnt separates fields with SPACES, so `ro` is preceded by a
+      # space rather than a comma. And `rw,errors=remount-ro` is a READ-WRITE mount whose options
+      # merely contain "ro" — a substring test would have excused exactly the case this catches.
+      ansible.builtin.assert:
+        that:
+          - _ro_mounts | length == 0
+          - _rw_mounts | length == 2
+        fail_msg: >-
+          rw-mount detection is wrong. read-only flagged: {{ _ro_mounts }};
+          writable caught: {{ _rw_mounts }} (expected 0 and 2).
+        success_msg: "Read-only card mounts pass; writable ones — including rw,errors=remount-ro — are caught."
+        quiet: true
+      vars:
+        _ro_samples:
+          - "/dev/mmcblk0p1 /boot/firmware ro,relatime"
+          - "/dev/mmcblk0p2 / ro,noatime"
+        _rw_samples:
+          - "/dev/mmcblk0p2 /media/rescue rw,relatime"
+          - "/dev/mmcblk0p9 /media/y rw,errors=remount-ro"
+        _ro_mounts: >-
+          {{ _ro_samples | select('search', '^/dev/mmcblk')
+             | reject('search', '[ ,]ro([, ]|$)') | list }}
+        _rw_mounts: >-
+          {{ _rw_samples | select('search', '^/dev/mmcblk')
+             | reject('search', '[ ,]ro([, ]|$)') | list }}

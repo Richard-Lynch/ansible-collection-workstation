@@ -1,0 +1,147 @@
+---
+# ENTRYPOINT: report the BIOS versions ASUS publishes for THIS board.
+#
+# HOW THE DATA IS OBTAINED, established by watching the page's own network traffic in a browser
+# rather than guessing endpoint names:
+#
+#   * The support page is a Nuxt SSR app and makes NO request for BIOS data — it is rendered
+#     server-side into the HTML. Every "find the API" approach fails because there is no API call
+#     to find.
+#   * The `?model2Name=` form of the URL returns the full ~566KB payload with every version and
+#     its SHA-256 embedded; the trailing-slash form returns a ~17KB client-rendered shell. That
+#     single query parameter is the whole difference between no data and all of it.
+#   * ASUS DOES have a real modern API — rog.asus.com/support/webapi/product/GetPDBIOS — which
+#     returns Version, sha256, DownloadUrl and ReleaseDate, and which was confirmed working
+#     against a ROG laptop. It is keyed on LevelTagId, NOT pdid (passing a laptop's LevelTagId
+#     with this board's pdid returns the LAPTOP's firmware), and no LevelTagId exists for TUF
+#     motherboards. So that API serves ROG laptops, not this board.
+#   * www.asus.com/support/api/product.asmx/GetPDBIOS is a LEGACY endpoint the current site no
+#     longer calls; it answers every request with the same hardcoded default product.
+#
+# So: parse the SSR page for the version table (live, authoritative), and keep DOWNLOAD URLs
+# pinned in the role — those are constructed client-side, appear nowhere in the payload, and were
+# verified by HTTP HEAD. Guessing a URL pattern is how you fetch the wrong file.
+#
+# This entrypoint reports the live table AND flags any drift from the pinned one, so a new
+# release announces itself rather than being silently missed.
+
+- name: Apply role defaults
+  ansible.builtin.include_tasks: setup_vars.yml
+
+- name: Fetch the live version table from ASUS
+  # Read-only HTTP GET of a public page. Failure is tolerated here and asserted on below, so a
+  # network problem degrades to "could not check" rather than hiding the pinned data entirely.
+  ansible.builtin.command:
+    argv:
+      - "{{ asus_bios_python }}"
+      - "{{ role_path }}/files/parse_bios_page.py"
+      - "{{ asus_bios_support_url }}?model2Name={{ asus_bios_model2_name }}"
+  register: _asus_live
+  changed_when: false
+  failed_when: false
+  when: asus_bios_check_live | bool
+
+- name: Parse the live result
+  ansible.builtin.set_fact:
+    _live: >-
+      {{ (_asus_live.stdout | from_json)
+         if (_asus_live.rc | default(1)) == 0 and (_asus_live.stdout | default('') | trim) | length > 0
+         else {'ok': false, 'count': 0, 'versions': []} }}
+  when: asus_bios_check_live | bool
+
+- name: Warn if the live check could not run
+  # A failed live check must not read as "no new versions" — that is the silent-success shape
+  # this repo bans. Reported explicitly so the pinned data is known to be unverified this run.
+  ansible.builtin.debug:
+    msg: >-
+      LIVE CHECK FAILED — could not read {{ asus_bios_support_url }}
+      ({{ _live.error | default('no versions parsed') }}).
+      The pinned table below is UNVERIFIED this run; re-check the vendor page by hand before
+      flashing.
+  when:
+    - asus_bios_check_live | bool
+    - not (_live.ok | default(false))
+
+- name: Compare the live table against the pinned one
+  # Drift in either direction matters: a version ASUS published that we do not know about, and a
+  # version we claim that ASUS no longer lists. Checksums are compared too — a changed hash for
+  # the same version number means the pinned value is wrong and must not be trusted.
+  ansible.builtin.set_fact:
+    _live_vers: "{{ _live.versions | map(attribute='version') | list }}"
+    _pinned_vers: "{{ asus_bios_versions | map(attribute='version') | list }}"
+    _hash_drift: >-
+      {{ _live.versions
+         | selectattr('version', 'in', asus_bios_versions | map(attribute='version') | list)
+         | rejectattr('sha256', 'in', asus_bios_versions | map(attribute='sha256') | map('upper') | list)
+         | map(attribute='version') | list }}
+  when:
+    - asus_bios_check_live | bool
+    - _live.ok | default(false)
+
+- name: Report any drift from the pinned table
+  # Built as a LIST that is then joined, rather than a folded scalar with conditional branches:
+  # an empty branch in a folded scalar leaves a blank line, which renders as a literal "\n" in
+  # the middle of the report. Selecting non-empty parts avoids that entirely.
+  ansible.builtin.debug:
+    msg: "{{ _parts | select('string') | select() | join(' ') }}"
+  vars:
+    _new: "{{ _live_vers | difference(_pinned_vers) }}"
+    _gone: "{{ _pinned_vers | difference(_live_vers) }}"
+    _parts:
+      - "LIVE vs PINNED: {{ _live_vers | length }} live, {{ _pinned_vers | length }} pinned."
+      - "{{ ('NEW upstream versions not in the role: ' ~ (_new | join(', '))) if (_new | length > 0) else 'No new upstream versions.' }}"
+      - "{{ ('PINNED versions no longer listed by ASUS: ' ~ (_gone | join(', '))) if (_gone | length > 0) else '' }}"
+      - "{{ ('CHECKSUM MISMATCH: ' ~ (_hash_drift | join(', ')) ~ ' — the pinned hash is WRONG, do not flash these.') if (_hash_drift | length > 0) else '' }}"
+  when:
+    - asus_bios_check_live | bool
+    - _live.ok | default(false)
+
+- name: Assert no pinned checksum contradicts the vendor
+  # The one drift that is a hard failure. A version present in both tables with DIFFERENT hashes
+  # means the role would verify a download against a wrong value — worse than not checking, since
+  # it looks verified.
+  ansible.builtin.assert:
+    that:
+      - _hash_drift | length == 0
+    fail_msg: >-
+      Pinned SHA-256 disagrees with ASUS for version(s) {{ _hash_drift | join(', ') }}.
+      Correct the role's pinned table from {{ asus_bios_support_url }} before downloading —
+      verifying against a wrong hash is worse than not verifying at all.
+    quiet: true
+  when:
+    - asus_bios_check_live | bool
+    - _live.ok | default(false)
+
+- name: Report the known BIOS versions
+  ansible.builtin.debug:
+    msg: "{{ _report.splitlines() }}"
+  vars:
+    _stable: "{{ asus_bios_versions | rejectattr('beta') | list }}"
+    _beta: "{{ asus_bios_versions | selectattr('beta') | list }}"
+    _report: |
+      Board: {{ asus_bios_board }} (ASUS ProductID {{ asus_bios_product_id }})
+      Source page: {{ asus_bios_support_url }}
+
+      {% for v in asus_bios_versions %}
+      {{ v.version }}{{ ' [BETA]' if v.beta else ' [stable]' }}  {{ v.released }}  {{ v.size }}
+          {{ v.notes }}
+          {{ 'CANNOT BE ROLLED BACK once flashed' if v.no_rollback | default(false) else '' }}
+      {% endfor %}
+      Newest stable: {{ (_stable | first).version }} ({{ (_stable | first).released }})
+      Newest beta:   {{ (_beta | first).version }} ({{ (_beta | first).released }})
+
+      RECOMMENDED: {{ asus_bios_recommended }} — see the role README for why.
+      Pinned data last checked: {{ asus_bios_data_checked }}
+
+- name: Warn if the pinned data is stale
+  # A version table nobody revisits is worse than none: it looks authoritative while quietly
+  # aging. This is a report, not a failure — the data being old does not make it wrong, it makes
+  # it worth re-checking before flashing.
+  ansible.builtin.debug:
+    msg: >-
+      NOTE: this pinned version list was last checked on {{ asus_bios_data_checked }}
+      ({{ _age }} days ago). Re-check {{ asus_bios_support_url }} before flashing —
+      ASUS may have published a newer version.
+  vars:
+    _age: "{{ ((now().timestamp() - (asus_bios_data_checked | to_datetime('%Y-%m-%d')).timestamp()) / 86400) | round(0) | int }}"
+  when: _age | int > asus_bios_stale_days | int

@@ -1,0 +1,20 @@
+---
+# AUTO-GENERATED defaults file — DO NOT EDIT.
+#
+# Source of truth: roles/rpi_fleet_report/meta/argument_specs.py
+# Regenerate:      venv/bin/python tools/argspec/cli.py x generate rpi_fleet_report
+#
+# Edits here are silently overwritten on the next generation. To change a value or its
+# documentation, change the OptionSpec in the source file above — descriptions there
+# are emitted as the comments in this file.
+# Entrypoint:      main
+
+# Whether these Pis are expected to be running from their SSDs.
+# Set false for a fleet still mid-migration, so the report describes
+# rather than complains.
+rpi_report_expect_ssd_root__default: true
+
+# Turn drift into a task failure, for CI or a scheduled check.
+# Default false so the report is safe to run ad hoc and always prints the
+# whole picture rather than stopping at the first problem.
+rpi_report_fail_on_drift__default: false

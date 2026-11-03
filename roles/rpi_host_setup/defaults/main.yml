@@ -1,0 +1,61 @@
+---
+# AUTO-GENERATED defaults file — DO NOT EDIT.
+#
+# Source of truth: roles/rpi_host_setup/meta/argument_specs.py
+# Regenerate:      venv/bin/python tools/argspec/cli.py x generate rpi_host_setup
+#
+# Edits here are silently overwritten on the next generation. To change a value or its
+# documentation, change the OptionSpec in the source file above — descriptions there
+# are emitted as the comments in this file.
+# Entrypoint:      main
+
+# Which entrypoint main.yml dispatches to.
+# probe and health_report are read-only; the rest need rpi_host_apply.
+# `all` runs baseline + usb_quirks + cgroups.
+rpi_host_action__default: probe
+
+# Actually make changes. Default false: report the plan and stop.
+rpi_host_apply__default: false
+
+# usb-storage quirk entries, as VID:PID:u — `u` meaning 'ignore UAS'.
+# Several widely sold USB3-SATA bridges (JMicron and ASMedia among them)
+# implement UAS incorrectly on the Pi, producing anything from poor
+# throughput to data corruption under load.
+# EMPTY BY DEFAULT AND DELIBERATELY REACTIVE: blanket-disabling UAS costs
+# real throughput on adapters that are fine. Probe reports each bridge's
+# VID:PID; add an entry here only when a specific adapter misbehaves.
+# Estate config — declared in inventory, never guessed by the role.
+rpi_usb_quirks__default: []
+
+# Enable the kernel memory cgroup controller.
+# WITHOUT IT, `docker run --memory=`, systemd's MemoryMax= and k3s pod
+# limits are all ACCEPTED AND SILENTLY UNENFORCED — the kernel has nowhere
+# to write the limit. Every layer reports success; nothing is limited.
+# Verification must read /proc/cmdline and cgroup.controllers, never
+# cmdline.txt: the firmware injects cgroup_disable=memory, which never
+# appears in that file, so a config-file check cannot fail.
+rpi_cgroup_memory__default: true
+
+# Cap on journald's on-disk size. Bounded because an unbounded journal on
+# a small root filesystem is a slow-motion disk-full outage.
+rpi_journald_max_use__default: 200M
+
+# System timezone. UTC by default — a generic, correct-for-any-caller
+# value; a fleet wanting local time declares it in inventory.
+rpi_timezone__default: Etc/UTC
+
+# Baseline packages every Pi gets. Generic: nothing site-specific, and
+# nothing service-specific — services install their own dependencies.
+rpi_host_packages__default:
+  - ca-certificates
+  - curl
+  - gnupg
+  - python3
+  - smartmontools
+  - unattended-upgrades
+
+# Apply SECURITY updates automatically (never full upgrades).
+# Sensible for a stateless fleet: a rebuild is cheap, an unpatched box is
+# not. Full upgrades stay manual because an unattended kernel change on a
+# USB-booted Pi is exactly the thing that should be observed.
+rpi_unattended_security__default: true

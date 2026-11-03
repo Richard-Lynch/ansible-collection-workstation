@@ -1,0 +1,20 @@
+---
+# Resolve caller-supplied vars over the generated defaults (defaults/main.yml is GENERATED from
+# meta/argument_specs.py by the ansible-devkit argspec generator). Same pattern as usb_media.
+- name: Store vars
+  ansible.builtin.set_fact:
+    asus_bios_action: "{{ asus_bios_action | default(asus_bios_action__default) }}"
+    asus_bios_apply: "{{ asus_bios_apply | default(asus_bios_apply__default) }}"
+    asus_bios_board: "{{ asus_bios_board | default(asus_bios_board__default) }}"
+    asus_bios_product_id: "{{ asus_bios_product_id | default(asus_bios_product_id__default) }}"
+    asus_bios_support_url: "{{ asus_bios_support_url | default(asus_bios_support_url__default) }}"
+    asus_bios_versions: "{{ asus_bios_versions | default(asus_bios_versions__default) }}"
+    asus_bios_recommended: "{{ asus_bios_recommended | default(asus_bios_recommended__default) }}"
+    asus_bios_check_live: "{{ asus_bios_check_live | default(asus_bios_check_live__default) }}"
+    asus_bios_model2_name: "{{ asus_bios_model2_name | default(asus_bios_model2_name__default) }}"
+    asus_bios_python: "{{ asus_bios_python | default(asus_bios_python__default) }}"
+    asus_bios_data_checked: "{{ asus_bios_data_checked | default(asus_bios_data_checked__default) }}"
+    asus_bios_stale_days: "{{ asus_bios_stale_days | default(asus_bios_stale_days__default) }}"
+    asus_bios_version: "{{ asus_bios_version | default(asus_bios_recommended | default(asus_bios_recommended__default)) }}"
+    asus_bios_dest: "{{ asus_bios_dest | default(asus_bios_dest__default) }}"
+    asus_bios_allow_beta: "{{ asus_bios_allow_beta | default(asus_bios_allow_beta__default) }}"

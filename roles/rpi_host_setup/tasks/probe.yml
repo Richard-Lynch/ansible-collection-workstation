@@ -1,0 +1,63 @@
+---
+# READ-ONLY survey of the OS side of a Pi, and the BOARD-IDENTITY check.
+#
+# The identity assertion is the point of this entrypoint. Nothing else in the design ties a
+# hostname to a physical board: two cards seeded with the same hostname in two boards produce
+# distinct MACs and addresses — so the DHCP reservations quietly work — but a colliding name in
+# DNS and monitoring, with nothing to detect it. The SoC serial is the anchor.
+
+- name: Resolve declared options over their generated defaults
+  ansible.builtin.include_tasks: _resolve_defaults.yml
+
+- name: Read this board's SoC serial
+  ansible.builtin.shell:
+    cmd: "set -o pipefail; awk -F': ' '/^Serial/{print $2}' /proc/cpuinfo"
+  args:
+    executable: /bin/bash
+  register: _rpi_serial
+  changed_when: false
+
+- name: HARD GATE — the board must be the one inventory says it is
+  # Catches what the media-side identity checks structurally cannot: a card seeded for one Pi that
+  # ended up in another's board. The reservation still works (the MAC is the board's), so nothing
+  # else on the network would notice.
+  ansible.builtin.assert:
+    that:
+      - (_rpi_serial.stdout | trim) == (rpi_soc_serial | trim)
+    fail_msg: >-
+      BOARD IDENTITY MISMATCH on {{ inventory_hostname }}.
+      This board's SoC serial is '{{ _rpi_serial.stdout | trim }}' but inventory declares
+      '{{ rpi_soc_serial | trim }}'.
+      Either the SD card is in the wrong Pi, or host_vars names the wrong serial. Both are worth
+      resolving before anything writes to this machine — a hostname collision in DNS and
+      monitoring is otherwise invisible.
+    success_msg: "Board identity confirmed ({{ rpi_soc_serial | trim }})."
+    quiet: true
+
+- name: Read the OS release
+  ansible.builtin.command:
+    cmd: cat /etc/os-release
+  register: _rpi_os
+  changed_when: false
+
+- name: Check whether TRIM works on the root filesystem
+  # Usually it does NOT over a USB-SATA bridge: most bridges do not pass through `unmap`, so
+  # fstrim silently no-ops (or errors) for the SSD's entire life unless a udev rule sets
+  # provisioning_mode. Not urgent — but it is invisible for two years and then looks like the SSD
+  # wearing out early, so it is reported rather than left unknown.
+  ansible.builtin.command:
+    cmd: fstrim --dry-run /
+  register: _rpi_trim
+  changed_when: false
+  failed_when: false
+  become: true
+
+- name: Report the OS baseline state
+  ansible.builtin.debug:
+    msg:
+      - "host:      {{ inventory_hostname }}"
+      - "serial:    {{ _rpi_serial.stdout | trim }}  (matches inventory)"
+      - "os:        {{ (_rpi_os.stdout_lines | select('search', '^PRETTY_NAME=') | first | default('?')) | regex_replace('^PRETTY_NAME=\"?([^\"]*)\"?$', '\\1') }}"
+      - "kernel:    {{ ansible_kernel | default('unknown') }}"
+      - "arch:      {{ ansible_architecture | default('unknown') }}"
+      - "TRIM on /: {{ 'works' if _rpi_trim.rc == 0 else 'NOT supported (typical over USB-SATA; fstrim will no-op for this disk)' }}"

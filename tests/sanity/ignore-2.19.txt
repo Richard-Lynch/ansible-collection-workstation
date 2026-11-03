@@ -1,0 +1,14 @@
+roles/asus_tuf_b850m_bios/files/parse_bios_page.py shebang
+roles/config_fan_control/files/fand-discover shebang
+roles/config_fan_control/files/fand-loadtest.py shebang
+roles/config_fan_control/files/fand.py shebang
+roles/config_fan_control/files/test_fand.py shebang
+roles/rpi_boot_media/files/rpi_boot_order.py shebang
+roles/rpi_boot_media/files/rpi_boot_probe.py shebang
+roles/rpi_boot_media/files/test_rpi_boot_order.py shebang
+roles/rpi_host_setup/files/rpi_cmdline.py shebang
+roles/usb_media/files/usb_capacity_check.py shebang
+roles/usb_media/files/usb_link_speed.py shebang
+roles/usb_media/files/usb_list_targets.py shebang
+roles/usb_media/files/usb_random_io.py shebang
+roles/usb_media/files/usb_retention.py shebang

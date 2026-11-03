@@ -1,0 +1,114 @@
+---
+# ENTRYPOINT: prove the device stores what is written to it — the counterfeit/failing-flash test.
+#
+# DESTRUCTIVE: requires usb_media_apply=true. There is no non-destructive version of this test;
+# proving storage means storing something.
+#
+# WHAT IT CATCHES, and what it does not. Fake sticks report a large capacity over a small real
+# part and handle writes past the real end either by DISCARDING them or by WRAPPING them onto low
+# addresses. The check writes offset-stamped blocks and requires each to read back its own stamp.
+#
+#   * SPARSE (default) reliably catches the DISCARD mode — the common one — at any size ratio,
+#     and catches WRAP only when the real size is near the claimed size.
+#   * FULL (usb_media_full=true) writes and verifies the ENTIRE capacity. This is the only mode
+#     that PROVES the size, because proving capacity requires writing more distinct data than the
+#     device can hold. It takes two full passes — an hour or more for a 64GB stick.
+#
+# The verdict names which mode ran, so a sparse PASS never reads as more than it tested. See
+# files/usb_capacity_check.py for the full reasoning and the simulation results behind it.
+
+- name: Apply role defaults
+  ansible.builtin.include_tasks: setup_vars.yml
+
+- name: Resolve and vet the target device
+  ansible.builtin.include_tasks: resolve_device.yml
+
+- name: Require the apply flag for a destructive test
+  ansible.builtin.assert:
+    that:
+      - usb_media_apply | bool
+    fail_msg: >-
+      The integrity check writes to {{ usb_media_device }} and destroys its contents.
+      Re-run with usb_media_apply=true if that is what you want.
+    quiet: true
+
+- name: Unmount the device before writing
+  ansible.builtin.command:
+    cmd: "{{ usb_media_diskutil }} unmountDisk {{ usb_media_device }}"
+  changed_when: true
+  become: "{{ usb_media_become | bool }}"
+
+- name: Run the capacity and integrity check
+  # Async + poll: a full-mode run on a large stick takes well over an hour, and Ansible buffers a
+  # task's output until it ends, so a synchronous call would sit silent for the duration with no
+  # way to tell progress from a hang.
+  ansible.builtin.command:
+    cmd: >-
+      {{ usb_media_python }} {{ role_path }}/files/usb_capacity_check.py
+      {{ _usb_raw }} {{ _usb_dev.TotalSize | int }} {{ usb_media_samples | int }}
+      {{ '--full' if (usb_media_full | bool) else '' }}
+  register: _usb_integrity_async
+  changed_when: true
+  become: "{{ usb_media_become | bool }}"
+  async: "{{ usb_media_integrity_timeout | int }}"
+  poll: 0
+
+- name: Wait for the integrity check to finish
+  ansible.builtin.async_status:
+    jid: "{{ _usb_integrity_async.ansible_job_id }}"
+  register: _usb_integrity
+  until: _usb_integrity.finished
+  # Each unfinished poll otherwise prints "FAILED - RETRYING", and a 17-minute full verify emits
+  # hundreds of them — lines that read like failures while the job is working perfectly. The
+  # `until:` is still a real wait, and the assert after it is still what catches a genuine
+  # timeout; this only silences the per-poll noise.
+  changed_when: false
+  retries: "{{ ((usb_media_integrity_timeout | int) / (usb_media_poll_interval | int)) | round(0, 'ceil') | int }}"
+  delay: "{{ usb_media_poll_interval | int }}"
+  become: "{{ usb_media_become | bool }}"
+
+- name: Assert the check actually ran to completion
+  # The explicit re-check the `until:` loop requires: a loop that exhausts its retries does not
+  # fail the play by itself, so without this a timed-out run would fall through to a parse of
+  # empty output and report something misleading.
+  ansible.builtin.assert:
+    that:
+      - _usb_integrity.finished | default(false) | bool
+      - (_usb_integrity.rc | default(1) | int) == 0
+    fail_msg: >-
+      The integrity check did not complete.
+      finished={{ _usb_integrity.finished | default(false) }}
+      rc={{ _usb_integrity.rc | default('unknown') }}
+      stderr={{ _usb_integrity.stderr | default('') | truncate(300) }}
+      In full mode raise usb_media_integrity_timeout (currently
+      {{ usb_media_integrity_timeout }}s) — a 64GB stick needs well over an hour.
+    quiet: true
+
+- name: Report the integrity result
+  ansible.builtin.debug:
+    msg: "{{ (_usb_integrity.stdout | from_json).report }}"
+
+- name: Deliver the verdict, then leave the device usable either way
+  # block/always, not a plain sequence: the assert aborts the play on a failing device, and a
+  # device that FAILED is precisely the one you most want handed back usable rather than left as
+  # raw unpartitioned media. `always` runs the cleanup on both paths.
+  block:
+    - name: Assert the device stored every block faithfully
+      ansible.builtin.assert:
+        that:
+          - (_usb_integrity.stdout | from_json).ok | bool
+        fail_msg: >-
+          INTEGRITY FAILURE on {{ usb_media_device }} — it did not return the bytes written to it.
+          Do NOT use this stick for install media: it will accept an image "successfully" and
+          produce corruption at an offset nobody can predict.
+        quiet: true
+
+  always:
+    - name: Leave the device usable again
+      # The full-capacity pass necessarily destroys the partition table — that is inherent to
+      # proving every block stores what was written. Reformatting is how the run FINISHES; skip
+      # it with usb_media_reformat=false only to inspect the raw patterns.
+      ansible.builtin.include_tasks: reformat.yml
+      when:
+        - usb_media_apply | bool
+        - usb_media_reformat | bool

@@ -1,0 +1,38 @@
+---
+# Resolve caller-supplied vars over the generated defaults. Every resolution here must be
+# idempotent: a role included twice in one play must not see its own earlier result.
+#
+# REQUIRED options are referenced BARE, with no `| default(...)`: the generator emits no
+# `__default` for them, so a default() argument would name a variable that does not exist.
+- name: Store vars
+  ansible.builtin.set_fact:
+    fand_apply: "{{ fand_apply | default(fand_apply__default) }}"
+    fand_enabled: "{{ fand_enabled | default(fand_enabled__default) }}"
+    fand_sensors: "{{ fand_sensors }}"
+    fand_groups: "{{ fand_groups }}"
+    fand_chip: "{{ fand_chip }}"
+    fand_extra_metrics: "{{ fand_extra_metrics | default(fand_extra_metrics__default) }}"
+    fand_pump_headers: "{{ fand_pump_headers | default(fand_pump_headers__default) }}"
+    fand_interval: "{{ fand_interval | default(fand_interval__default) }}"
+    fand_rise_rate: "{{ fand_rise_rate | default(fand_rise_rate__default) }}"
+    fand_fall_rate: "{{ fand_fall_rate | default(fand_fall_rate__default) }}"
+    fand_deadband_pwm: "{{ fand_deadband_pwm | default(fand_deadband_pwm__default) }}"
+    fand_sensor_fail_tolerance: "{{ fand_sensor_fail_tolerance | default(fand_sensor_fail_tolerance__default) }}"
+    fand_failsafe_floor_pwm: "{{ fand_failsafe_floor_pwm | default(fand_failsafe_floor_pwm__default) }}"
+    fand_watchdog_sec: "{{ fand_watchdog_sec | default(fand_watchdog_sec__default) }}"
+    fand_path: "{{ fand_path | default(fand_path__default) }}"
+    fand_config_path: "{{ fand_config_path | default(fand_config_path__default) }}"
+    fand_metrics_path: "{{ fand_metrics_path | default(fand_metrics_path__default) }}"
+    fand_loadtest: "{{ fand_loadtest | default(fand_loadtest__default) }}"
+    fand_loadtest_name: "{{ fand_loadtest_name | default(fand_loadtest_name__default) }}"
+    fand_loadtest_apply: "{{ fand_loadtest_apply | default(fand_loadtest_apply__default) }}"
+    fand_loadtest_duration: "{{ fand_loadtest_duration | default(fand_loadtest_duration__default) }}"
+    fand_loadtest_interval: "{{ fand_loadtest_interval | default(fand_loadtest_interval__default) }}"
+    fand_loadtest_path: "{{ fand_loadtest_path | default(fand_loadtest_path__default) }}"
+    fand_loadtest_config: "{{ fand_loadtest_config | default(fand_loadtest_config__default) }}"
+    fand_loadtest_results: "{{ fand_loadtest_results | default(fand_loadtest_results__default) }}"
+    fand_discover_path: "{{ fand_discover_path | default(fand_discover_path__default) }}"
+    fand_discover_save: "{{ fand_discover_save | default(fand_discover_save__default) }}"
+    fand_discover_modules: "{{ fand_discover_modules | default(fand_discover_modules__default) }}"
+    fand_python: "{{ fand_python | default(fand_python__default) }}"
+    fand_unit: "{{ fand_unit | default(fand_unit__default) }}"
