@@ -1,0 +1,150 @@
+---
+# DISPATCHER. Selects an entrypoint by `bazzite_action` for callers who prefer that to
+# tasks_from.
+#
+#   probe     survey what the machine already has                (read-only)
+#   status    is an update running, and is it progressing?           (read-only)
+#   controllers  why Steam does not list a working gamepad          (read-only)
+#   sensors   temps/clocks/power, with thresholds — run under load   (read-only)
+#   fan_report  WHY the fans are at this speed: pwm mode per header    (read-only)
+#   fan_sweep   hold each declared header at every duty: stall + noise  (writes, temporary)
+#   fan_hold    hold ONE header at ONE duty, report, stop: conversational (writes, temporary)
+#   fan_curve   reprogram the chip's OWN fan curves from inventory        (writes, persistent-ish)
+#   lighting  report RGB devices; set a colour with bazzite_apply    (read-only by default)
+#   lighting_identify  which fans are on which ARGB header           (writes, temporary)
+#   display_report  CEC feasibility and connected outputs            (read-only)
+#   sunshine  game-streaming host: report, then enable with apply    (read-only by default)
+#   autologin log in at boot so Steam/Sunshine come up unattended    (writes)
+#   wol       arm the NIC for Wake-on-LAN, persistently              (writes)
+#   sudoers   passwordless sudo — run ONCE with --ask-become-pass    (writes)
+#   image     converge the variant, then update the base image     (needs reboot)
+#   rebase    converge the image VARIANT declared in inventory      (needs reboot + confirm)
+#   deck_daemons  mask the Deck-hardware units on desktop hardware  (writes)
+#   steamos   steamos-manager state; converge HDMI-CEC                (read-only by default)
+#   firmware_report  firmware versions and available updates          (read-only, never applies)
+#   reboot    reboot and VERIFY the staged image actually booted    (reboots!)
+#   power_off shut down to a full power-off (S5), to test WoL     (powers OFF! needs confirm)
+#   hostname  set the static hostname (installer leaves it EMPTY)   (writes)
+#   network   pin the WiFi MAC so a DHCP reservation holds            (writes)
+#   power     display blanking / lock / suspend timeouts             (writes dotfiles)
+#   power_report  did it sleep, and is the power config in effect?   (read-only)
+#   game_session  which output / how many xwayland servers Game Mode uses (writes dotfiles)
+#   session_report  why is Game Mode blank while the overlay draws?   (read-only)
+#   controller_probe  which PHYSICAL button sends which code?      (read-only, interactive)
+#   sleep_inhibit  mask the sleep targets so it CANNOT suspend        (writes, root)
+#   flatpaks  install the declared flatpak set                   (writes)
+#   gaming    MangoHud/GameMode user config                      (writes dotfiles)
+#   layer     rpm-ostree layered packages — last resort          (writes, needs reboot)
+#   all       flatpaks + gaming (NOT layer — that is opt-in)
+#
+# RUN `probe` FIRST on a new machine. Bazzite ships much of what a naive setup play would
+# install, and the survey is what turns this role from guesswork into a targeted change.
+
+- name: Assert a known action was requested
+  ansible.builtin.assert:
+    that:
+      - bazzite_action in _actions
+    fail_msg: >-
+      Unknown bazzite_action '{{ bazzite_action | default('(unset)') }}'.
+      Choose one of: {{ _actions | join(', ') }}.
+    quiet: true
+  vars:
+    _actions:
+      - probe
+      - status
+      - sensors
+      - fan_report
+      - fan_sweep
+      - fan_hold
+      - fan_curve
+      - controllers
+      - controller_probe
+      - lighting
+      - lighting_identify
+      - display_report
+      - session_report
+      - sunshine
+      - autologin
+      - wol
+      - sudoers
+      - dhcp_renew
+      - image
+      - rebase
+      - reboot
+      - power_off
+      - hostname
+      - network
+      - power
+      - power_report
+      - game_session
+      - sleep_inhibit
+      - deck_daemons
+      - steam_guard
+      - steamos
+      - firmware_report
+      - flatpaks
+      - gaming
+      - layer
+      - all
+
+- name: Run the requested action
+  ansible.builtin.include_tasks: "{{ bazzite_action }}.yml"
+  when: bazzite_action != 'all'
+
+- name: Run the full setup
+  # `layer` is deliberately EXCLUDED from `all`: it needs a reboot and carries a permanent cost
+  # on future image updates, so it should never happen as a side effect of "set the machine up".
+  #
+  # `rebase` IS included, but only as the CHECK. It is a cheap `rpm-ostree status` read and an
+  # exact refspec comparison — no pull, no write — and it FAILS on unconfirmed drift. That matters
+  # because the only routine things that touch this machine are uupd.timer, which never looks at
+  # the variant, and this action. Without the check here, a declared variant would be enforced
+  # only when somebody remembered to run `image`, which is the residue of the maintenance-play
+  # problem the declaration exists to remove. Staging still requires bazzite_rebase_confirm, so
+  # `all` can never swap the OS as a side effect.
+  #
+  # `sleep_inhibit` IS included, and is safe there because it is declarative in both directions:
+  # it converges to whatever bazzite_sleep_inhibit says, defaulting to false (unmasked, normal
+  # behaviour). On a host that has not opted in, it is a no-op that reports "already converged".
+  # It belongs in `all` because it is the ONLY entrypoint that governs suspend on the Game Mode
+  # image — leaving it out would mean a from-scratch rebuild silently regains the
+  # sleep behaviour that made it unreachable.
+  #
+  # `autologin` joins the list ONLY when the machine declares Game Mode. It is excluded by default
+  # for a desktop, where autologin is a real security trade that belongs behind an explicit
+  # action — but a machine whose inventory says `bazzite_login_mode: game` is a couch box whose
+  # whole purpose is booting unattended into a session, so a from-scratch build that skipped it
+  # would land at a greeter with nothing streaming.
+  #
+  # `| default(...)` on the login mode because THIS file resolves no defaults — the entrypoints
+  # do, via setup_vars.yml. Reached through include_role the argspec has already supplied it; on a
+  # tasks_from: path it has not, and a bare reference would fail the whole dispatcher over an
+  # optional knob.
+  ansible.builtin.include_tasks: "{{ item }}.yml"
+  loop: >-
+    {{ ['rebase', 'hostname', 'network', 'power', 'sleep_inhibit', 'flatpaks', 'gaming']
+       + (['autologin'] if (bazzite_login_mode | default('desktop')) == 'game' else []) }}
+  when: bazzite_action == 'all'
+
+- name: Stop after staging — the rest of `all` belongs on the image it will run on
+  # With both flags set, `all` MAY converge the variant: it stages, then stops here. The remaining
+  # steps run on the post-reboot re-run, against the deck image rather than the outgoing one —
+  # which is more correct anyway, since flatpak and gaming config should be validated on the image
+  # that will actually run it.
+  #
+  # end_host (not end_play) so a multi-host run continues for the others; this is the dispatcher's
+  # own last step, so nothing later in the role is skipped by it.
+  ansible.builtin.debug:
+    msg: >-
+      A {{ bazzite_image_variant }} deployment is staged. Reboot into it
+      (bazzite_action=reboot bazzite_apply=true), then re-run `all` to finish configuring the
+      machine on the new image.
+  when: &staged_after_all
+    - bazzite_action == 'all'
+    - bazzite_apply | bool
+    - bazzite_rebase_confirm | bool
+    - _bz_rebase_needed | default(false) | bool
+
+- name: End the run for this host
+  ansible.builtin.meta: end_host
+  when: *staged_after_all

@@ -1,0 +1,18 @@
+# {{ ansible_managed }}
+#
+# Game Mode HDR, read by gamescope-session-plus from ~/.config/environment.d/*.conf.
+#
+# WHY BOTH KEYS. The session script gates the HDR branch on ENABLE_GAMESCOPE_HDR and
+# ENABLE_GAMESCOPE_WSI BOTH being 1:
+#
+#     if [ "$ENABLE_GAMESCOPE_HDR" == "1" ] && [ "$ENABLE_GAMESCOPE_WSI" == "1" ] && ...
+#             HDR_OPTIONS="--hdr-enabled --hdr-itm-enable"
+#
+# WSI defaults to 1 in the script's own preamble, but that file lives under /usr and is replaced
+# by image updates, so it is written here too rather than depended on.
+#
+# --hdr-itm-enable is inverse tone mapping, added by the same branch: it is what makes SDR
+# content look correct on an HDR output instead of dull.
+# Written only when bazzite_sunshine_hdr is true; with HDR off the file is removed (image default).
+ENABLE_GAMESCOPE_HDR=1
+ENABLE_GAMESCOPE_WSI=1

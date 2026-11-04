@@ -1,0 +1,148 @@
+---
+# ENTRYPOINT: force this machine to re-acquire its DHCP leases, so a NEW reservation takes effect
+# now instead of at the next T1.
+#
+# WHY THIS EXISTS HERE. A DHCP reservation only changes a host's address when that host next asks.
+# Until then it keeps the lease it already holds, so the network is in a split state — the
+# reservation is live, the machine is not on it — and the reservation LOOKS like it did not work.
+# With a typical T1 of an hour, waiting means up to an hour of ambiguity.
+#
+# A Bazzite workstation is BARE METAL — there is no hypervisor to exec the renewal through — so it
+# has to happen on the machine itself, which means it belongs to the role that owns the machine.
+#
+# BOTH INTERFACES, because a dual-homed desktop has one on each of two VLANs (wired and WiFi) and
+# each has its own reservation. Renewing only the one Ansible happens to be
+# connected over would leave the other on a stale address.
+#
+# SAFE OVER SSH. `nmcli connection up` re-runs DHCP on an interface that is already up; it does not
+# take the link down first. The connection Ansible is riding does drop briefly, so each interface is
+# renewed in its own task with a reconnect wait after — see the async note below.
+#
+#   PREVIEW: bazzite_action=dhcp_renew
+#   APPLY:   bazzite_action=dhcp_renew bazzite_apply=true
+
+- name: Apply role defaults
+  ansible.builtin.include_tasks: setup_vars.yml
+
+- name: Read the current addressing on every managed interface
+  # nmcli rather than ansible_facts: this reports the ACTIVE CONNECTION PROFILE alongside the
+  # address, which is what `connection up` acts on. Facts give the interface, not the profile, and
+  # the two are not interchangeable when a device has several profiles.
+  ansible.builtin.command:
+    cmd: "nmcli -t -f NAME,DEVICE,TYPE,STATE connection show --active"
+  register: _bz_dr_active
+  changed_when: false
+
+- name: Select the ethernet and wifi profiles
+  # Derived from the live device list, never hardcoded: interface names are
+  # predictable-but-not-guessable (e.g. wlp3s0) and change with hardware.
+  ansible.builtin.set_fact:
+    _bz_dr_profiles: >-
+      {{ _bz_dr_active.stdout_lines
+         | select('search', ':(802-3-ethernet|802-11-wireless|ethernet|wifi):')
+         | map('split', ':') | list }}
+
+- name: Read each interface's current address
+  ansible.builtin.command:
+    cmd: "ip -4 -o addr show dev {{ item.1 }}"
+  register: _bz_dr_before
+  changed_when: false
+  failed_when: false
+  loop: "{{ _bz_dr_profiles }}"
+  loop_control:
+    label: "{{ item.1 }}"
+
+- name: Report the plan
+  ansible.builtin.debug:
+    msg:
+      - "{{ 'APPLY' if (bazzite_apply | bool) else 'PREVIEW (set bazzite_apply=true to act)' }}"
+      - >-
+        Would renew: {{ _bz_dr_profiles | map(attribute=1) | list }}
+        (profiles: {{ _bz_dr_profiles | map(attribute=0) | list }})
+      - >-
+        Current: {{ _bz_dr_before.results
+                    | map(attribute='stdout')
+                    | map('regex_search', 'inet ([0-9.]+)', '\1')
+                    | map('default', ['?'], true) | map('first') | list }}
+      - >-
+        A renewal is only needed after a reservation CHANGES. The DHCP server hands out the reserved address
+        on the next request; without this the machine keeps its current lease until T1 (up to an
+        hour), during which the reservation is live but the machine is not on it.
+
+- name: Renew each interface
+  # ASYNC + POLL 0, deliberately. `nmcli connection up` drops and re-establishes the link, which
+  # kills the SSH connection Ansible is riding on if it is that interface — the task would hang
+  # until the SSH timeout and report a failure for an action that actually succeeded.
+  #
+  # Fire-and-forget, then wait for the host to come back and verify from the OUTSIDE. The
+  # verification is what proves it worked; the task's own return value is deliberately not trusted.
+  #
+  # `become: true` is REQUIRED, and not only because nmcli needs root to activate a profile.
+  # Without it the module runs through the login shell, and a shell prompt that emits terminal
+  # query sequences (`ESC]10;?`, `ESC[6n`) that are prepended to the module's stdout. With
+  # `pipelining = True` in ansible.cfg the result is parsed straight from that stream, so the JSON
+  # is preceded by escape bytes and deserialization fails with "No start of json char found" — for
+  # a job that started perfectly well. Tasks that already become are unaffected.
+  ansible.builtin.command:
+    cmd: "nmcli connection up {{ item.0 }}"
+  become: true
+  loop: "{{ _bz_dr_profiles }}"
+  loop_control:
+    label: "{{ item.0 }} ({{ item.1 }})"
+  async: 30
+  poll: 0
+  changed_when: true
+  when: bazzite_apply | bool
+
+- name: Wait for the machine to come back
+  # The renewal drops the link briefly. Without this the next task runs against a dead connection
+  # and fails for a reason that has nothing to do with DHCP.
+  ansible.builtin.wait_for_connection:
+    delay: 5
+    timeout: 120
+  when: bazzite_apply | bool
+
+- name: Read the addressing back
+  # The read-back is the actual test. A `nmcli connection up` that returns 0 says the profile was
+  # activated, not that DHCP handed over the address the reservation names.
+  ansible.builtin.command:
+    cmd: "ip -4 -o addr show dev {{ item.1 }}"
+  register: _bz_dr_after
+  changed_when: false
+  failed_when: false
+  loop: "{{ _bz_dr_profiles }}"
+  loop_control:
+    label: "{{ item.1 }}"
+  when: bazzite_apply | bool
+
+- name: Report the result
+  ansible.builtin.debug:
+    msg: >-
+      {{ item.item.1 }}:
+      {{ item.stdout | regex_search('inet ([0-9.]+)', '\1') | first | default('NO ADDRESS') }}
+      {{ '(unchanged)'
+         if (item.stdout | regex_search('inet ([0-9.]+)', '\1') | first | default(''))
+            == ((_bz_dr_before.results | selectattr('item.1', 'eq', item.item.1) | first).stdout
+                | regex_search('inet ([0-9.]+)', '\1') | first | default(''))
+         else '(CHANGED — the reservation took effect)' }}
+  loop: "{{ _bz_dr_after.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.1 }}"
+  when: bazzite_apply | bool
+
+- name: HARD GATE — every interface must hold an address after the renewal
+  # The failure that matters: a renewal that leaves an interface with NO address is worse than not
+  # renewing at all, and on a machine reached over that interface it is how you lose the box.
+  ansible.builtin.assert:
+    that:
+      - _bz_dr_after.results | default([]) | map(attribute='stdout') | select('search', 'inet ') | list | length == (_bz_dr_profiles | length)
+    fail_msg: >-
+      After renewing, at least one interface has NO IPv4 address:
+      {{ _bz_dr_after.results | default([])
+         | rejectattr('stdout', 'search', 'inet ')
+         | map(attribute='item.1') | list }}.
+      Check `nmcli device status` on the machine.
+    success_msg: >-
+      All {{ _bz_dr_profiles | length }} interface(s) hold an address after the renewal.
+    quiet: true
+  when: bazzite_apply | bool

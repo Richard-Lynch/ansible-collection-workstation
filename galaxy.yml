@@ -4,12 +4,12 @@
 ---
 namespace: richard_lynch
 name: workstation
-version: 1.0.0
+version: 1.1.0
 readme: README.md
 authors:
   - Richard Lynch
 description: >-
-  Workstation and device roles: per-component fan control, Raspberry Pi boot media, image seeding, host setup and fleet reports, bootable USB media, and BIOS flashing media for one ASUS board.
+  Workstation and device roles: post-install setup and live-state reports for a Bazzite gaming workstation, per-component fan control, Raspberry Pi boot media, image seeding, host setup and fleet reports, bootable USB media, and BIOS flashing media for one ASUS board.
 license:
   - GPL-3.0-or-later
 tags:
@@ -17,6 +17,7 @@ tags:
   - raspberrypi
   - linux
   - desktop
+  - gaming
 dependencies:
   ansible.utils: ">=5.0.0"
   community.general: ">=10.0.0"
@@ -27,6 +28,7 @@ homepage: https://github.com/Richard-Lynch/ansible-collection-workstation
 issues: https://github.com/Richard-Lynch/ansible-collection-workstation/issues
 build_ignore:
   - .ansible-lint
+  - ci
   - configured_roles.txt
   - roles/*/defaults/SKIP
   - .github

@@ -1,0 +1,31 @@
+# {{ ansible_managed }}
+# Reprogram the Super-I/O's own fan curves at boot.
+#
+# WHY THIS IS NEEDED. The auto_point registers are VOLATILE: a reboot restores the factory
+# curve, which on some boards pins the case fans at full speed from 30C upward. `fand` normally
+# drives the fans and would mask that — but these curves are its FALLBACK, and a fallback that
+# silently reverts to "loud" after every reboot is not a fallback anyone can rely on.
+#
+# ORDERING: this must land BEFORE fand takes the headers, or fand's own writes would be
+# overwritten by a later curve program. Hence Before=fand.service.
+[Unit]
+Description=Program the Super-I/O fan curves (fand's fallback)
+Before={{ bazzite_fan_curve_unit_before }}
+# After the module load AND after sysinit: run earlier and the Super-I/O chip may not exist yet.
+After=systemd-modules-load.service sysinit.target
+Requires=systemd-modules-load.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# The script WAITS for the chip rather than failing on a race: modules-load.service completing
+# means modprobe returned, not that the hwmon device has finished registering in sysfs. Those
+# are different moments, and the gap is a race.
+ExecStart={{ bazzite_fan_curve_script }}
+# One retry covers a slow enumeration without masking a real failure: a chip that is genuinely
+# absent still fails after the script's own wait expires.
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

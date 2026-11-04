@@ -1,0 +1,149 @@
+---
+# ENTRYPOINT: grant this user passwordless sudo, so the box can be managed headlessly.
+#
+# WHY THIS IS ITS OWN STEP, AND RUN ONCE. Every other entrypoint that touches system state needs
+# root. Without passwordless sudo each run needs --ask-become-pass, which rules out unattended
+# runs and makes the box awkward to manage from the controller. This is the bootstrap that gets
+# out of that: run it once WITH --ask-become-pass, and every later run is self-sufficient.
+#
+# THE TRADE-OFF, stated plainly rather than buried. Passwordless sudo means anyone with this
+# user's session can become root without a prompt. For a home desktop behind your own network it is a
+# reasonable trade for headless management. It is NOT appropriate for a laptop
+# that leaves the house or a shared machine.
+#
+# VALIDATED BEFORE INSTALL. A malformed sudoers file can lock root out entirely, and the failure
+# is discovered at the worst possible moment. `visudo -cf` checks the syntax of the candidate file
+# and the copy is refused if it does not parse — the standard guard for a sudoers drop-in.
+#
+#   # once, interactively:
+#   ansible-playbook bazzite.yml -e bazzite_action=sudoers -e bazzite_apply=true --ask-become-pass
+
+- name: Apply role defaults
+  ansible.builtin.include_tasks: setup_vars.yml
+
+- name: HARD GATE — the sudo user is declared
+  ansible.builtin.assert:
+    that:
+      - bazzite_sudo_user is defined
+      - bazzite_sudo_user | string | length > 0
+    fail_msg: >-
+      bazzite_sudo_user is not set. Whose sudo this grants is inventory config; declare it in the
+      host's inventory entry.
+    quiet: true
+
+- name: HARD GATE — the 1Password item for the sudo password is declared
+  ansible.builtin.assert:
+    that:
+      - bazzite_sudo_secret_item is defined
+      - bazzite_sudo_secret_item | length > 0
+      - bazzite_sudo_secret_vault is defined
+      - bazzite_sudo_secret_vault | length > 0
+    fail_msg: >-
+      bazzite_sudo_from_1password is true but bazzite_sudo_secret_item / bazzite_sudo_secret_vault
+      are not both set. Declare them in inventory, or set bazzite_sudo_from_1password: false.
+    quiet: true
+  when:
+    - bazzite_apply | bool
+    - bazzite_sudo_from_1password | bool
+
+- name: Resolve the become password from 1Password
+  # THE BOOTSTRAP PROBLEM THIS SOLVES. Enabling passwordless sudo itself needs sudo, so the very
+  # first run has to authenticate somehow. --ask-become-pass works but forces a human at a prompt,
+  # which defeats headless management and cannot be scripted.
+  #
+  # Reading it from 1Password instead keeps the secret out of the repo, off disk, and out of the
+  # shell history — and a service-account token means no interactive approval prompt.
+  # onepassword_cached, never a bare `op` call: the cache makes every later run free and silent
+  # (under desktop auth each bare op call is a separate prompt).
+  #
+  # Set as a CONNECTION VARIABLE for this play only. It is never written anywhere, and after this
+  # entrypoint has run once nothing needs it again.
+  ansible.builtin.set_fact:
+    ansible_become_password: >-
+      {{ lookup('richard_lynch.common.onepassword_cached', bazzite_sudo_secret_item,
+                field='password', vault=bazzite_sudo_secret_vault) }}
+  no_log: true
+  when:
+    - bazzite_apply | bool
+    - bazzite_sudo_from_1password | bool
+
+- name: Check whether passwordless sudo already works
+  # `sudo -n` fails rather than prompting when a password is required, so this distinguishes
+  # "already configured" from "needs setting up" without ever hanging on a prompt.
+  ansible.builtin.command:
+    cmd: sudo -n true
+  register: _bz_nopasswd
+  changed_when: false
+  failed_when: false
+  become: false
+
+- name: Report the current state
+  ansible.builtin.debug:
+    msg: >-
+      passwordless sudo for {{ ansible_user_id | default(ansible_user) }}:
+      {{ 'ALREADY CONFIGURED — nothing to do' if _bz_nopasswd.rc == 0
+         else 'not configured. This run needs --ask-become-pass; later runs will not.' }}
+
+- name: Install the sudoers rule
+  # A file in /etc/sudoers.d rather than editing /etc/sudoers: it is the supported drop-in
+  # mechanism, survives package updates, and is trivially removable to revert.
+  #
+  # /etc IS writable on Bazzite (only /usr is read-only) and rpm-ostree three-way merges it across
+  # image updates, so this persists — no layering needed.
+  ansible.builtin.copy:
+    content: |
+      # Managed by roles/bazzite_workstation — passwordless sudo for Ansible management.
+      # Remove this file to revert; see tasks/sudoers.yml for the reasoning and trade-off.
+      {{ bazzite_sudo_user }} ALL=(ALL) NOPASSWD: ALL
+    dest: "/etc/sudoers.d/{{ bazzite_sudoers_file }}"
+    mode: "0440"
+    owner: root
+    group: root
+    # THE IMPORTANT LINE. visudo parses the candidate file and the copy is aborted if it is
+    # malformed, so a typo cannot leave the system unable to escalate at all.
+    validate: "visudo -cf %s"
+  become: true
+  when: bazzite_apply | bool
+
+- name: Report what would change
+  ansible.builtin.debug:
+    msg: >-
+      WOULD grant passwordless sudo to '{{ bazzite_sudo_user }}' via
+      /etc/sudoers.d/{{ bazzite_sudoers_file }}. Re-run with bazzite_apply=true and
+      --ask-become-pass.
+  when:
+    - not (bazzite_apply | bool)
+    - _bz_nopasswd.rc != 0
+
+- name: Verify passwordless sudo now works
+  # A real read-back, not a trust of the copy's changed status: the file can be written correctly
+  # and still not take effect (wrong username, an earlier rule overriding it, a mismatched host
+  # alias). Only actually running `sudo -n` proves it.
+  ansible.builtin.command:
+    cmd: sudo -n true
+  register: _bz_nopasswd_after
+  changed_when: false
+  failed_when: false
+  become: false
+  when: bazzite_apply | bool
+
+- name: Assert passwordless sudo is in effect
+  ansible.builtin.assert:
+    that:
+      - _bz_nopasswd_after.rc == 0
+    fail_msg: >-
+      /etc/sudoers.d/{{ bazzite_sudoers_file }} was written but `sudo -n true` still fails
+      (rc={{ _bz_nopasswd_after.rc }}). Check the username is right
+      ('{{ bazzite_sudo_user }}') and that no later rule in /etc/sudoers.d overrides it.
+      Later runs will still need --ask-become-pass.
+    quiet: true
+  when: bazzite_apply | bool
+
+- name: Confirm
+  ansible.builtin.debug:
+    msg: >-
+      Passwordless sudo confirmed for '{{ bazzite_sudo_user }}'. Subsequent runs of this role
+      need no --ask-become-pass.
+  when:
+    - bazzite_apply | bool
+    - _bz_nopasswd_after.rc == 0

@@ -1,0 +1,117 @@
+---
+# ENTRYPOINT: hold each declared fan header at a series of duty cycles so a human can rate the
+# noise, and record the RPM each duty actually produces.
+#
+# WHY THIS EXISTS. Two of the numbers the fan policy needs cannot be measured by any sensor:
+#
+#   * the STALL POINT -- the duty below which a fan stops and will not restart without a kick.
+#     A board that declares no `pwm*_min_output` and no `fan*_min` leaves nothing in sysfs that knows it.
+#     "25% is basically silent" is a reasonable instinct and an untested one: 25% on a
+#     pump-rated header is not silent, and on a low-speed chassis fan it may be below stall.
+#   * the NOISE each duty makes, which has no sensor at all. It needs ears.
+#
+# Both are per-header -- one header can sit at 28% duty for 600 RPM while another runs 3000 RPM -- so a
+# single answer for "the fans" would be wrong for most of them.
+#
+# DRIVEN BY A DECLARED LIST, NOT A HEADER ARGUMENT. `bazzite_fan_sweep_headers` is a list of
+# {header, note, steps?} in inventory, and this loops over it. Which headers exist, what is
+# plugged into each, and which are worth sweeping are facts about THE board, not the role,
+# so they belong in a reviewable file rather than retyped per run -- and the note travels with
+# the result, so a recorded sweep says what it was of.
+#
+# THIS TAKES EACH HEADER TO MANUAL MODE, so for the duration the hardware curve is NOT
+# protecting it. Everything about the shape of this entrypoint follows from that:
+#
+#   * the sweep runs as ONE process (files/fan_sweep.py) with the restore in a `finally` plus
+#     SIGINT/SIGTERM handlers, rather than as a loop of Ansible tasks. Ansible cannot guarantee
+#     a restore between two tasks -- a failed task, a dropped connection or a Ctrl-C leaves the
+#     header pinned with nothing to put it back.
+#   * the per-header body is INCLUDED per iteration (fan_sweep_one.yml) so its block/always is
+#     scoped to ONE header. A single block around the whole loop would run its `always` once,
+#     against whichever header was current, leaving the others stranded in manual mode.
+#   * the restore is confirmed by READ-BACK, not by exit code. A restore that silently failed
+#     leaves a fan under no thermal control with a transcript claiming success.
+#   * a header declared in `bazzite_fan_sweep_pump_headers` is REFUSED outright: the sweep
+#     searches downward for a stall point, which on a pump risks cavitation and loss of coolant
+#     flow.
+#
+# GATED. Sweeping is a write, so it needs `bazzite_fan_sweep_apply=true`; without it this
+# reports what it would do, per header, and stops.
+#
+#   bazzite_action=fan_sweep                               (report)
+#   bazzite_action=fan_sweep bazzite_fan_sweep_apply=true  (sweep)
+#
+# RATING NEEDS A TTY, which an Ansible run does not have. So this entrypoint MEASURES
+# (unattended, records rpm per duty) and prints the exact command to re-run by hand on the box
+# for the listening pass. Pretending to prompt through Ansible would hang forever on a headless
+# run.
+
+- name: Apply role defaults
+  ansible.builtin.include_tasks: setup_vars.yml
+
+- name: HARD GATE — the Super-I/O chip is declared
+  ansible.builtin.assert:
+    that:
+      - bazzite_fan_sweep_chip is defined
+      - bazzite_fan_sweep_chip | string | length > 0
+    fail_msg: >-
+      bazzite_fan_sweep_chip is not set. Which hwmon chip carries the fan headers is a fact about
+      the board; declare it (e.g. nct6799) in the host's inventory entry.
+    quiet: true
+
+- name: Refuse to run with no headers declared
+  # An empty list would loop zero times and report a clean run -- a green result proving
+  # nothing, which is exactly the shape of a check that cannot fail. The role ships no default
+  # list on purpose (it cannot know what is plugged into a board), so an empty one means the
+  # inventory has not declared them yet, not that there is nothing to do.
+  ansible.builtin.assert:
+    that:
+      - "(bazzite_fan_sweep_headers | default([]) | length) > 0"
+    fail_msg: >-
+      No headers declared to sweep. Set bazzite_fan_sweep_headers in inventory as a list of
+      {header, note} entries -- run bazzite_action=fan_report to see which headers exist and
+      which are empty.
+    quiet: true
+
+- name: Try to load the motherboard sensor module
+  # Without nct6775 the pwm channels do not exist and the sweep would report "no such header"
+  # when the truth is "the module is not loaded".
+  ansible.builtin.command:
+    argv: [modprobe, "{{ item }}"]
+  become: true
+  register: _bz_sweep_modprobe
+  changed_when: _bz_sweep_modprobe.rc == 0
+  failed_when: false
+  loop: "{{ bazzite_sensor_modules }}"
+  when: bazzite_sensors_load_modules | bool
+
+- name: Install the sweep helper
+  ansible.builtin.copy:
+    src: fan_sweep.py
+    dest: "{{ bazzite_fan_sweep_path }}"
+    mode: "0755"
+  become: true
+
+- name: Sweep each declared header
+  # include_tasks, not a looped block: a block cannot be looped in Ansible, and the per-header
+  # restore has to be scoped to one header (see fan_sweep_one.yml).
+  ansible.builtin.include_tasks: fan_sweep_one.yml
+  loop: "{{ bazzite_fan_sweep_headers }}"
+  loop_control:
+    loop_var: _sweep
+    label: "header {{ _sweep.header }} — {{ _sweep.note | default('') }}"
+
+- name: How to do the listening pass
+  # Ansible has no TTY, so the rating prompts cannot run from here. Printing the exact command
+  # is honest about that rather than pretending to offer an interactive mode that would hang.
+  ansible.builtin.debug:
+    msg: >-
+      {{ ['Measured RPM per duty is in ' ~ bazzite_fan_sweep_results | regex_replace('\.json$', '') ~ '-hdr<N>.json on the box.',
+          'For the NOISE rating, run this on the machine itself (it needs a terminal):']
+         + (bazzite_fan_sweep_headers
+            | map(attribute='header')
+            | map('regex_replace', '^(.*)$',
+                  '  sudo ' ~ bazzite_python ~ ' ' ~ bazzite_fan_sweep_path ~ ' --header=\1 --rate')
+            | list)
+         + ['Rate 1 (silent) to 5 (loud) at each step; it restores automatic control on exit.'] }}
+  when: bazzite_fan_sweep_apply | bool

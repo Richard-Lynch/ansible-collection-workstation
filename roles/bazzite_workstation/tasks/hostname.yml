@@ -1,0 +1,96 @@
+---
+# ENTRYPOINT: set the machine's static hostname.
+#
+# WHY THIS IS NOT COSMETIC. The Bazzite installer leaves the STATIC hostname empty. With nothing
+# set, the box sends no hostname in its DHCP request, so the DHCP server invents one from the address and
+# DDNS-registers it — a name like `dhcp-192-0-2-39.example.com`, derived from a lease that will change. The machine then adopts that as its transient
+# hostname, so it is effectively named after its own IP.
+#
+# Setting it properly breaks the circle: the box identifies itself, DDNS registers the real name,
+# and a DHCP reservation can then key off something stable.
+#
+# Idempotent and cheap. Reports the change rather than making it silently, because a hostname
+# change is the kind of thing someone later wonders about.
+
+- name: Apply role defaults
+  ansible.builtin.include_tasks: setup_vars.yml
+
+- name: HARD GATE — the hostname is declared
+  ansible.builtin.assert:
+    that:
+      - bazzite_hostname is defined
+      - bazzite_hostname | string | length > 0
+    fail_msg: >-
+      bazzite_hostname is not set. Which name a machine carries is inventory config; declare it
+      in the host's inventory entry.
+    quiet: true
+
+- name: Read the current hostnames
+  # STATIC and TRANSIENT are different things and the distinction matters here: transient is
+  # whatever DHCP/DDNS most recently imposed, static is what the machine actually claims for
+  # itself. An empty static with a populated transient is exactly the symptom described above.
+  ansible.builtin.command:
+    cmd: "hostnamectl --{{ item }}"
+  register: _bz_hostnames
+  changed_when: false
+  loop: [static, transient]
+  loop_control:
+    label: "{{ item }}"
+
+- name: Report the current state
+  ansible.builtin.debug:
+    msg: >-
+      static='{{ (_bz_hostnames.results[0].stdout | default('')) | trim | default('(unset)', true) }}'
+      transient='{{ (_bz_hostnames.results[1].stdout | default('')) | trim }}'
+      wanted='{{ bazzite_hostname }}'
+
+- name: Set the static hostname
+  # hostnamectl rather than writing /etc/hostname: it updates the running system AND the
+  # persistent config in one step, and works the same on an immutable OS where /etc is writable
+  # but the base image is not.
+  ansible.builtin.command:
+    argv: [hostnamectl, set-hostname, "{{ bazzite_hostname }}"]
+  become: true
+  changed_when: true
+  when:
+    - bazzite_apply | bool
+    - (_bz_hostnames.results[0].stdout | default('') | trim) != bazzite_hostname
+
+- name: Report what would change
+  ansible.builtin.debug:
+    msg: >-
+      WOULD set the static hostname to '{{ bazzite_hostname }}'
+      (currently '{{ (_bz_hostnames.results[0].stdout | default('')) | trim | default('(unset)', true) }}').
+      Re-run with bazzite_apply=true.
+  when:
+    - not (bazzite_apply | bool)
+    - (_bz_hostnames.results[0].stdout | default('') | trim) != bazzite_hostname
+
+- name: Confirm the hostname took
+  # A read-back, not a trust of the command's exit code — hostnamectl can accept a name that
+  # systemd then normalises (case, invalid characters), so the value that landed is worth
+  # checking against the value asked for.
+  ansible.builtin.command:
+    cmd: hostnamectl --static
+  register: _bz_hostname_after
+  changed_when: false
+  when: bazzite_apply | bool
+
+- name: Assert the static hostname is now set
+  ansible.builtin.assert:
+    that:
+      - (_bz_hostname_after.stdout | trim) == bazzite_hostname
+    fail_msg: >-
+      Hostname is '{{ _bz_hostname_after.stdout | trim }}' after setting it to
+      '{{ bazzite_hostname }}' — systemd may have rejected or normalised the name.
+    quiet: true
+  when: bazzite_apply | bool
+
+- name: Note the DHCP follow-up
+  # The hostname alone does not give a stable ADDRESS. Said here because the two are easy to
+  # conflate, and the reservation is the half that actually makes the box easy to reach.
+  ansible.builtin.debug:
+    msg: >-
+      Hostname set. For a stable address, add a DHCP reservation for this host's MAC so it stops
+      moving between leases — the hostname fixes what it is CALLED, not where it IS.
+  when: bazzite_apply | bool

@@ -1,0 +1,196 @@
+---
+# ENTRYPOINT: own the Game Mode (gamescope) session's own configuration.
+#
+# WHAT THIS IS FOR, and why it is not part of `sunshine`. Which output Game Mode drives and how
+# many xwayland servers it runs are properties of the SESSION. Left unowned, a desktop runs the
+# image's stock Steam Deck defaults — `--prefer-output *,eDP-1` (a laptop panel a desktop does not
+# have) and `--xwayland-count 2`.
+#
+# THE SECOND XWAYLAND SERVER CAN CAUSE A RECURRING BLACK SCREEN: a Remote Play client connects,
+# gamescope switches to presenting server #1, and on disconnect never switches back — holding
+# input devices that no longer exist. Audio
+# fine, overlay drawing, no image, and Remote Play launches silently going nowhere. Nothing
+# crashed, so nothing recovered; only a restart cleared it. Full evidence in the template.
+#
+# WHY A CONFIG CHANGE RATHER THAN A WATCHDOG. A unit that noticed the wrong server was presented
+# and restarted the session would be a repair loop in front of a fault we can simply not have —
+# and it would fire on the legitimate case too, because "presenting server #1" is exactly what a
+# working nested Remote Play session looks like. Removing the server removes the ambiguity.
+#
+# THE SESSION MUST BE RESTARTED for any of this to take effect: gamescope reads these at startup,
+# so a running session keeps the values it was launched with. This entrypoint does NOT restart it
+# — that would kill whatever is on screen as a side effect of a config converge. It reports the
+# difference instead, and restarting the session unit is the caller's deliberate act.
+
+- name: Apply role defaults
+  ansible.builtin.include_tasks: setup_vars.yml
+
+- name: Work out which values differ from the IMAGE'S defaults
+  # DO LESS. The env file exists only to change something, so it carries only
+  # the keys that differ from gamescope-session-plus's own `:=` defaults — and when none do, the
+  # file is REMOVED rather than restating the image. An override that restates or
+  # fights the image costs something: one xwayland server breaks every game launch.
+  ansible.builtin.set_fact:
+    _bz_gs_overrides: >-
+      {{ {}
+         | combine({'OUTPUT_CONNECTOR': bazzite_gamescope_output}
+                   if bazzite_gamescope_output != _bz_gs_image_defaults.OUTPUT_CONNECTOR else {})
+         | combine({'XWAYLAND_COUNT': bazzite_gamescope_xwayland_count | int}
+                   if (bazzite_gamescope_xwayland_count | int) != _bz_gs_image_defaults.XWAYLAND_COUNT else {}) }}
+  vars:
+    # /usr/share/gamescope-session-plus/gamescope-session-plus:
+    #   : "${OUTPUT_CONNECTOR:=*,eDP-1}"   : "${XWAYLAND_COUNT:=2}"
+    _bz_gs_image_defaults: {OUTPUT_CONNECTOR: "*,eDP-1", XWAYLAND_COUNT: 2}
+
+- name: Assert the declared output is a real connector on this machine
+  # Which output a machine drives is inventory config, and a wrong value here is
+  # worse than no value — gamescope would claim a connector that does not exist and present to
+  # nothing, which is the very fault this entrypoint exists to remove.
+  #
+  # Read from the kernel's own drm state, not from a config file or a previous report.
+  block:
+    - name: Read the connected outputs
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: |
+          set -o pipefail
+          for c in /sys/class/drm/card*-*/status; do
+            [ -r "$c" ] || continue
+            printf '%s=%s\n' "$(basename "$(dirname "$c")")" "$(cat "$c")"
+          done
+      register: _bz_gs_outputs
+      changed_when: false
+
+    - name: Assert the declared connector is connected
+      # Matched against the CONNECTOR NAME as gamescope names it (HDMI-A-1), which is the drm
+      # directory minus its `cardN-` prefix. A wildcard is accepted as-is: it is the image
+      # default and means "first available", so there is nothing to verify.
+      ansible.builtin.assert:
+        that:
+          - bazzite_gamescope_output == '*,eDP-1'
+            or bazzite_gamescope_output in _bz_gs_connected
+            or (bazzite_gamescope_output | regex_replace('^\*,', '')) in _bz_gs_connected
+        fail_msg: >-
+          bazzite_gamescope_output is '{{ bazzite_gamescope_output }}', which is not a CONNECTED
+          output on this machine. Connected: {{ _bz_gs_connected | join(', ') | default('(none)', true) }}.
+          Game Mode would claim a connector that does not exist and present to nothing.
+        success_msg: >-
+          {{ bazzite_gamescope_output }} is connected.
+        quiet: true
+      vars:
+        _bz_gs_connected: >-
+          {{ _bz_gs_outputs.stdout_lines | select('search', '=connected$')
+             | map('regex_replace', '=connected$', '')
+             | map('regex_replace', '^card\d+-', '') | list }}
+
+- name: Read what the RUNNING session was actually launched with
+  # THE AUTHORITATIVE SOURCE for "what is in effect" is the live process's argv, never the config
+  # file. Those differ for the whole life of a session after a change — so a fix can look applied
+  # for days while the old flags are still running.
+  #
+  # `tr` the NULs so the argv is one readable line.
+  # `pgrep -x <a> <b>` takes only ONE pattern — the second word becomes a PID argument and the
+  # whole call fails, which under `set -o pipefail` returns EMPTY against a live gamescope
+  # (comm `gamescope-wl`). The drift check below would then report "no gamescope running" on a
+  # healthy session and, worse, NO DRIFT by the same path: a guard that cannot see the thing it
+  # compares against. So the real comm name is matched, one pattern per call.
+  #
+  # Matched on the real executable path instead, which catches the process whatever its comm is.
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      # `pgrep -f` matches THIS SHELL too, since the pattern appears in its own command line.
+      # Excluded by PID rather than by inspecting /proc/<pid>/exe: that symlink is only readable
+      # for one's own processes, so filtering on it dropped the REAL gamescope as well and the
+      # report said "none found" against a live session. (The three-outcome guard below is what
+      # made that visible instead of it reading as "no drift" — which is why it is three.)
+      #
+      # $$ is this shell; the loop also skips anything whose argv contains the pattern string
+      # itself, which is how a matching wrapper would otherwise appear.
+      for p in $(pgrep -f '/usr/bin/gamescope ' || true); do
+        [ "$p" = "$$" ] && continue
+        [ -r "/proc/$p/cmdline" ] || continue
+        _argv="$(tr '\0' ' ' < "/proc/$p/cmdline")"
+        case "$_argv" in
+          *pgrep*|*"/bin/bash -c"*) continue ;;
+        esac
+        printf 'pid=%s %s\n' "$p" "$_argv"
+      done
+  register: _bz_gs_running
+  changed_when: false
+
+- name: Report the plan and the drift
+  ansible.builtin.debug:
+    msg:
+      - >-
+        {{ ('Writing' if (bazzite_apply | bool) else 'WOULD write') ~ ' the Game Mode session environment: '
+           ~ (_bz_gs_overrides.items() | map('join', '=') | join(' '))
+           if (_bz_gs_overrides | length > 0)
+           else (('Removing' if (bazzite_apply | bool) else 'WOULD remove')
+                 ~ ' the Game Mode session environment file: every value is the image default.') }}
+        {{ '' if (bazzite_apply | bool) else 'Re-run with bazzite_apply=true.' }}
+      - "RUNNING argv: {{ _bz_gs_running.stdout_lines | default([]) | default(['(none found)'], true) }}"
+      # THREE OUTCOMES, NOT TWO. "no session found" must not read as "matches" — that is the
+      # silent-guard shape this check already fell into once (see the task above), where an
+      # unparseable read and a converged session were indistinguishable. Stated separately so a
+      # broken read can never present as a clean one.
+      - >-
+        {{ 'CANNOT TELL: no running gamescope found, so there is nothing to compare the declared
+            values against. If Game Mode is up, this read is broken — fix it before trusting
+            this report.'
+           if (_bz_gs_running.stdout | trim | length == 0)
+           else ('THE RUNNING SESSION ALREADY MATCHES: --xwayland-count '
+                 ~ bazzite_gamescope_xwayland_count ~ ' is in effect.'
+                 if (_bz_gs_running.stdout is search('--xwayland-count ' ~ (bazzite_gamescope_xwayland_count | string) ~ '(\s|$)'))
+                 else 'DRIFT: the running session was launched with different values and KEEPS
+                       THEM until it is restarted — gamescope reads these only at startup.
+                       Restart the Game Mode session (bazzite_steam_guard_session_unit)
+                       when the machine is free (it kills whatever is running).') }}
+
+- name: Write the session environment
+  when: bazzite_apply | bool
+  block:
+    - name: Ensure the session environment directory exists
+      # Shared with the HDR file written by the `sunshine` entrypoint; both are *.conf in this
+      # directory and are sourced together, so neither owns the directory exclusively.
+      ansible.builtin.file:
+        path: "{{ ansible_env.HOME }}/.config/environment.d"
+        state: directory
+        mode: "0755"
+
+    - name: Set the Game Mode session environment
+      # 40- so it sorts BEFORE 50-iaac-hdr.conf. They set disjoint keys today, so order does not
+      # matter; the prefix is there so that if it ever does, the ordering is declared rather than
+      # alphabetical by accident.
+      ansible.builtin.template:
+        src: gamescope-session.conf.j2
+        dest: "{{ ansible_env.HOME }}/.config/environment.d/40-iaac-gamescope-session.conf"
+        mode: "0644"
+      register: _bz_gs_written
+      when: _bz_gs_overrides | length > 0
+
+    - name: Remove the session environment when nothing differs from the image
+      ansible.builtin.file:
+        path: "{{ ansible_env.HOME }}/.config/environment.d/40-iaac-gamescope-session.conf"
+        state: absent
+      register: _bz_gs_removed
+      when: _bz_gs_overrides | length == 0
+
+    - name: Report what landed, and what it will take to apply
+      ansible.builtin.debug:
+        msg:
+          - >-
+            {{ ('Removed' if (_bz_gs_removed is changed) else 'Already absent')
+               if (_bz_gs_overrides | length == 0)
+               else ('Wrote' if (_bz_gs_written is changed) else 'Already current') }}:
+            ~/.config/environment.d/40-iaac-gamescope-session.conf
+          - >-
+            THIS DOES NOT AFFECT THE RUNNING SESSION. gamescope reads these at startup, so the
+            fix applies at the next session start — a reboot, or a
+            deliberate restart of the session unit. Until then the black-screen fault can still
+            recur, because the second xwayland server is still there.
+          - >-
+            Verify after restarting by re-running this entrypoint: it compares the declared
+            values against the RUNNING argv, which is the only thing that proves the session
+            picked them up.

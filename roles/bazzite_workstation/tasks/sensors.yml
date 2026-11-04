@@ -1,0 +1,276 @@
+---
+# ENTRYPOINT: temperatures, clocks and power draw — read while the machine is under load.
+#
+# WHY THIS IS ITS OWN ENTRYPOINT. "Are the temps OK?" is asked exactly when the box is busy, which
+# is the worst time to be hand-running commands over SSH. It is also the only time the answer
+# means anything: idle temperatures tell you nothing about whether cooling is adequate.
+#
+# WHAT THE NUMBERS MEAN, because raw figures without thresholds are not an answer:
+#
+#   Ryzen X3D — X3D parts run HOT BY DESIGN. The stacked cache sits above the cores and impedes
+#             heat transfer, so 80-90C under sustained load is normal, not a fault. AMD's
+#             throttle point (Tjmax) is 95C. Chasing lower numbers with an aggressive fan curve
+#             buys noise, not longevity.
+#   Radeon RDNA — edge temp under 90C is fine. The number that actually matters on RDNA is the
+#             JUNCTION (hotspot) temperature: up to ~110C is within spec, and a large edge-to-
+#             junction gap (>25C) points at mounting pressure or paste, not airflow.
+#
+# So this reports the thresholds ALONGSIDE the readings, and says plainly whether anything is
+# actually out of range rather than leaving a wall of numbers to interpret.
+#
+# Writes nothing. Safe at any time, including mid-game — that is the point.
+
+- name: Apply role defaults
+  ansible.builtin.include_tasks: setup_vars.yml
+
+- name: Try to load the motherboard sensor module
+  # WHY THIS IS NEEDED. ASUS boards expose CPU/chassis fan headers and board temperatures through
+  # a Super-I/O chip that the kernel reads via `nct6775` (or `asus-ec-sensors` on newer boards).
+  # Neither is autoloaded, because probing Super-I/O blindly can conflict with ACPI. Without it
+  # the ONLY fan visible is the GPU's — on ASUS boards the `asus_wmi` hwmon exposes no
+  # fan or temperature channels at all, so CPU fan, chassis fans and any AIO pump on a board
+  # header are all invisible.
+  #
+  # Loading it is safe and reversible (`modprobe -r`), but it is NOT guaranteed to work: on a
+  # recent chipset the chip may be unsupported, in which case the module loads and simply registers
+  # nothing. That is why the read-back below checks for actual channels rather than trusting the
+  # load to mean success.
+  ansible.builtin.command:
+    argv: [modprobe, "{{ item }}"]
+  become: true
+  register: _bz_modprobe
+  changed_when: _bz_modprobe.rc == 0
+  failed_when: false
+  loop: "{{ bazzite_sensor_modules }}"
+  when: bazzite_sensors_load_modules | bool
+
+- name: Report which sensor modules loaded
+  ansible.builtin.debug:
+    msg: >-
+      {{ _bz_modprobe.results | default([])
+         | map(attribute='item') | zip(_bz_modprobe.results | default([]) | map(attribute='rc'))
+         | map('join', '=rc') | list }}
+      (rc0 = loaded or already present; anything else = unsupported on this board, which is a
+      normal outcome rather than a fault)
+  when: bazzite_sensors_load_modules | bool
+
+- name: Read the hardware sensors
+  # `sensors -j` for machine-readable output. Falls back gracefully: a box without lm_sensors
+  # configured still has the kernel's hwmon tree, and reporting nothing would be worse than
+  # reporting less.
+  ansible.builtin.command:
+    cmd: sensors -j
+  register: _bz_sensors
+  changed_when: false
+  failed_when: false
+
+- name: Read the GPU state
+  # amdgpu exposes far more through its sysfs/hwmon nodes than `sensors` surfaces — junction and
+  # memory temperature, power draw, clocks and utilisation. Junction is the one that matters on
+  # RDNA and it is NOT the temperature most tools show by default.
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      # PICK THE DISCRETE CARD, not simply the first one. A Ryzen 9000 CPU has an integrated Radeon, so
+      # /sys/class/drm/card* contains BOTH, and `head -1` can pick the iGPU — which reports
+      # junction 0C, 0W, 0% busy and 0.5GB VRAM. That reads as a suspiciously cold GPU rather
+      # than as the wrong device, which is the dangerous kind of wrong for a temperature check.
+      #
+      # The discrete card is identified by having real VRAM: the iGPU reports a token amount
+      # (~0.5GB of shared memory), a dGPU reports its actual framebuffer. Largest wins.
+      best=""; bestvram=0
+      for d in /sys/class/drm/card*/device; do
+        [ -r "$d/mem_info_vram_total" ] || continue
+        v=$(cat "$d/mem_info_vram_total" 2>/dev/null || echo 0)
+        if [ "$v" -gt "$bestvram" ]; then bestvram="$v"; best="$d"; fi
+      done
+      [ -z "$best" ] && { echo "no amdgpu device with VRAM"; exit 0; }
+      card=$(ls -d "$best"/hwmon/hwmon* 2>/dev/null | head -1)
+      [ -z "$card" ] && { echo "no amdgpu hwmon"; exit 0; }
+      printf 'device=%s\n' "$(basename "$(dirname "$best")")"
+      for f in temp1_input temp2_input temp3_input power1_average power1_cap fan1_input; do
+        [ -r "$card/$f" ] && printf '%s=%s\n' "$f" "$(cat "$card/$f")"
+      done
+      for f in temp1_label temp2_label temp3_label; do
+        [ -r "$card/$f" ] && printf '%s=%s\n' "$f" "$(cat "$card/$f")"
+      done
+      dev="$best"
+      [ -r "$dev/gpu_busy_percent" ] && printf 'busy=%s\n' "$(cat "$dev/gpu_busy_percent")"
+      [ -r "$dev/mem_info_vram_used" ] && printf 'vram_used=%s\n' "$(cat "$dev/mem_info_vram_used")"
+      [ -r "$dev/mem_info_vram_total" ] && printf 'vram_total=%s\n' "$(cat "$dev/mem_info_vram_total")"
+  register: _bz_gpu
+  changed_when: false
+
+- name: Read CPU load and clocks
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      printf 'loadavg=%s\n' "$(cut -d' ' -f1-3 /proc/loadavg)"
+      printf 'maxfreq_mhz=%s\n' "$(awk '/cpu MHz/{if($4>m)m=$4}END{printf "%.0f", m}' /proc/cpuinfo)"
+      printf 'governor=%s\n' "$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo '?')"
+  register: _bz_cpu
+  changed_when: false
+
+- name: Read storage, memory and fan sensors
+  # FOUR THINGS A CPU/GPU-ONLY REPORT MISSES, each of which can be the actual problem when a machine
+  # misbehaves and the CPU/GPU temperatures look fine:
+  #
+  #   NVMe      — drives throttle HARD when hot (often from ~80-85C) and the
+  #               symptom is stutter during loading, not a crash. Nothing else reports it.
+  #   DDR5 DIMM — DDR5 modules carry their own temperature sensors (spd5118). EXPO raises voltage
+  #               and heat, and marginal memory thermals show up as instability that looks like a
+  #               failing CPU or a bad overclock.
+  #   GPU fan   — RPM distinguishes "cool because the load is light" from "cool because the fans
+  #               are screaming", which the temperature alone cannot.
+  #   CPU power — the package draw the cooler is actually being asked to remove.
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      # NVMe: hottest composite across all drives, plus its own critical threshold.
+      for h in /sys/class/hwmon/hwmon*; do
+        n=$(cat "$h/name" 2>/dev/null)
+        case "$n" in
+          nvme)
+            [ -r "$h/temp1_input" ] && printf 'nvme_c=%s\n' "$(cat "$h/temp1_input")"
+            [ -r "$h/temp1_crit" ]  && printf 'nvme_crit=%s\n' "$(cat "$h/temp1_crit")"
+            ;;
+          spd5118)
+            # One sensor per DIMM; report the hottest.
+            [ -r "$h/temp1_input" ] && printf 'dimm=%s\n' "$(cat "$h/temp1_input")"
+            ;;
+        esac
+      done
+      # Motherboard fans and board temperatures, via the Super-I/O chip nct6775 exposes. The
+      # ASUS BIOS labels these (CPU_FAN, AIO_PUMP, CHA_FAN1-3) but the kernel does not know those
+      # names — it reports fan1..fan7 in header order. So they are reported RAW with their
+      # numbers, and the mapping is left to whoever knows what is plugged in. Guessing which
+      # index is the pump would be worse than useless: a wrong "pump OK" is exactly the reading
+      # someone would rely on.
+      #
+      # A 0 RPM channel is an EMPTY HEADER, not a stopped fan — the chip reports every header
+      # whether or not anything is connected.
+      for h in /sys/class/hwmon/hwmon*; do
+        n=$(cat "$h/name" 2>/dev/null)
+        case "$n" in
+          nct6*|it87*)
+            for f in "$h"/fan*_input; do
+              [ -r "$f" ] || continue
+              idx=$(basename "$f" | sed "s/fan//;s/_input//")
+              printf 'mb_fan%s=%s\n' "$idx" "$(cat "$f")"
+            done
+            for t in temp1_input temp2_input; do
+              [ -r "$h/$t" ] && printf 'mb_%s=%s\n' "$t" "$(cat "$h/$t")"
+            done
+            ;;
+        esac
+      done
+
+      # GPU fan, from the same discrete card the block above selected.
+      best=""; bestvram=0
+      for d in /sys/class/drm/card*/device; do
+        [ -r "$d/mem_info_vram_total" ] || continue
+        v=$(cat "$d/mem_info_vram_total" 2>/dev/null || echo 0)
+        if [ "$v" -gt "$bestvram" ]; then bestvram="$v"; best="$d"; fi
+      done
+      if [ -n "$best" ]; then
+        hw=$(ls -d "$best"/hwmon/hwmon* 2>/dev/null | head -1)
+        [ -r "$hw/fan1_input" ] && printf 'gpu_fan=%s\n' "$(cat "$hw/fan1_input")"
+        [ -r "$hw/freq1_input" ] && printf 'gpu_clk=%s\n' "$(cat "$hw/freq1_input")"
+      fi
+  register: _bz_extra
+  changed_when: false
+
+- name: Parse the readings
+  ansible.builtin.set_fact:
+    _g: >-
+      {{ dict(_bz_gpu.stdout_lines | default([]) | select('search', '=')
+              | map('split', '=') | map('list')) }}
+    _c: >-
+      {{ dict(_bz_cpu.stdout_lines | default([]) | select('search', '=')
+              | map('split', '=') | map('list')) }}
+    _x: >-
+      {{ dict(_bz_extra.stdout_lines | default([]) | select('search', '=')
+              | map('split', '=') | map('list')) }}
+    _s: >-
+      {{ (_bz_sensors.stdout | from_json)
+         if (_bz_sensors.rc | default(1)) == 0 and (_bz_sensors.stdout | default('') | trim) | length > 0
+         else {} }}
+
+- name: Report
+  ansible.builtin.debug:
+    msg: "{{ _report.splitlines() | select('string') | list }}"
+  vars:
+    # hwmon reports millidegrees and microwatts.
+    _gpu_edge: "{{ ((_g.temp1_input | default(0) | int) / 1000) | round(1) }}"
+    _gpu_junc: "{{ ((_g.temp2_input | default(0) | int) / 1000) | round(1) }}"
+    _gpu_mem: "{{ ((_g.temp3_input | default(0) | int) / 1000) | round(1) }}"
+    _gpu_pwr: "{{ ((_g.power1_average | default(0) | int) / 1000000) | round(1) }}"
+    _gpu_cap: "{{ ((_g.power1_cap | default(0) | int) / 1000000) | round(1) }}"
+    # Tctl is the CPU control temperature AMD throttles on.
+    _g_fan: "{{ _x.gpu_fan | default('?') }}"
+    _gap: "{{ ((_gpu_junc | float) - (_gpu_edge | float)) }}"
+    _mb_sys: "{{ ((_x.mb_temp1_input | default(0) | int) / 1000) | round(1) }}"
+    _mb_cpu: "{{ ((_x.mb_temp2_input | default(0) | int) / 1000) | round(1) }}"
+    _mb_fans: >-
+      {{ _x | dict2items | selectattr('key', 'search', '^mb_fan')
+         | map(attribute='key') | zip(_x | dict2items | selectattr('key', 'search', '^mb_fan')
+         | map(attribute='value'))
+         | map('join', '=') | map('regex_replace', '^mb_fan', 'fan') | list }}
+    _nvme: "{{ ((_x.nvme_c | default(0) | int) / 1000) | round(1) }}"
+    _nvme_crit: "{{ ((_x.nvme_crit | default(85000) | int) / 1000) | round(0) }}"
+    _dimm: "{{ ((_x.dimm | default(0) | int) / 1000) | round(1) }}"
+    # The k10temp key carries a per-machine bus address (k10temp-pci-00c3 on most AM5 boards), so
+    # it is selected by chip prefix. No reading is reported as "cannot tell", never as 0C.
+    _k10: >-
+      {{ _s | dict2items | selectattr('key', 'match', 'k10temp-') | map(attribute='value') | first | default({}) }}
+    _cpu_raw: "{{ (_k10['Tctl'] | default({}))['temp1_input'] | default('') }}"
+    _cpu_temp: "{{ (_cpu_raw | float | round(1)) if (_cpu_raw | string | length > 0) else '?' }}"
+    _report: |
+      ===== CPU =====
+      temperature : {{ _cpu_temp }}C   {{ '(throttles at 95C)' }}
+      load        : {{ _c.loadavg | default('?') }}
+      peak clock  : {{ _c.maxfreq_mhz | default('?') }} MHz
+      governor    : {{ _c.governor | default('?') }}
+      {{ 'STATUS: cannot tell — no k10temp reading (not an AMD CPU, or the module is absent).'
+         if _cpu_temp == '?'
+         else 'STATUS: fine — X3D parts run hot by design; 80-90C under load is normal.'
+         if (_cpu_temp | float) < 90
+         else ('STATUS: warm but within spec — throttling begins at 95C.'
+               if (_cpu_temp | float) < 95
+               else 'STATUS: AT OR OVER 95C — thermal throttling. Check the cooler mount and case airflow.') }}
+
+      ===== GPU (discrete) =====
+      edge        : {{ _gpu_edge }}C   {{ '(fine below 90C)' }}
+      junction    : {{ _gpu_junc }}C   {{ '(the one that matters — spec allows ~110C)' }}
+      memory      : {{ _gpu_mem }}C
+      power       : {{ _gpu_pwr }}W of {{ _gpu_cap }}W cap
+      utilisation : {{ _g.busy | default('?') }}%
+      vram        : {{ ((_g.vram_used | default(0) | int) / 1073741824) | round(1) }} /
+                    {{ ((_g.vram_total | default(0) | int) / 1073741824) | round(1) }} GB
+      {{ 'STATUS: fine.' if (_gpu_junc | float) < 100
+         else ('STATUS: hot but in spec — junction is rated to ~110C.'
+               if (_gpu_junc | float) < 110
+               else 'STATUS: AT SPEC LIMIT — the card is throttling. Check case airflow.') }}
+      fan         : {{ _g_fan }} RPM
+      {{ ('NOTE: edge-to-junction gap is ' ~ (_gap | float) | round(1) ~ 'C. Common at full load on RDNA;'
+          ~ ' only worth investigating if junction approaches 110C.')
+         if (_gap | float) > 35 else '' }}
+
+      ===== MOTHERBOARD ({{ bazzite_fan_sweep_chip | default('Super-I/O', true) }}) =====
+      board temps : SYSTIN {{ _mb_sys }}C   CPUTIN {{ _mb_cpu }}C
+      fan headers : {{ _mb_fans | join('  ') }}
+      (raw header order — the BIOS names these CPU_FAN / AIO_PUMP / CHA_FAN*, the kernel does
+       not. 0 RPM means an EMPTY header, not a stopped fan.)
+
+      ===== STORAGE / MEMORY =====
+      nvme        : {{ _nvme }}C   (throttles near {{ _nvme_crit }}C)
+      {{ 'STATUS: fine.' if (_nvme | float) < 70
+         else 'STATUS: HOT — NVMe throttling causes loading stutter, not crashes. Check airflow
+               over the drive or its heatsink.' }}
+      dimm        : {{ _dimm }}C   (DDR5 sensor; EXPO raises voltage and heat)
+      {{ 'STATUS: fine.' if (_dimm | float) < 55
+         else 'STATUS: WARM — marginal DDR5 thermals present as instability that looks like a
+               CPU or overclock fault. Worth watching if EXPO is enabled.' }}

@@ -1,0 +1,162 @@
+---
+# ENTRYPOINT: check that the Deck-hardware daemons are quiet on non-Deck hardware.
+#
+# THIS VERIFIES; IT DOES NOT NORMALLY WRITE. It is tempting to mask the handheld daemons here,
+# because bazzite-deck packages them unconditionally and some of them start-and-fail on a desktop
+# board (jupiter-fan-control aborting with "NotImplementedError: DMI_ID Board Name not
+# implemented!" is a documented upstream report).
+#
+# THE IMAGE HANDLES IT.
+# `bazzite-hardware-setup.service` ("Configure Bazzite for current hardware") runs at boot, keys
+# off /usr/libexec/hwsupport/sysid, and on a desktop board masks inputplumber and
+# powerstation and leaves jupiter-fan-control/vpower installed-but-disabled. Nothing fails.
+#
+# So the role must not fight it. Two writers of the same systemd state is exactly the churn this
+# repo bans elsewhere, and re-running masks the image already applied would be work that looks
+# like it did something. The role's job here is to CONFIRM the image did its job, and to fail
+# loudly if a future image stops doing it.
+#
+# bazzite_deck_hw_units      handheld-only. Expected masked, disabled, or absent — never failed.
+# bazzite_deck_generic_units hardware-agnostic in principle (inputplumber = input remapping,
+#                            powerstation = DBus TDP/GPU control). Reported, NOT asserted:
+#                            bazzite-hardware-setup legitimately masks them on a desktop, and
+#                            asserting "active" would fail a correct machine.
+#
+# `bazzite_apply=true` masks anything the image left running AND failing — a repair path for a
+# future image that regresses, not the normal case.
+
+- name: Apply role defaults
+  ansible.builtin.include_tasks: setup_vars.yml
+
+- name: Read the state of every Deck daemon
+  # ONE LINE PER UNIT, emitted by the shell rather than parsed out of systemctl's blank-line-
+  # separated block format. Deliberate: splitting those blocks needs a '\n\n' literal, and inside
+  # a folded YAML scalar that is the two characters backslash-n twice, which never matches —
+  # verified, it returns one block instead of six (YAMLESC-01: backslash escapes in folded
+  # scalars). A per-unit line sidesteps the quoting question entirely.
+  #
+  # `systemctl show` answers for units that do not exist without failing, which is what makes
+  # this entrypoint safe on the desktop variant too, where none of them are installed.
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      for u in {{ (bazzite_deck_hw_units + bazzite_deck_generic_units) | join(' ') }}; do
+        load=$(systemctl show "$u" --property=LoadState --value 2>/dev/null)
+        active=$(systemctl show "$u" --property=ActiveState --value 2>/dev/null)
+        file=$(systemctl show "$u" --property=UnitFileState --value 2>/dev/null)
+        # EVERY FIELD DEFAULTED. UnitFileState is EMPTY for a unit that does not exist, which
+        # made this line three fields instead of four — the parser's `selectattr('3','defined')`
+        # then dropped every row and the report read "? / ? / ?" for a machine whose state was
+        # perfectly readable. An empty field must still occupy its column.
+        printf '%s %s %s %s\n' "$u" "${load:-none}" "${active:-none}" "${file:-none}"
+      done
+  register: _bz_dd_show
+  changed_when: false
+
+- name: Read whether the image's own hardware setup has run
+  # The service that owns this concern. It re-runs whenever the image name, branch or Fedora
+  # version changes, so on a variant rebase it reconfigures for the new image.
+  ansible.builtin.command:
+    cmd: systemctl is-active bazzite-hardware-setup.service # noqa: command-instead-of-module
+  register: _bz_hw_setup
+  changed_when: false
+  failed_when: false
+
+- name: Parse the unit states
+  # Keyed by unit name so each list can be judged against its OWN expectation.
+  # `splitlines()` rather than `split('\n')`, per the same escape trap.
+  # Each row is "unit load active enabled"; field 0 is the key, the rest are the state.
+  ansible.builtin.set_fact:
+    _bz_dd_state: >-
+      {{ dict(_rows | map(attribute='0') | zip(_rows)) }}
+  vars:
+    _rows: >-
+      {{ (_bz_dd_show.stdout | default('')).splitlines()
+         | map('split') | selectattr('3', 'defined') | list }}
+
+- name: Work out which handheld units need intervention
+  # FAILED, or ACTIVE on hardware the image did not gate it for. Anything else — masked,
+  # disabled, absent, inactive — is the image having done its job, and is left alone.
+  ansible.builtin.set_fact:
+    _bz_dd_problem: >-
+      {{ bazzite_deck_hw_units
+         | map('extract', _bz_dd_state)
+         | select('defined')
+         | selectattr('2', 'in', ['failed', 'active'])
+         | map(attribute='0') | list }}
+
+- name: Report
+  ansible.builtin.debug:
+    msg: "{{ _report.splitlines() | select('string') | list }}"
+  vars:
+    _report: |
+      bazzite-hardware-setup.service: {{ _bz_hw_setup.stdout | default('?') | trim }}
+        (the image's own hardware gating — it masks the handheld daemons on a desktop board and
+         re-runs when the image name/branch/version changes)
+
+      Handheld-only units — expected masked, disabled or absent; NEVER failed:
+      {% for u in bazzite_deck_hw_units %}
+        {{ u }}: {{ (_bz_dd_state[u] | default(['', '?']))[1] | default('?') }} / {{ (_bz_dd_state[u] | default(['', '', '?']))[2] | default('?') }} / {{ (_bz_dd_state[u] | default(['', '', '', '?']))[3] | default('?') }}
+      {% endfor %}
+
+      Hardware-agnostic units — reported only; the image may legitimately mask these on a desktop:
+      {% for u in bazzite_deck_generic_units %}
+        {{ u }}: {{ (_bz_dd_state[u] | default(['', '?']))[1] | default('?') }} / {{ (_bz_dd_state[u] | default(['', '', '?']))[2] | default('?') }} / {{ (_bz_dd_state[u] | default(['', '', '', '?']))[3] | default('?') }}
+      {% endfor %}
+
+      -> {{ 'all quiet — the image gated these correctly, nothing for this role to do'
+            if (_bz_dd_problem | length) == 0
+            else ('NEEDS ATTENTION: ' ~ (_bz_dd_problem | join(', '))) }}
+
+- name: Assert no handheld daemon is failing or running on this hardware
+  # THE ACTUAL CHECK. A failed unit pollutes every future `systemctl --failed` and every
+  # monitoring alert; a RUNNING handheld daemon on a desktop board is the thermal/input concern.
+  # This is what catches a future image that stops gating them.
+  ansible.builtin.assert:
+    that:
+      - (_bz_dd_problem | length) == 0
+    fail_msg: >-
+      These handheld-only units are failed or active on non-Deck hardware:
+      {{ _bz_dd_problem | join(', ') }}. The image's bazzite-hardware-setup normally masks them
+      (it is {{ _bz_hw_setup.stdout | default('?') | trim }}). Re-run with bazzite_apply=true to
+      mask them from here, and check whether the image changed its gating.
+    quiet: true
+  when: not (bazzite_apply | bool)
+
+- name: Mask a handheld daemon the image left misbehaving
+  # THE REPAIR PATH, not the normal one. Only units actually failed or active — never a blanket
+  # mask over what the image already arranged.
+  ansible.builtin.systemd_service:
+    name: "{{ _unit }}"
+    masked: true
+    state: stopped
+  become: true
+  loop: "{{ _bz_dd_problem }}"
+  loop_control:
+    loop_var: _unit
+  when: bazzite_apply | bool
+
+- name: Read back the repaired units
+  # An INDEPENDENT read rather than trusting the module's changed/ok.
+  # noqa: command-instead-of-module — enumerates several units at once.
+  ansible.builtin.command:
+    cmd: "systemctl is-enabled {{ _bz_dd_problem | join(' ') }}"
+  register: _bz_dd_after
+  changed_when: false
+  failed_when: false
+  when:
+    - bazzite_apply | bool
+    - (_bz_dd_problem | length) > 0
+
+- name: Assert the repair took
+  ansible.builtin.assert:
+    that:
+      - _bz_dd_after.stdout_lines | default([]) | reject('equalto', 'masked') | list | length == 0
+    fail_msg: >-
+      After masking, these are still not masked:
+      {{ dict(_bz_dd_problem | zip(_bz_dd_after.stdout_lines | default([]))) }}
+    quiet: true
+  when:
+    - bazzite_apply | bool
+    - (_bz_dd_problem | length) > 0

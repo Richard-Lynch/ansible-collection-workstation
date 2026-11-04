@@ -1,0 +1,286 @@
+---
+# ENTRYPOINT: report the base image, and update it via uupd.
+#
+# WHY uupd AND NOT rpm-ostree DIRECTLY. uupd ("Universal Update") is Bazzite's own updater and the
+# successor to ublue-update. It updates the IMAGE, FLATPAKS, DISTROBOX CONTAINERS and brew in one
+# ordered pass, with the distro's own failure handling. Driving rpm-ostree by hand updates only
+# the image and reimplements — worse — what uupd already does.
+#
+# It also solves two problems this play originally hand-rolled:
+#
+#   * `uupd wait` blocks until the ostree sysroot lock is free. Bazzite's own update timer holds
+#     that lock while it runs, and any concurrent rpm-ostree call fails with "System transaction
+#     in progress". Previously worked around with a retry loop; uupd has a purpose-built command.
+#
+#   * `uupd update-check` gives a real exit-code contract: 77 = no update available. That matters
+#     because `rpm-ostree upgrade --check` IS DOCUMENTED AS UNRELIABLE — it prints
+#     "Note: --check and --preview may be unreliable. See coreos/rpm-ostree#1579" and then reports
+#     rc 0 "No updates available". It can claim current while the deployed digest is two releases
+#     behind the registry's :stable.
+#
+# The registry digest comparison is KEPT for reporting, because it answers "which image, how old,
+# how far behind" in a way no exit code does — but the update DECISION is uupd's.
+#
+# GENERATE-DON'T-APPLY: reports and stops unless bazzite_apply=true.
+
+- name: Apply role defaults
+  ansible.builtin.include_tasks: setup_vars.yml
+
+- name: Converge the declared image variant first
+  # "Keep the image current" and "make sure it is the RIGHT image" are the same question asked in
+  # the same breath, and separating them is how a machine ends up diligently kept up to date on
+  # the wrong variant. rebase.yml is a no-op once converged and honours its own flags, so a bare
+  # `bazzite_action=image` still reports and changes nothing.
+  ansible.builtin.include_tasks: rebase.yml
+
+- name: Refuse to update along a refspec the inventory no longer declares
+  # A HARD FAIL, not a warning. Updating the old stream while drift is declared IS the failure
+  # mode this design exists to prevent, and a debug line is too easy to scroll past. Note this
+  # fires in REPORT mode too — the divergence is worth stopping for whether or not you meant to
+  # write anything, and it also keeps the digest comparison below from running cross-variant
+  # (comparing a bazzite deployment against a bazzite-deck registry digest is meaningless).
+  ansible.builtin.assert:
+    that:
+      - not (_bz_rebase_needed | default(false) | bool)
+    fail_msg: >-
+      This machine boots {{ _bz_booted['container-image-reference'] | default('?') }} but inventory
+      declares {{ bazzite_image_refspec }}. Refusing to update along the old refspec.
+      Converge it (bazzite_action=rebase bazzite_apply=true bazzite_rebase_confirm=true), or
+      correct bazzite_image_variant in inventory.
+    quiet: true
+
+- name: Note that the declared image is staged and only needs a reboot
+  ansible.builtin.debug:
+    msg: >-
+      {{ bazzite_image_variant }} is staged and awaiting a reboot
+      (bazzite_action=reboot bazzite_apply=true). Skipping the update: running uupd now would pull
+      along the NEW refspec on top of a deployment that has not booted yet. One image transition
+      at a time.
+  when: _bz_awaiting_reboot | default(false) | bool
+
+- name: Wait for the ostree sysroot lock
+  # uupd's own wait, rather than a retry loop around a probe. Bazzite's update timer holds this
+  # lock while it runs and a concurrent transaction is NORMAL, not an error.
+  ansible.builtin.command:
+    cmd: uupd wait
+  register: _bz_wait
+  changed_when: false
+  failed_when: false
+  become: true
+
+- name: Read the current deployment
+  ansible.builtin.command:
+    cmd: rpm-ostree status --json
+  register: _bz_img_status
+  changed_when: false
+
+- name: Parse the deployment
+  # Defensively: from_json raises on empty input rather than returning a default.
+  ansible.builtin.set_fact:
+    _img: >-
+      {{ ((_bz_img_status.stdout | from_json).deployments | default([{}]))[0] | default({}) }}
+
+- name: Ask uupd whether an update is available
+  # THE AUTHORITATIVE ANSWER. Exit 77 = no update, 0 = update available. A documented contract,
+  # unlike rpm-ostree's --check.
+  ansible.builtin.command:
+    cmd: uupd update-check
+  register: _bz_uupd_check
+  changed_when: false
+  failed_when: false
+  become: true
+
+- name: Ask the registry what the tag points at
+  # For REPORTING only — the decision above is uupd's. This answers "how far behind am I", which
+  # an exit code cannot, and makes a stale image visible rather than merely absent.
+  ansible.builtin.command:
+    cmd: "skopeo inspect docker://{{ bazzite_image_ref }}"
+  register: _bz_remote
+  changed_when: false
+  failed_when: false
+
+- name: Extract the digests
+  ansible.builtin.set_fact:
+    # `base-commit-meta` — HYPHENS. `_img.base_commit_meta` is a different, non-existent key:
+    # Jinja resolves it to Undefined, `| default({})` makes it an empty dict, and the digest comes
+    # out blank. That silently reads as "no difference" on a machine releases behind. Bracket
+    # notation is required for any key containing a hyphen.
+    _bz_local_digest: >-
+      {{ (_img['base-commit-meta'] | default({}))['ostree.manifest-digest'] | default('') }}
+    _bz_remote_digest: >-
+      {{ (_bz_remote.stdout | from_json).Digest | default('')
+         if (_bz_remote.rc | default(1)) == 0 and (_bz_remote.stdout | default('') | trim) | length > 0
+         else '' }}
+    _bz_remote_version: >-
+      {{ ((_bz_remote.stdout | from_json).Labels | default({}))['org.opencontainers.image.version'] | default('?')
+         if (_bz_remote.rc | default(1)) == 0 and (_bz_remote.stdout | default('') | trim) | length > 0
+         else '?' }}
+
+- name: Decide whether to update
+  # uupd's exit code is the decision. 77 = no update, 0 = update available; anything else means
+  # uupd could not tell us, which is UNKNOWN rather than "no" — treating a failed check as
+  # up-to-date is the silent-success shape that made rpm-ostree's --check useless here.
+  #
+  # AND NOT WHILE A VARIANT REBASE IS STAGED. Every update task below keys off
+  # _bz_update_available, so suppressing it here is the single point that stops uupd pulling along
+  # the NEW refspec on top of a deployment that has not booted yet. Gating here rather than adding
+  # a condition to eight tasks keeps the eight from drifting apart.
+  ansible.builtin.set_fact:
+    _bz_update_available: >-
+      {{ (_bz_uupd_check.rc | default(1)) == 0
+         and not (_bz_awaiting_reboot | default(false) | bool) }}
+    _bz_check_conclusive: "{{ (_bz_uupd_check.rc | default(1)) in [0, 77] }}"
+
+- name: Report
+  ansible.builtin.debug:
+    msg: "{{ _report.splitlines() }}"
+  vars:
+    _age_days: >-
+      {{ ((now().timestamp() - ((_img.timestamp | default(0)) | int)) / 86400) | round(0) | int }}
+    _report: |
+      image     : {{ _img['container-image-reference'] | default('unknown') }}
+      declared  : {{ bazzite_image_refspec }}
+      version   : {{ _img.version | default('unknown') }}  ({{ _age_days }} days old)
+      local     : {{ _bz_local_digest | default('(unreadable)', true) | truncate(24, true, '') }}
+      registry  : {{ _bz_remote_digest | default('(unreadable)', true) | truncate(24, true, '') }}
+                  {{ _bz_remote_version }}
+      layered   : {{ _img['requested-packages'] | default([]) | join(', ') | default('none', true) }}
+
+      uupd update-check: rc={{ _bz_uupd_check.rc | default('?') }}
+      -> {{ 'UPDATE AVAILABLE' if _bz_update_available | bool
+            else ('up to date' if _bz_check_conclusive | bool
+                  else 'UNKNOWN — uupd could not check (lock held, or no network)') }}
+
+- name: Fail if the update check was inconclusive
+  # Refuses to proceed on an unknown rather than assuming "no update". The whole reason this
+  # entrypoint was rewritten is that an unreliable check reported a stale box as current.
+  ansible.builtin.assert:
+    that:
+      - _bz_check_conclusive | bool
+    fail_msg: >-
+      `uupd update-check` returned rc={{ _bz_uupd_check.rc }}, which is neither 0 (update
+      available) nor 77 (up to date). {{ _bz_uupd_check.stderr | default('') | trim | truncate(200) }}
+      Refusing to guess — an inconclusive check must not read as "nothing to do".
+    quiet: true
+
+- name: Preview the update
+  # uupd's own dry run, rather than a hand-written description of what it might do.
+  ansible.builtin.command:
+    cmd: uupd --dry-run
+  register: _bz_dry
+  changed_when: false
+  failed_when: false
+  become: true
+  when:
+    - not (bazzite_apply | bool)
+    - _bz_update_available | bool
+
+- name: Show the preview
+  ansible.builtin.debug:
+    msg: "{{ (_bz_dry.stdout_lines | default([]))[:20] + ['Re-run with bazzite_apply=true to apply.'] }}"
+  when:
+    - not (bazzite_apply | bool)
+    - _bz_update_available | bool
+
+- name: Run the update
+  # Async: uupd pulls a multi-GB image plus flatpaks, and Ansible buffers task output until the
+  # task ends — a synchronous call sits silent for many minutes with no way to tell progress from
+  # a hang.
+  #
+  # NOT --apply: that flag makes uupd REBOOT when the image changes. Rebooting a machine out from
+  # under whoever ran the play is not this role's decision to make.
+  ansible.builtin.command:
+    cmd: uupd
+  register: _bz_uupd_async
+  changed_when: true
+  become: true
+  async: "{{ bazzite_image_timeout | int }}"
+  poll: 0
+  when:
+    - bazzite_apply | bool
+    - _bz_update_available | bool
+
+- name: Wait for uupd to finish
+  ansible.builtin.async_status:
+    jid: "{{ _bz_uupd_async.ansible_job_id }}"
+  register: _bz_uupd_done
+  until: _bz_uupd_done.finished
+  # Quiet: each unfinished poll otherwise prints "FAILED - RETRYING", which reads as an error
+  # while a multi-GB pull proceeds normally.
+  changed_when: false
+  retries: "{{ ((bazzite_image_timeout | int) / 15) | round(0, 'ceil') | int }}"
+  delay: 15
+  become: true
+  when:
+    - bazzite_apply | bool
+    - _bz_update_available | bool
+
+- name: Assert uupd completed
+  # The explicit re-check an `until:` requires — an exhausted loop CONTINUES rather than failing.
+  ansible.builtin.assert:
+    that:
+      - _bz_uupd_done.finished | default(false) | bool
+      - (_bz_uupd_done.rc | default(1) | int) == 0
+    fail_msg: >-
+      uupd did not complete. finished={{ _bz_uupd_done.finished | default(false) }}
+      rc={{ _bz_uupd_done.rc | default('?') }}
+      {{ _bz_uupd_done.stderr | default('') | truncate(300) }}
+    quiet: true
+  when:
+    - bazzite_apply | bool
+    - _bz_update_available | bool
+
+- name: Verify a new deployment was staged
+  # A READ-BACK, not a trust of uupd's exit code: it can succeed having updated only flatpaks if
+  # the image pull failed, and "it exited 0" is not the standard this repo holds.
+  ansible.builtin.command:
+    cmd: rpm-ostree status --json
+  register: _bz_after
+  changed_when: false
+  when:
+    - bazzite_apply | bool
+    - _bz_update_available | bool
+
+- name: Report the outcome
+  ansible.builtin.debug:
+    msg: >-
+      {{ 'New image staged: ' ~ (_deps[0].version | default('?')) ~ ' — REBOOT to activate. '
+         ~ 'The previous deployment is kept; `rpm-ostree rollback` returns to it.'
+         if (_deps | length) > 1 and (_deps[0].version | default('')) != (_deps[1].version | default(''))
+         else 'uupd ran, but no new image deployment appeared — flatpaks/containers may have
+               updated while the image did not. Check `rpm-ostree status`.' }}
+  vars:
+    _deps: "{{ (_bz_after.stdout | from_json).deployments | default([]) }}"
+  when:
+    - bazzite_apply | bool
+    - _bz_update_available | bool
+
+- name: Manage the automatic update timer
+  ansible.builtin.systemd_service:
+    name: "{{ bazzite_image_auto_unit }}"
+    enabled: "{{ bazzite_image_auto | bool }}"
+    state: "{{ 'started' if (bazzite_image_auto | bool) else 'stopped' }}"
+  become: true
+  register: _bz_auto
+  failed_when: false
+  when: bazzite_apply | bool
+
+- name: Read back the timer state
+  # An INDEPENDENT read: failed_when:false above pins `.failed` to False even on genuine failure,
+  # so branching on it could never report a problem (FAILED-01).
+  # noqa: command-instead-of-module — deliberately not the systemd module, for that reason.
+  ansible.builtin.command:
+    cmd: "systemctl is-enabled {{ bazzite_image_auto_unit }}"
+  register: _bz_auto_state
+  changed_when: false
+  failed_when: false
+  become: true
+  when: bazzite_apply | bool
+
+- name: Report the timer state
+  ansible.builtin.debug:
+    msg: >-
+      {{ bazzite_image_auto_unit }} is
+      {{ (_bz_auto_state.stdout | default('') | trim) | default('absent', true) }}
+      (wanted {{ 'enabled' if bazzite_image_auto | bool else 'disabled' }})
+  when: bazzite_apply | bool

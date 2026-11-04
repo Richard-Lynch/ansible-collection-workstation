@@ -1,0 +1,202 @@
+---
+# ENTRYPOINT: which PHYSICAL button sends which event code? Read-only, and INTERACTIVE by design.
+#
+# Writes nothing.
+#
+# THE QUESTION THIS ANSWERS, which `controllers` cannot. `controllers` reports what the host sees
+# about a pad — its mode, its id, how many buttons it claims. It CANNOT tell you that the button
+# labelled A is sending the code for B, because from the host's side a remapped pad is
+# indistinguishable from a correctly mapped one: the pad just says "east button pressed" and
+# everything downstream believes it.
+#
+# WHY THAT MATTERS FOR 8BITDO PADS SPECIFICALLY. These controllers store REMAPPING PROFILES in
+# their own firmware. A profile that swaps A/B is applied INSIDE the pad, before any code leaves
+# it, so no amount of inspection on the PC will reveal it and no Steam setting caused it. The
+# profile also travels WITH the pad, which is why such a pad misbehaves identically on every
+# machine — and why "it worked on the Steam Deck" stops being evidence that the pad is fine.
+#
+# So this reads the codes as they arrive, and the operator compares them against the labels printed
+# on the pad. That comparison is the only place the profile becomes visible.
+#
+# WHAT THE CODES MEAN. The kernel names buttons by POSITION, not by letter:
+#
+#   BTN_SOUTH  (BTN_A)  the bottom face button    -> Xbox A / Nintendo B
+#   BTN_EAST   (BTN_B)  the right face button     -> Xbox B / Nintendo A
+#   BTN_NORTH  (BTN_X)  the top face button       -> Xbox Y / Nintendo X
+#   BTN_WEST   (BTN_Y)  the left face button      -> Xbox X / Nintendo Y
+#
+# Nintendo and Xbox layouts are PHYSICALLY TRANSPOSED, so a pad in a Switch layout reporting
+# BTN_EAST for its A button is behaving correctly for that layout and wrongly for Steam's Xbox
+# assumption. Pressing the BOTTOM button should report BTN_SOUTH; if it reports BTN_EAST, something
+# between the plastic and the kernel has remapped it — a firmware profile, or the wrong mode.
+#
+# HOW TO RUN IT. It waits for real presses, so it needs someone at the pad:
+#
+#   bazzite_action=controller_probe
+#
+# Press the face buttons in a known order when prompted — BOTTOM, RIGHT, TOP, LEFT — then let it
+# time out. The report prints what arrived, in order, so the mapping is read off directly.
+#
+# NOT A GATE. It asserts nothing: there is no correct answer without knowing which layout the pad
+# is meant to be in, and that is the operator's call. It reports and explains.
+
+- name: Apply role defaults
+  ansible.builtin.include_tasks: setup_vars.yml
+
+- name: Find the gamepad event devices
+  # By CAPABILITY, not by name. A pad's name varies with mode and firmware, but a device with
+  # BTN_SOUTH in its key bitmask is a gamepad whatever it calls itself. Keyboard and mouse
+  # interfaces of a composite pad are excluded here on purpose — they are a normal part of these
+  # devices and are not what a face-button probe should read.
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      python3 - <<'PY_INNER'
+      import re
+      blocks = open('/proc/bus/input/devices').read().split('\n\n')
+      for b in blocks:
+          if not b.strip():
+              continue
+          name = re.search(r'N: Name="([^"]*)"', b)
+          hand = re.search(r'H: Handlers=(.*)', b)
+          if not name or not hand:
+              continue
+          h = hand.group(1)
+          # js* means the kernel treats it as a joystick; that is the node a game reads.
+          if 'js' not in h:
+              continue
+          ev = re.search(r'(event\d+)', h)
+          if ev:
+              print('%s %s' % (ev.group(1), name.group(1)))
+      PY_INNER
+  register: _bz_probe_devs
+  changed_when: false
+  failed_when: false
+
+- name: Announce what to press
+  ansible.builtin.debug:
+    msg:
+      - "PRESS THE FOUR FACE BUTTONS NOW, in this order, then wait:"
+      - "  1. the BOTTOM button   (expect BTN_SOUTH)"
+      - "  2. the RIGHT button    (expect BTN_EAST)"
+      - "  3. the TOP button      (expect BTN_NORTH)"
+      - "  4. the LEFT button     (expect BTN_WEST)"
+      - ""
+      - "Listening for {{ bazzite_controller_probe_seconds }}s on:
+         {{ (_bz_probe_devs.stdout_lines | default(['(no gamepad found)'])) | join('; ') }}"
+
+- name: Capture button presses as they arrive
+  # evtest needs read access to /dev/input/event*, which is root-only on this image — hence become.
+  # A TIMEOUT rather than a press count: a pad whose buttons are NOT arriving is exactly the case
+  # being investigated, so waiting for N presses would hang forever on the interesting failure.
+  # `timeout` exiting 124 is the normal path here, not an error.
+  become: true
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      dev="/dev/input/{{ bazzite_controller_probe_device | default((_bz_probe_devs.stdout_lines | first | default('')).split(' ') | first) }}"
+      [ -e "$dev" ] || { echo "no-such-device $dev"; exit 0; }
+      # stdbuf so evtest's output is not held in a block buffer until the timeout kills it —
+      # without it a short run prints nothing at all.
+      timeout {{ bazzite_controller_probe_seconds }} stdbuf -oL evtest "$dev" 2>/dev/null \
+        | grep -E 'type 1 \(EV_KEY\).*value 1' \
+        | sed -E 's/.*code [0-9]+ \(([A-Z_0-9]+)\).*/\1/' || true
+  register: _bz_probe_presses
+  changed_when: false
+  failed_when: false
+
+- name: Capture presses on EVERY gamepad node at once
+  # WHY BOTH NODES, SIMULTANEOUSLY. Steam Input synthesises a VIRTUAL pad (`Microsoft X-Box 360
+  # pad 0`) alongside the physical one, so a machine running Steam has TWO gamepad nodes for one
+  # piece of plastic. Steam's own UI reads one; a game may read the other, or both — and they do
+  # not enumerate buttons identically.
+  #
+  # That is the mechanism behind "correct in the Steam menus, wrong in one game": nothing is
+  # remapped anywhere, the game is simply reading a different node than the UI. Watching one node
+  # cannot show it; watching both, with one press, shows exactly which codes each reports for the
+  # same physical button.
+  #
+  # A press that appears on only ONE node is also the finding for dropped simultaneous holds: if
+  # the physical pad and the virtual pad disagree about a button being held, whichever the game
+  # reads wins and the other looks like a dropped input.
+  become: true
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      pids=""
+      out="$(mktemp -d)"
+      for line in {{ (_bz_probe_devs.stdout_lines | default([])) | map('regex_replace', ' .*$', '') | join(' ') }}; do
+        [ -e "/dev/input/$line" ] || continue
+        # stdbuf so each event is flushed as it happens rather than sitting in a block buffer
+        # until timeout kills the process — without it a short run prints nothing at all.
+        timeout {{ bazzite_controller_probe_seconds }} stdbuf -oL evtest "/dev/input/$line" \
+          > "$out/$line.raw" 2>/dev/null &
+        pids="$pids $!"
+      done
+      for p in $pids; do wait "$p" 2>/dev/null || true; done
+      for f in "$out"/*.raw; do
+        [ -f "$f" ] || continue
+        n="$(basename "$f" .raw)"
+        # PREFIX EVERY LINE with its node rather than printing a header above a group. The
+        # report renders stdout through a join, which preserves order but makes a bare header
+        # ambiguous once two nodes interleave — the first version printed eight codes with no
+        # way to tell which device reported which, defeating the whole comparison.
+        c="$(grep -cE 'type 1 \(EV_KEY\).*value 1' "$f" 2>/dev/null || echo 0)"
+        if [ "$c" -gt 0 ]; then
+          grep -E 'type 1 \(EV_KEY\).*value 1' "$f" 2>/dev/null \
+            | sed -E "s/.*code [0-9]+ \(([A-Z_0-9]+)\).*/$n  \1/"
+        else
+          printf '%s  (no presses)\n' "$n"
+        fi
+      done
+      rm -rf "$out"
+  register: _bz_probe_all
+  changed_when: false
+  failed_when: false
+
+- name: Report
+  ansible.builtin.debug:
+    msg: "{{ _report.splitlines() }}"
+  vars:
+    _p: "{{ _bz_probe_presses.stdout_lines | default([]) }}"
+    _faces: "{{ _p | select('match', 'BTN_(SOUTH|EAST|NORTH|WEST|A|B|X|Y)$') | list }}"
+    _first: "{{ (_faces | first) | default('(nothing)', true) }}"
+    _report: |
+      ===== GAMEPAD EVENT DEVICES =====
+      {{ (_bz_probe_devs.stdout | default('(none found)')) | trim }}
+
+      ===== PER-NODE COMPARISON (the same press, seen by each node) =====
+      {{ (_bz_probe_all.stdout | default('(unreadable)')) | trim }}
+
+      If the two nodes report DIFFERENT codes for the same physical press, nothing is remapped —
+      the Steam UI and the game are simply reading DIFFERENT DEVICES. That is the usual cause of
+      "correct in the menus, wrong in one game", and the fix is per-game Steam Input, not the pad.
+
+      ===== BUTTON CODES RECEIVED, IN ORDER =====
+      {{ (_p | join('
+      ')) | default('(nothing arrived — see below)', true) }}
+
+      face-button presses seen: {{ _faces | length }}
+
+      ===== HOW TO READ THIS =====
+      The kernel names face buttons by POSITION: BTN_SOUTH is the bottom button, BTN_EAST the
+      right, BTN_NORTH the top, BTN_WEST the left. Xbox and Nintendo layouts are physically
+      transposed, so "A" means different positions on each.
+
+      {{ 'NOTHING ARRIVED. Either no press was made during the listening window, or this pad is
+      not delivering button events to that device node at all — which is itself the finding. Check
+      the device list above is the pad you pressed.'
+         if (_faces | length) == 0
+         else ('The FIRST face button pressed reported ' ~ _first ~ '. If that press was the
+      BOTTOM button, then BTN_SOUTH is correct and the pad is mapped as Steam expects; anything
+      else means the codes are transposed relative to the physical layout.
+
+      A TRANSPOSITION THAT SURVIVES A MODE CHANGE IS AN ONBOARD PROFILE. 8BitDo pads store
+      remapping in their own firmware, applied before any code leaves the controller — so it is
+      invisible to every check on this machine, it travels with the pad to other machines, and no
+      Steam setting caused it or can see it. Clear or switch the profile using 8BitDo Ultimate
+      Software (Windows/Android) or the pad''s own profile button, then re-run this probe: the
+      codes are what prove it changed.') }}

@@ -1,0 +1,298 @@
+---
+# ENTRYPOINT: reshape the Super-I/O's OWN fan curves, so the hardware keeps regulating.
+#
+# WHY THE HARDWARE CURVE RATHER THAN A DAEMON. The chip runs the curve itself, in firmware. No
+# userspace process sits in the thermal path, so nothing to crash, hang, be OOM-killed or be
+# forgotten on a rebase — if Linux dies the fans keep being regulated. The cost is that the chip
+# can only steer off its OWN temp channels (amdgpu, nvme and k10temp are invisible to it), which
+# is what a userspace per-component daemon (such as config_fan_control) adds. That daemon's value is
+# per-header sensor subsets, so on a board where the case fans share one header it buys little.
+#
+# WHAT THIS FIXES: a factory curve can jump from 53 to 255 between 22C and 30C. With CPUTIN idling
+# at ~28-32C, every fan on that header sits at FULL SPEED on a cold board essentially always — the
+# loudest available setting for the most common condition.
+#
+# THE CURVES ARE PER-MACHINE CONFIG and live in inventory. They encode one case, its fans and
+# someone's measured noise tolerance — nothing about them generalises, and a role
+# default would be wrong on every other machine while looking authoritative.
+#
+# GENERATE-DON'T-APPLY: prints a before/after table and stops unless bazzite_fan_curve_apply=true.
+#
+#   bazzite_action=fan_curve                               (report)
+#   bazzite_action=fan_curve bazzite_fan_curve_apply=true  (program the curves)
+#
+# NOT PERSISTENT ACROSS A REBOOT. The registers are volatile, so this must be re-applied at boot
+# to stick; that is deliberately a separate step, because the failure mode of NOT re-applying is
+# "the factory curve returns" — loud, not dangerous. Establish the curve is right first.
+
+- name: Apply role defaults
+  ansible.builtin.include_tasks: setup_vars.yml
+
+- name: HARD GATE — the Super-I/O chip is declared
+  ansible.builtin.assert:
+    that:
+      - bazzite_fan_sweep_chip is defined
+      - bazzite_fan_sweep_chip | string | length > 0
+    fail_msg: >-
+      bazzite_fan_sweep_chip is not set. Which hwmon chip carries the fan headers is a fact about
+      the board; declare it (e.g. nct6799) in the host's inventory entry.
+    quiet: true
+
+- name: Refuse to run with no curves declared
+  # An empty list would program nothing and still install the boot unit and report every point
+  # landed: a green run over zero points.
+  ansible.builtin.assert:
+    that:
+      - bazzite_fan_curves | length > 0
+    fail_msg: >-
+      bazzite_fan_curves is empty. A curve encodes a specific case and specific fans, so it is
+      declared per host in inventory; there is nothing to program until it is.
+    quiet: true
+
+- name: Refuse to reshape a pump header's curve
+  # A pump's flat-255 curve is probably CORRECT (most are specified to run at a fixed duty); reshaping it
+  # downward is a coolant-flow decision, not a noise one, and never a side effect of a fan job.
+  ansible.builtin.assert:
+    that:
+      - "(bazzite_fan_curves | map(attribute='header') | map('int') | select('in', bazzite_fan_sweep_pump_headers | map('int') | list) | list | length) == 0"
+    fail_msg: >-
+      A declared curve targets a PUMP header
+      ({{ bazzite_fan_sweep_pump_headers }}). Reshaping a pump's curve downward risks
+      cavitation and loss of coolant flow.
+    quiet: true
+
+- name: Try to load the motherboard sensor module
+  ansible.builtin.command:
+    argv: [modprobe, "{{ item }}"]
+  become: true
+  register: _bz_curve_modprobe
+  changed_when: _bz_curve_modprobe.rc == 0
+  failed_when: false
+  loop: "{{ bazzite_sensor_modules }}"
+  when: bazzite_sensors_load_modules | bool
+
+- name: Read the curves currently programmed into the chip
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      h=""
+      for d in /sys/class/hwmon/hwmon*; do
+        [ "$(cat "$d/name" 2>/dev/null)" = "{{ bazzite_fan_sweep_chip }}" ] && h="$d"
+      done
+      [ -n "$h" ] || { echo "chip_missing=true"; exit 0; }
+      for i in {{ bazzite_fan_curves | map(attribute='header') | join(' ') }}; do
+        line="hdr${i}"
+        for pt in 1 2 3 4 5; do
+          line="$line p${pt}=$(cat "$h/pwm${i}_auto_point${pt}_temp" 2>/dev/null || echo na)/$(cat "$h/pwm${i}_auto_point${pt}_pwm" 2>/dev/null || echo na)"
+        done
+        line="$line sel=$(cat "$h/pwm${i}_temp_sel" 2>/dev/null || echo na)"
+        echo "$line"
+      done
+  register: _bz_curve_before
+  changed_when: false
+
+- name: Report the change this would make
+  ansible.builtin.debug:
+    msg: "{{ _report.splitlines() | select('string') | list }}"
+  vars:
+    _report: |
+      ===== FAN CURVES: before =====
+      {{ _bz_curve_before.stdout_lines | default(['(chip not found)']) | join('
+      ') }}
+
+      ===== FAN CURVES: proposed =====
+      {% for c in bazzite_fan_curves %}
+      hdr{{ c.header }} ({{ c.note | default('') }})
+        {% for p in c.points %}{{ p.temp }}C -> pwm {{ p.pwm }} ({{ (p.pwm * 100 / 255) | round | int }}%){% if not loop.last %}, {% endif %}{% endfor %}
+
+      {% endfor %}
+      Points are temperature -> duty on the chip's own curve. Between points the chip
+      interpolates; above the last point it holds that duty.
+      {{ 'Set bazzite_fan_curve_apply=true to write them.' if not (bazzite_fan_curve_apply | bool) else 'APPLYING.' }}
+
+- name: Write the curves
+  when: bazzite_fan_curve_apply | bool
+  block:
+    - name: Program each curve point
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: |
+          set -o pipefail
+          h=""
+          for d in /sys/class/hwmon/hwmon*; do
+            [ "$(cat "$d/name" 2>/dev/null)" = "{{ bazzite_fan_sweep_chip }}" ] && h="$d"
+          done
+          [ -n "$h" ] || { echo "chip_missing=true"; exit 1; }
+          i="{{ item.0.header }}"
+          pt="{{ item.1 }}"
+          want_t="{{ (item.0.points[item.1 | int - 1].temp | int) * 1000 }}"
+          want_p="{{ item.0.points[item.1 | int - 1].pwm }}"
+          echo "$want_t" > "$h/pwm${i}_auto_point${pt}_temp"
+          echo "$want_p" > "$h/pwm${i}_auto_point${pt}_pwm"
+          # Read back BOTH: Super-I/O registers can silently clamp, so a successful write is not
+          # evidence the value landed, and a curve half-applied is worse than one not applied.
+          got_t="$(cat "$h/pwm${i}_auto_point${pt}_temp")"
+          got_p="$(cat "$h/pwm${i}_auto_point${pt}_pwm")"
+          if [ "$got_t" = "$want_t" ] && [ "$got_p" = "$want_p" ]; then
+            echo "hdr${i} p${pt} ok ${got_t}/${got_p}"
+          else
+            echo "hdr${i} p${pt} MISMATCH wanted ${want_t}/${want_p} got ${got_t}/${got_p}"
+          fi
+      become: true
+      loop: "{{ bazzite_fan_curves | product(['1', '2', '3', '4', '5']) | list }}"
+      loop_control:
+        label: "hdr{{ item.0.header }} point {{ item.1 }}"
+      register: _bz_curve_write
+      changed_when: true
+
+    - name: Ensure the headers are actually running their curve
+      # Programming a curve changes nothing if the header is in manual mode — which is exactly
+      # the state a previous sweep or probe leaves behind. Mode 5 is what makes the chip use it.
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: |
+          set -o pipefail
+          h=""
+          for d in /sys/class/hwmon/hwmon*; do
+            [ "$(cat "$d/name" 2>/dev/null)" = "{{ bazzite_fan_sweep_chip }}" ] && h="$d"
+          done
+          out=""
+          for i in {{ bazzite_fan_curves | map(attribute='header') | join(' ') }}; do
+            echo 5 > "$h/pwm${i}_enable" 2>/dev/null || true
+            out="$out hdr${i}=$(cat "$h/pwm${i}_enable")"
+          done
+          echo "modes:$out"
+      become: true
+      register: _bz_curve_mode
+      changed_when: true
+
+    - name: Every curve point must have landed exactly
+      ansible.builtin.assert:
+        that:
+          - "(_bz_curve_write.results | map(attribute='stdout') | select('search', 'MISMATCH') | list | length) == 0"
+        fail_msg: >-
+          A curve point did not land:
+          {{ _bz_curve_write.results | map(attribute='stdout') | select('search', 'MISMATCH') | list }}
+        success_msg: "All curve points landed and were confirmed by read-back."
+        quiet: true
+
+    - name: Every touched header must be on its curve, not manual
+      ansible.builtin.assert:
+        that:
+          - "(_bz_curve_mode.stdout | regex_findall('hdr[0-9]+=([0-9]+)') | reject('equalto', '5') | list | length) == 0"
+        fail_msg: "A header is not in automatic mode: {{ _bz_curve_mode.stdout }}"
+        success_msg: "{{ _bz_curve_mode.stdout }}"
+        quiet: true
+
+    - name: Load the sensor module at boot
+      # Without this, nct6775 is present only when an Ansible run has modprobed it. After a
+      # bare reboot there is no Super-I/O chip in sysfs at all — no curves, no daemon control,
+      # nothing — and the boot unit fails looking for a chip that has not appeared yet.
+      # `copy: content:` rather than a template only because this is three lines. Two traps here,
+      # both silent:
+      #   * ansible_managed is NOT available in `content:` (template-only) — it fails the run
+      #     with "'ansible_managed' is undefined";
+      #   * `join('\n')` inside a YAML block scalar produces the two characters \ and n, not a
+      #     newline, so the file held ONE invalid module name rather than two valid ones — and
+      #     modules-load.d would simply not load the module, silently.
+      ansible.builtin.copy:
+        content: |
+          # Managed by roles/bazzite_workstation (bazzite_action=fan_curve).
+          # Super-I/O sensors. Without this there are no fan headers in sysfs after a reboot,
+          # and both the curve program and the fan daemon have nothing to control.
+          {% for m in bazzite_sensor_modules %}{{ m }}
+          {% endfor %}
+        dest: /etc/modules-load.d/iaac-fan-sensors.conf
+        mode: "0644"
+      become: true
+      when: bazzite_fan_curve_persist | bool
+
+    - name: Install the boot-persistence script
+      # The auto_point registers are VOLATILE — a reboot restores the factory curve, which on
+      # some boards pins the case fans at full from 30C up. fand normally masks that by driving the
+      # fans itself, which is exactly why it matters: these curves are fand's FALLBACK, and a
+      # fallback that silently reverts to "loud" after every reboot is not one to rely on.
+      ansible.builtin.template:
+        src: fan-curve-restore.sh.j2
+        dest: "{{ bazzite_fan_curve_script }}"
+        mode: "0755"
+      become: true
+      when: bazzite_fan_curve_persist | bool
+
+    - name: Install the boot unit
+      ansible.builtin.template:
+        src: fan-curve-restore.service.j2
+        dest: "/etc/systemd/system/{{ bazzite_fan_curve_unit }}"
+        mode: "0644"
+      become: true
+      when: bazzite_fan_curve_persist | bool
+
+    - name: Enable it for next boot
+      ansible.builtin.systemd_service:
+        name: "{{ bazzite_fan_curve_unit }}"
+        enabled: true
+        daemon_reload: true
+      become: true
+      when: bazzite_fan_curve_persist | bool
+
+    - name: Run it now, exactly as boot will
+      # Proves the unit works rather than assuming it will next reboot. The script is
+      # idempotent, so running it here simply re-programs what was just written.
+      ansible.builtin.systemd_service:
+        name: "{{ bazzite_fan_curve_unit }}"
+        state: restarted
+      become: true
+      register: _bz_curve_boot
+      when: bazzite_fan_curve_persist | bool
+
+    - name: The boot unit must have succeeded
+      # Read back its result rather than trusting the module's own report: a oneshot that exits
+      # non-zero still "restarts" successfully from the module's point of view.
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: |
+          set -o pipefail
+          printf 'result=%s enabled=%s\n' \
+            "$(systemctl show {{ bazzite_fan_curve_unit }} -p Result --value)" \
+            "$(systemctl is-enabled {{ bazzite_fan_curve_unit }} 2>/dev/null || echo disabled)"
+      become: true
+      register: _bz_curve_boot_state
+      changed_when: false
+      when: bazzite_fan_curve_persist | bool
+
+    - name: Boot persistence must be armed and working
+      ansible.builtin.assert:
+        that:
+          - "'result=success' in _bz_curve_boot_state.stdout"
+          - "'enabled=enabled' in _bz_curve_boot_state.stdout"
+        fail_msg: >-
+          Boot persistence is not working: {{ _bz_curve_boot_state.stdout | trim }}.
+          Check `journalctl -u {{ bazzite_fan_curve_unit }}`.
+        success_msg: "Curves will be reprogrammed at boot ({{ _bz_curve_boot_state.stdout | trim }})."
+        quiet: true
+      when: bazzite_fan_curve_persist | bool
+
+    - name: Read the curves back
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: |
+          set -o pipefail
+          h=""
+          for d in /sys/class/hwmon/hwmon*; do
+            [ "$(cat "$d/name" 2>/dev/null)" = "{{ bazzite_fan_sweep_chip }}" ] && h="$d"
+          done
+          for i in {{ bazzite_fan_curves | map(attribute='header') | join(' ') }}; do
+            line="hdr${i}"
+            for pt in 1 2 3 4 5; do
+              line="$line $(( $(cat "$h/pwm${i}_auto_point${pt}_temp") / 1000 ))C/$(cat "$h/pwm${i}_auto_point${pt}_pwm")"
+            done
+            echo "$line now: pwm=$(cat "$h/pwm${i}") rpm=$(cat "$h/fan${i}_input" 2>/dev/null || echo na)"
+          done
+      become: true
+      register: _bz_curve_after
+      changed_when: false
+
+    - name: Show the result
+      ansible.builtin.debug:
+        msg: "{{ ['===== FAN CURVES: after ====='] + (_bz_curve_after.stdout_lines | default([])) }}"

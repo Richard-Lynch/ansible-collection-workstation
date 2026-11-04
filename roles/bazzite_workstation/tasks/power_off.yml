@@ -1,0 +1,127 @@
+---
+# ENTRYPOINT: shut the machine down to a full power-off (S5).
+#
+# WHY THIS EXISTS AND WHY IT IS NOT `reboot`. Proving Wake-on-LAN means proving it from the state
+# the machine is actually left in, and here that is POWERED OFF rather than suspended. A
+# reboot never passes through S5 at all, so it cannot test the thing that matters: whether the
+# BIOS keeps the PCIe slot powered when off ('Power On By PCI-E/PCI' enabled, 'ErP Ready'
+# disabled). Those are precisely the settings a driver-level flag check cannot see.
+#
+# THIS IS THE ONE ENTRYPOINT THAT CANNOT VERIFY ITSELF. Every other action in this role reads its
+# result back; here a successful run ends with the target unreachable, so there is nothing to read
+# back FROM. The read-back is a separate play against a different host — a wake helper on the
+# same L2 segment — and that asymmetry is the whole point rather than an omission:
+#
+#   1. bazzite_action=power_off bazzite_power_off_confirm=true   (this entrypoint)
+#   2. a play on another host that sends the magic packet and probes the target
+#
+# Step 2 probes afterwards and reports honestly, so a box that was woken by a human pressing the
+# power button is not recorded as a successful magic packet (a false "WoL works").
+#
+# IT ALSO CANNOT UNDO ITSELF. Nothing in this role can power the machine back ON except a magic
+# packet, which is the capability under test — so if WoL does not work, recovery is a walk to the
+# machine. That is why this is gated on its own explicit confirm rather than on bazzite_apply:
+# the universal write flag is passed routinely while converging a machine, and powering a
+# streaming host off must never be reachable as a side effect of that.
+
+- name: Apply role defaults
+  ansible.builtin.include_tasks: setup_vars.yml
+
+- name: Require explicit confirmation
+  # A DEDICATED gate, deliberately not bazzite_apply. See the header: bazzite_apply is the flag
+  # that turns the whole role from report to write, and `all` passes it — so reusing it here
+  # would mean a routine converge could power the machine down.
+  ansible.builtin.assert:
+    that:
+      - bazzite_power_off_confirm | bool
+    fail_msg: >-
+      This powers {{ inventory_hostname }} OFF (S5), and nothing in this role can power it back
+      on except a Wake-on-LAN magic packet — which is usually the capability being tested, so a
+      failure means walking to the machine. Set bazzite_power_off_confirm=true in a play
+      dedicated to this, never alongside routine convergence.
+    quiet: true
+
+- name: Report the Wake-on-LAN state before powering off
+  # Read, not assumed, and reported BEFORE the shutdown because afterwards there is no way to ask.
+  # A box powered off with `Wake-on: d` cannot be woken, and discovering that after the fact is
+  # indistinguishable from a BIOS problem — which is a much longer hunt.
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      for i in $(ls -1 /sys/class/net | grep -E '^(eno|enp|eth)'); do
+        printf '%s=%s\n' "$i" "$(ethtool "$i" 2>/dev/null | awk -F': ' '/^[[:space:]]*Wake-on/{print $2}')"
+      done
+  register: _bz_off_wol
+  changed_when: false
+  become: true
+
+- name: Assert the NIC is armed before taking the machine away
+  # THE CHECK THAT EARNS ITS PLACE. Powering off a box whose NIC is not armed creates exactly the
+  # situation this test exists to avoid, and the cost is physical. Refusing here is free.
+  #
+  # Matched as '=g' against the per-interface read-back above, so a NIC reporting 'd' cannot pass
+  # by sharing a line with one reporting 'g'.
+  ansible.builtin.assert:
+    that:
+      - _bz_off_wol.stdout is search('=g')
+    fail_msg: >-
+      No wired interface is armed for magic-packet wake: {{ _bz_off_wol.stdout_lines | join(' ') }}.
+      Powering off now would leave the machine unwakeable. Arm it first with
+      bazzite_action=wol bazzite_apply=true, then re-run this.
+    quiet: true
+
+- name: Capture the timeout before the connection goes away
+  # Resolved WHILE THE HOST IS STILL UP. Every task after the poweroff runs against a machine
+  # that is going or gone, and a role default resolved at that point raises undefined — see the
+  # note on the wait_for below.
+  ansible.builtin.set_fact:
+    _bz_off_timeout: "{{ bazzite_power_off_timeout | int }}"
+
+- name: Report what is about to happen
+  ansible.builtin.debug:
+    msg:
+      - "{{ _bz_off_wol.stdout_lines }}"
+      - >-
+        Powering {{ inventory_hostname }} off now. The connection will drop mid-task; that is
+        expected and is reported as a successful shutdown below, not as a failure.
+      - >-
+        Wake it with a Wake-on-LAN magic packet from another host on the same segment.
+
+- name: Power off
+  # `async` + `poll: 0` on purpose. A synchronous shutdown command kills its own SSH connection
+  # before the module can report, which Ansible surfaces as an unreachable-host FAILURE for a run
+  # that did exactly what was asked. Firing and not waiting keeps the run honest.
+  #
+  # The sleep gives sshd time to return the task result before systemd tears the link down.
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: "sleep 2 && systemctl poweroff"
+  async: 30
+  poll: 0
+  become: true
+  changed_when: true
+
+- name: Wait for the machine to stop answering
+  # PROVES THE SHUTDOWN, from the controller. `systemctl poweroff` returning 0 means the request
+  # was accepted, not that the machine went down — a hung unit can keep it up indefinitely, and a
+  # wake test against a box that never powered off reports a false success.
+  #
+  # THE TIMEOUT IS CAPTURED INTO A PLAY VAR ABOVE, not read from bazzite_power_off_timeout here.
+  # This task runs AFTER the poweroff has already closed the connection, and
+  # resolving a role default at that point fails with "'bazzite_power_off_timeout' is undefined"
+  # — the shutdown has happened, and the run would report FAILED for the one task whose whole job is
+  # to confirm it. A wake test then looks like it is following a failed power-off.
+  ansible.builtin.wait_for:
+    host: "{{ ansible_host | default(inventory_hostname) }}"
+    port: 22
+    state: stopped
+    timeout: "{{ _bz_off_timeout | int }}"
+  delegate_to: localhost
+  changed_when: false
+
+- name: Report that it is down
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }} no longer answers on port 22 — it is powered off (S5).
+      Now send the magic packet from another host; a probe after sending is what proves it worked.

@@ -1,0 +1,362 @@
+---
+# ENTRYPOINT: log the primary user in automatically at boot, so the machine is fully usable —
+# Steam, Sunshine, Big Picture — without anyone touching a keyboard.
+#
+# WHY THIS IS NEEDED AT ALL. Steam Remote Play and Sunshine both capture the GRAPHICAL SESSION,
+# so neither can start until someone logs in. A rebooted box sits at the greeter with nothing
+# listening, and from a client it looks identical to a network problem: the host simply is not
+# there: Remote Play "not showing up" on the client, with nothing wrong on the network at all.
+#
+# THE DISPLAY MANAGER HERE IS `plasmalogin`, NOT SDDM. Plasma 6.7 replaced SDDM on this image, and
+# it does NOT read /etc/sddm.conf — configuration written there is silently ignored, which is the
+# obvious wrong turn when following any autologin guide. It uses the same [Autologin] User=/
+# Session= schema at /etc/plasmalogin.conf.d/.
+#
+# A FRESH INSTALL ALREADY HAS AUTOLOGIN — POINTED AT THE WRONG USER. Bazzite ships
+# 99-plasma-setup.conf with `User=plasma-setup`, the first-run wizard account. It is a leftover
+# from installation, so the machine autologs into a setup user rather than the real one. The drop-in
+# written here sorts AFTER it (KConfig applies drop-ins in lexical order, last wins) rather than
+# editing the vendor file, which an image update would replace.
+#
+# SECURITY, stated plainly rather than assumed. Autologin means physical access to the machine is
+# access to a logged-in desktop. On a gaming box whose lock screen is already disabled that
+# changes very little, but it IS a real trade and belongs behind an explicit flag.
+#
+# THE KEYRING CAVEAT. KWallet is unlocked by the login password. With autologin there is no
+# password entry, so anything using the wallet may prompt on first use. Reported below rather
+# than silently worked around, because the usual "fix" is to blank the wallet password, which
+# quietly removes encryption from stored credentials.
+
+- name: Apply role defaults
+  ansible.builtin.include_tasks: setup_vars.yml
+
+- name: HARD GATE — the autologin user is declared
+  ansible.builtin.assert:
+    that:
+      - bazzite_autologin_user is defined
+      - bazzite_autologin_user | length > 0
+    fail_msg: >-
+      bazzite_autologin_user is not set. Which account a machine logs in as is the caller's
+      to declare (inventory); the role has no default for it.
+    quiet: true
+
+- name: Identify the display manager
+  # Not assumed: the config path differs entirely between sddm and plasmalogin, and writing to the
+  # wrong one succeeds and does nothing.
+  # noqa command-instead-of-module — systemd_service SETS state; it has no read-only "which
+  # unit is display-manager.service aliased to" query, which is the only thing needed here.
+  ansible.builtin.command:
+    cmd: systemctl show display-manager.service --property=Id --value # noqa: command-instead-of-module
+  register: _bz_dm
+  changed_when: false
+  failed_when: false
+
+- name: Assert this is a display manager we know how to configure
+  ansible.builtin.assert:
+    that:
+      - (_bz_dm.stdout | trim) in ['plasmalogin.service', 'sddm.service']
+    fail_msg: >-
+      Unexpected display manager '{{ _bz_dm.stdout | trim }}'. This entrypoint writes
+      plasmalogin/sddm [Autologin] config; another DM uses a different mechanism entirely and
+      writing here would silently do nothing.
+    quiet: true
+
+- name: Note the config directory for this display manager
+  ansible.builtin.set_fact:
+    _bz_dm_confdir: "{{ '/etc/plasmalogin.conf.d' if (_bz_dm.stdout | trim) == 'plasmalogin.service' else '/etc/sddm.conf.d' }}"
+
+- name: Look for an existing autologin setting
+  # Specifically to surface the vendor's plasma-setup entry, which is the thing being overridden.
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      grep -rH -A2 '\[Autologin\]' {{ _bz_dm_confdir }}/ /etc/plasmalogin.conf /etc/sddm.conf 2>/dev/null | grep -vE '^\s*$' || true
+  register: _bz_autologin_now
+  changed_when: false
+
+- name: Report the plan
+  ansible.builtin.debug:
+    msg:
+      - "display manager : {{ _bz_dm.stdout | trim }}  (config in {{ _bz_dm_confdir }})"
+      - "current autologin:"
+      - "{{ _bz_autologin_now.stdout_lines | default(['(none)'], true) }}"
+      - >-
+        {{ 'Setting' if (bazzite_apply | bool) else 'WOULD set' }} autologin for
+        '{{ bazzite_autologin_user }}' into session '{{ bazzite_autologin_session }}'.
+        {{ '' if (bazzite_apply | bool) else 'Re-run with bazzite_apply=true.' }}
+
+- name: Detect the deck image's own autologin machinery
+  # bazzite-deck ships /usr/libexec/bazzite-autologin, run by bazzite-autologin.service (enabled
+  # in the image via an explicit multi-user.target.wants symlink — there is no preset entry). It
+  # rewrites autologin on EVERY boot, so the role cannot simply write its own file and expect it
+  # to stand. Its presence is what selects the deck-native path below.
+  ansible.builtin.stat:
+    path: /usr/libexec/bazzite-autologin
+  register: _bz_deck_autologin
+
+- name: Configure Game Mode the way the deck image expects
+  # WHY NOT JUST WRITE Session= IN OUR OWN DROP-IN. SDDM merges /etc/sddm.conf.d lexically,
+  # last-wins per key, and the deck stack has four writers:
+  #
+  #   zz-bazzite-autologin.conf   User=    rewritten by bazzite-autologin EVERY boot
+  #   zz-holo-autologin.conf      Session= written by it ONLY IF ABSENT  <- the vendor's hook
+  #   zz-iaac-autologin.conf      (what this role writes on a desktop image)
+  #   zz-steamos-autologin.conf   Session= written by steamosctl, DELETED every boot by the above
+  #   zzt-steamos-temp-login.conf Session= one-shot, written by an in-UI mode switch
+  #
+  # A role-written Session= in zz-iaac would beat the vendor default but LOSE to every "Return to
+  # Gaming Mode" in the Steam UI — three writers churning one key, where the effective value
+  # depends on which ran last. Unassertable by construction.
+  #
+  # So the role uses the vendor's own create-if-missing hook instead: a pre-existing
+  # zz-holo-autologin.conf is respected forever and never overwritten. State lives in two plain
+  # files — the sentinel and zz-holo — which is fully readable back, unlike `steamosctl`, whose
+  # file is deleted on every boot.
+  when: _bz_deck_autologin.stat.exists | bool
+  block:
+    - name: Read the account the image will autologin
+      # bazzite-autologin hardcodes User=$(id -nu 1000) and rewrites it every boot, so the role
+      # cannot durably own User=. Asserting is the honest alternative: if uid 1000 is not the
+      # intended account that is a real problem to surface, not to paper over.
+      ansible.builtin.command:
+        cmd: id -nu 1000
+      register: _bz_uid1000
+      changed_when: false
+
+    - name: Assert the image will autologin the intended account
+      ansible.builtin.assert:
+        that:
+          - (_bz_uid1000.stdout | trim) == bazzite_autologin_user
+        fail_msg: >-
+          bazzite-autologin logs in uid 1000, which is
+          '{{ _bz_uid1000.stdout | trim }}', but bazzite_autologin_user is
+          '{{ bazzite_autologin_user }}'. The image rewrites User= on every boot, so the role
+          cannot override it durably — fix the account, or correct inventory.
+        quiet: true
+
+    - name: Confirm the Game Mode session exists
+      ansible.builtin.stat:
+        path: "/usr/share/wayland-sessions/{{ bazzite_game_session }}"
+      register: _bz_game_session_file
+      when: bazzite_login_mode == 'game'
+
+    - name: Assert the Game Mode session is real
+      ansible.builtin.assert:
+        that:
+          - _bz_game_session_file.stat.exists
+        fail_msg: >-
+          No session '/usr/share/wayland-sessions/{{ bazzite_game_session }}'. Autologin into a
+          session that does not exist fails silently and leaves the greeter up.
+        quiet: true
+      when: bazzite_login_mode == 'game'
+
+    - name: Pin the Game Mode session through the vendor's create-if-missing hook
+      ansible.builtin.copy:
+        dest: /etc/sddm.conf.d/zz-holo-autologin.conf
+        mode: "0644"
+        owner: root
+        group: root
+        content: |
+          # Managed by Ansible: roles/bazzite_workstation (autologin entrypoint).
+          #
+          # /usr/libexec/bazzite-autologin creates this file ONLY when it is absent, so a managed
+          # copy is respected on every boot and never overwritten. That is why the session is
+          # pinned here rather than in a zz-iaac- file, which would be overridden by every in-UI
+          # "Return to Gaming Mode".
+          #
+          # The image's own default is gamescope-session-ogui-steam.desktop (OpenGamepadUI,
+          # "Big Picture Plus"). This pins whichever session inventory declares.
+          [Autologin]
+          Session={{ bazzite_game_session }}
+      become: true
+      when:
+        - bazzite_apply | bool
+        - bazzite_login_mode == 'game'
+
+    - name: Unpin the session when returning to desktop mode
+      # THE REVERSE TRANSITION, which is easy to get wrong. Setting the
+      # sentinel alone is not enough: bazzite-autologin writes zz-holo-autologin.conf ONLY when
+      # it is absent, so a file left pinned to the gamescope session keeps winning and the box
+      # boots into Game Mode however the sentinel reads.
+      #
+      # Removing it hands the choice back to bazzite-autologin, which then writes plasma.desktop
+      # because the sentinel is present. That is what makes game -> desktop work by changing one
+      # inventory value, in both directions.
+      ansible.builtin.file:
+        path: /etc/sddm.conf.d/zz-holo-autologin.conf
+        state: absent
+      become: true
+      when:
+        - bazzite_apply | bool
+        - bazzite_login_mode != 'game'
+
+    - name: Set the desktop/game sentinel
+      # Absent = Game Mode, present = desktop. bazzite-autologin reads this to choose the session
+      # it would write. A plain file, so the intent is declarative and readable back.
+      ansible.builtin.file:
+        path: /etc/bazzite/desktop_autologin
+        state: "{{ 'absent' if bazzite_login_mode == 'game' else 'touch' }}"
+        mode: "0644"
+      become: true
+      when: bazzite_apply | bool
+
+    - name: Read back what will actually happen at next boot
+      # The FILES, not a command's exit code: these are what SDDM and bazzite-autologin read.
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: |
+          set -o pipefail
+          printf 'uid1000=%s\n'  "$(id -nu 1000)"
+          printf 'sentinel=%s\n' "$([ -f /etc/bazzite/desktop_autologin ] && echo present || echo absent)"
+          printf 'holo=%s\n'     "$(grep -hs '^Session=' /etc/sddm.conf.d/zz-holo-autologin.conf | cut -d= -f2)"
+          printf 'dropins=%s\n'  "$(ls /etc/sddm.conf.d/ 2>/dev/null | tr '\n' ' ')"
+      register: _bz_deck_login_readback
+      changed_when: false
+
+    - name: Report the effective login policy
+      ansible.builtin.debug:
+        msg: >-
+          {{ _bz_deck_login_readback.stdout_lines }}
+          -> mode={{ bazzite_login_mode }}; the sentinel must be ABSENT for Game Mode, and
+          `holo` is the session that will start.
+
+- name: Configure autologin the desktop-image way
+  # The original path, for images WITHOUT the deck autologin machinery (plain bazzite, where the
+  # display manager is plasmalogin and nothing else writes these files).
+  when: not (_bz_deck_autologin.stat.exists | bool)
+  block:
+    - name: Confirm the target session exists
+      # A session name that does not resolve leaves the greeter up with no error anywhere obvious —
+      # the machine simply never logs in, which is the same symptom as no autologin at all.
+      ansible.builtin.stat:
+        path: "/usr/share/wayland-sessions/{{ bazzite_autologin_session }}.desktop"
+      register: _bz_session_file
+
+    - name: Assert the session is real
+      ansible.builtin.assert:
+        that:
+          - _bz_session_file.stat.exists
+        fail_msg: >-
+          No session '/usr/share/wayland-sessions/{{ bazzite_autologin_session }}.desktop'.
+          Autologin into a non-existent session fails silently and leaves the greeter up.
+          Check the names under /usr/share/wayland-sessions on the machine.
+        quiet: true
+
+    - name: Write the autologin drop-in
+      # zz-iaac- so it sorts AFTER Bazzite's 99-plasma-setup.conf. Drop-ins apply in lexical order
+      # and the last value wins, so this overrides the vendor file WITHOUT editing it — an image
+      # update replaces that file and would discard an in-place edit.
+      #
+      # The 'zz-' prefix sorts it after every vendor drop-in, digit- or letter-prefixed alike.
+      # The read-back assert below checks which file actually set the value, because the write
+      # succeeds and reports changed whether or not a later file overrides it.
+      ansible.builtin.copy:
+        dest: "{{ _bz_dm_confdir }}/zz-iaac-autologin.conf"
+        mode: "0644"
+        owner: root
+        group: root
+        content: |
+          # Managed by Ansible: roles/bazzite_workstation (autologin entrypoint).
+          #
+          # Overrides Bazzite's 99-plasma-setup.conf, which autologs into the first-run wizard user
+          # 'plasma-setup' rather than the owner. Sorts after it by filename; last drop-in wins.
+          #
+          # Autologin is what makes Steam, Sunshine and Big Picture available after a reboot with no
+          # keyboard — all three need a graphical session and cannot start at the greeter.
+          [Autologin]
+          User={{ bazzite_autologin_user }}
+          Session={{ bazzite_autologin_session }}
+          # Log back in automatically after logging out, not just at boot. Without this, a logout
+          # leaves the box at the greeter and silently offline for streaming until someone returns.
+          Relogin={{ 'true' if (bazzite_autologin_relogin | bool) else 'false' }}
+      become: true
+      register: _bz_autologin_written
+      when: bazzite_apply | bool
+
+    - name: Read the effective configuration back
+      # The merged result, not the file just written: a later-sorting drop-in would override this one,
+      # and reading only our own file would miss that entirely.
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: |
+          set -o pipefail
+          for f in $(ls -1 {{ _bz_dm_confdir }}/*.conf 2>/dev/null | sort); do
+            printf '%s: %s\n' "$(basename "$f")" "$(grep -A3 '\[Autologin\]' "$f" 2>/dev/null | grep -E '^(User|Session)=' | tr '\n' ' ')"
+          done
+      register: _bz_autologin_after
+      changed_when: false
+      when: bazzite_apply | bool
+
+    - name: Assert our drop-in is the last word
+      # Gates on OUR file sorting last among those that set a User, which is what actually determines
+      # the outcome. Asserting merely that the file exists would pass while a later drop-in overrode it.
+      ansible.builtin.assert:
+        that:
+          - _bz_last_setter == 'zz-iaac-autologin.conf'
+          - "('User=' ~ bazzite_autologin_user) in (_bz_autologin_after.stdout | default(''))"
+        fail_msg: >-
+          Autologin is not effective. Last drop-in setting a user is '{{ _bz_last_setter }}',
+          expected zz-iaac-autologin.conf. Full state:
+          {{ _bz_autologin_after.stdout_lines | default([]) | join(' | ') }}
+        quiet: true
+      vars:
+        _bz_last_setter: >-
+          {{ (_bz_autologin_after.stdout_lines | default([]) | select('search', 'User=')
+              | map('regex_replace', ':.*$', '') | list | last) | default('(none)', true) }}
+      when: bazzite_apply | bool
+
+    - name: Report
+      ansible.builtin.debug:
+        msg:
+          - "{{ _bz_autologin_after.stdout_lines | default([]) }}"
+          - >-
+            Autologin set for {{ bazzite_autologin_user }}. This takes effect at the NEXT BOOT — it
+            does not log anyone in right now.
+          - >-
+            KWallet is normally unlocked by the login password; with autologin there is no password
+            entry, so an app using the wallet may prompt on first use. Do NOT "fix" that by blanking
+            the wallet password — that removes encryption from every credential it holds.
+      when: bazzite_apply | bool
+
+- name: Remove this role's autologin drop-in for the OTHER display manager
+  # A deck rebase swaps plasmalogin for SDDM, leaving /etc/plasmalogin.conf.d/zz-iaac-autologin.conf
+  # behind — /etc survives a deployment change, so the file persists in a directory nothing reads.
+  # Harmless to boot, but it states an autologin policy that cannot be in effect and will mislead
+  # every future investigation.
+  #
+  # OFF BY DEFAULT AND DELIBERATELY LATE. `rpm-ostree rollback` returns to the plasmalogin image,
+  # where that drop-in is exactly what makes autologin work — deleting it at cutover would land a
+  # rollback at a greeter with nothing streaming. Turn it on once the rollback window has closed.
+  ansible.builtin.file:
+    path: "{{ _other_confdir }}/zz-iaac-autologin.conf"
+    state: absent
+  vars:
+    _other_confdir: >-
+      {{ '/etc/sddm.conf.d' if (_bz_dm.stdout | trim) == 'plasmalogin.service'
+         else '/etc/plasmalogin.conf.d' }}
+  become: true
+  when:
+    - bazzite_apply | bool
+    - bazzite_autologin_cleanup_stale | bool
+
+- name: Remove deck-era session state when the image no longer has the deck machinery
+  # THE OTHER REVERSE TRANSITION: rebasing bazzite-deck -> bazzite. /etc survives a deployment
+  # change, so zz-holo-autologin.conf and the sentinel persist — but on the desktop image
+  # bazzite-autologin is gone and nothing rewrites them, leaving SDDM files that name a gamescope
+  # session the image no longer ships. Removing them is what makes the variant genuinely
+  # reversible by changing one inventory value.
+  #
+  # Guarded on the machinery being ABSENT, so this can never fire on a deck image.
+  ansible.builtin.file:
+    path: "{{ _leftover }}"
+    state: absent
+  loop:
+    - /etc/sddm.conf.d/zz-holo-autologin.conf
+    - /etc/bazzite/desktop_autologin
+  loop_control:
+    loop_var: _leftover
+  become: true
+  when:
+    - bazzite_apply | bool
+    - not (_bz_deck_autologin.stat.exists | bool)

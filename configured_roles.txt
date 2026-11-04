@@ -1,4 +1,5 @@
 asus_tuf_b850m_bios
+bazzite_workstation
 config_fan_control
 rpi_boot_media
 rpi_fleet_report

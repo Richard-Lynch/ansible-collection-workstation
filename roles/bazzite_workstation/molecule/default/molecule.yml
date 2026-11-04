@@ -1,0 +1,34 @@
+# Offline scenario — exercises the role's REAL variable resolution and convergence logic with no
+# rpm-ostree, no ublue image and no network. Nothing on the network is touched: every task runs
+# against fixtures and localhost.
+#
+# WHAT THIS TESTS, and why it is worth having. The rebase logic decides whether to replace a
+# machine's operating system, and it makes that decision from a refspec comparison. The specific
+# bug it is written against is a SUBSTRING match: 'bazzite' is a substring of 'bazzite-deck', so a
+# naive `'bazzite' in ref` reports a correctly-converged deck machine as needing a rebase forever.
+# That case is exercised explicitly below.
+---
+dependency:
+  name: galaxy
+driver:
+  name: default
+platforms:
+  - name: localhost
+provisioner:
+  name: ansible
+  # Molecule runs from the scenario directory, so the repo's ansible.cfg roles_path (./roles) does
+  # not resolve. Pointed at the repo root explicitly so converge.yml can include the role's REAL
+  # setup_vars.yml — re-deriving the refspec in the scenario would make this a tautology that
+  # tests the copy against itself (MOLMIRROR-02).
+  env:
+    ANSIBLE_ROLES_PATH: "${MOLECULE_PROJECT_DIRECTORY}/../"
+    ANSIBLE_COLLECTIONS_PATH: "${MOLECULE_PROJECT_DIRECTORY}/../../collections.galaxy:${MOLECULE_PROJECT_DIRECTORY}/../../../../.."
+  inventory:
+    host_vars:
+      localhost:
+        ansible_connection: local
+  playbooks:
+    converge: converge.yml
+    verify: verify.yml
+verifier:
+  name: ansible

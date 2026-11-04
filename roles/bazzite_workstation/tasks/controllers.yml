@@ -1,0 +1,202 @@
+---
+# ENTRYPOINT: report every game controller the kernel and Steam can see.
+#
+# WHY THIS EXISTS. "The controller works but Steam does not list it as a controller" is a
+# recurring, confusing report, because a gamepad reaches Linux through SEVERAL independent layers
+# and each can succeed while a later one fails:
+#
+#   1. USB/Bluetooth   — the device is enumerated at all
+#   2. kernel driver   — hid-generic / xpad / hid-nintendo / 8bitdo bind to it
+#   3. /dev/input      — event + js nodes appear, with the right permissions (udev)
+#   4. Steam Input     — Steam recognises it as a CONTROLLER rather than a keyboard/mouse
+#
+# A device can be perfectly usable at layer 3 — buttons register, it "works" — while Steam refuses
+# to treat it as a controller at layer 4. That is almost always either the controller being in the
+# wrong INPUT MODE (8BitDo pads switch between XInput / DInput / Switch / macOS with a button
+# combo at power-on, and only some are recognised as controllers), or Steam Input's per-type
+# support checkbox being off.
+#
+# So this reports all four layers rather than answering "is it plugged in", which is the question
+# nobody actually has.
+#
+# Writes nothing.
+
+- name: Apply role defaults
+  ansible.builtin.include_tasks: setup_vars.yml
+
+- name: Enumerate USB devices
+  ansible.builtin.command:
+    cmd: lsusb
+  register: _bz_usb
+  changed_when: false
+  failed_when: false
+
+- name: Enumerate Bluetooth devices
+  ansible.builtin.command:
+    cmd: bluetoothctl devices
+  register: _bz_bt
+  changed_when: false
+  failed_when: false
+
+- name: Read the kernel input device table
+  # /proc/bus/input/devices is the authoritative view of what the kernel thinks each device IS —
+  # crucially its Name, the driver Handlers bound to it, and the EV bitmask. A pad that shows
+  # `js0` in Handlers is a joystick to the kernel; one that only has kbd/mouse handlers will
+  # never be seen by Steam as a controller no matter how well its buttons work.
+  ansible.builtin.slurp:
+    src: /proc/bus/input/devices
+  register: _bz_inputs
+
+- name: Look for the udev rules that grant Steam access
+  # Steam needs permission on the device node. Bazzite ships the rules, but a controller in an
+  # unusual mode can present a USB id no rule matches — the device works for anything reading
+  # /dev/input directly, and is invisible to Steam.
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      ls /usr/lib/udev/rules.d/ /etc/udev/rules.d/ 2>/dev/null \
+        | grep -iE "steam|joystick|gamepad|input|8bitdo|xpad" | sort -u || true
+  register: _bz_udev
+  changed_when: false
+
+- name: Read what the 8BitDo udev rules say each mode's USB id IS
+  # THE AUTHORITATIVE MODE MAP, and the reason this task exists rather than a remembered button
+  # combo. An 8BitDo pad exposes a DIFFERENT USB product id per input mode, and the vendor's own
+  # udev rules enumerate those ids — so the rules on the box are a better source for "which mode
+  # is this pad in" than any table written from memory, which differs per model and goes stale.
+  #
+  # Reported alongside the LIVE id from lsusb so the two can be compared directly: the live id
+  # tells you where the pad IS, the rules tell you what else it COULD be.
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      for f in /usr/lib/udev/rules.d/*8bitdo* /etc/udev/rules.d/*8bitdo* \
+               /usr/lib/udev/rules.d/*steam-input* ; do
+        [ -f "$f" ] || continue
+        printf '--- %s ---\n' "$(basename "$f")"
+        grep -oE 'idVendor}=="[0-9a-fA-F]{4}", *ATTRS?\{idProduct}=="[0-9a-fA-F]{4}"' "$f" 2>/dev/null \
+          | sed -E 's/.*idVendor}=="([0-9a-f]{4})".*idProduct}=="([0-9a-f]{4})".*/  \1:\2/' \
+          | sort -u || true
+      done
+      echo "--- live gamepad ids from lsusb ---"
+      lsusb 2>/dev/null | grep -iE '8bitdo|045e:|054c:|057e:' || echo '  (no known gamepad vendor matched)'
+  register: _bz_pad_modes
+  changed_when: false
+  failed_when: false
+
+- name: Read each gamepad's button and axis capabilities
+  # WHY: "half the buttons are unbound" and "A and B are swapped" are DIFFERENT faults and this is
+  # what separates them. The EV/KEY bitmask says which button codes the device actually reports, so
+  # a pad missing codes is a mode problem, while a pad reporting the full set with the wrong LABELS
+  # is a layout/mapping problem (Nintendo-style A/B and Xbox-style A/B are physically transposed).
+  #
+  # A pad that ALSO presents keyboard/mouse interfaces is reported explicitly: a real gamepad mode
+  # does not, and keyboard HID rollover rules are why simultaneous button holds get dropped.
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      python3 - <<'PY_INNER'
+      import glob, os, re
+      txt = open('/proc/bus/input/devices').read().split('\n\n')
+      for block in txt:
+          if not block.strip():
+              continue
+          name = re.search(r'N: Name="([^"]*)"', block)
+          name = name.group(1) if name else '?'
+          if not re.search(r'(?i)8bitdo|x-box|xbox|gamepad|joystick|controller', name):
+              continue
+          hand = re.search(r'H: Handlers=(.*)', block)
+          hand = hand.group(1).strip() if hand else ''
+          keyline = re.search(r'B: KEY=(.*)', block)
+          keys = keyline.group(1).strip() if keyline else ''
+          abs_ = re.search(r'B: ABS=(.*)', block)
+          nbits = bin(int(keys.replace(' ', ''), 16)).count('1') if keys else 0
+          kind = []
+          if 'js' in hand: kind.append('GAMEPAD(js)')
+          if 'kbd' in hand: kind.append('KEYBOARD')
+          if 'mouse' in hand: kind.append('MOUSE')
+          print('%-58s %-22s buttons=%-4s abs=%s' % (
+              name[:58], ','.join(kind) or 'other', nbits,
+              'yes' if abs_ else 'no'))
+      PY_INNER
+  register: _bz_pad_caps
+  changed_when: false
+  failed_when: false
+
+- name: Read Steam's controller configuration
+  # Steam Input has a PER-TYPE toggle (Xbox / PlayStation / Switch / Generic). A pad presenting as
+  # a type whose box is unticked is listed as a plain input device rather than a controller —
+  # the exact symptom this entrypoint exists to explain.
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      f=~/.steam/steam/config/config.vdf
+      [ -f "$f" ] && grep -iE "SDL_GamepadBind|controller|Xbox|PS4|PS5|Switch|Generic" "$f" \
+        | head -12 || echo "(no Steam config.vdf — has Steam been launched and logged in?)"
+  register: _bz_steamcfg
+  changed_when: false
+  failed_when: false
+
+- name: Report
+  ansible.builtin.debug:
+    msg: "{{ _report.splitlines() }}"
+  vars:
+    _dev: "{{ _bz_inputs.content | b64decode }}"
+    # Names of every input device, so a pad appearing under an unexpected name is visible.
+    # Double-quoted so YAML turns \n into a real newline: in a >- scalar the backslash
+    # survives and split() never splits (YAMLESC-01).
+    _names: "{{ _dev.split('\n') | select('match', '^N: Name=') | map('regex_replace', '^N: Name=\"?', '')
+               | map('regex_replace', '\"$', '') | list }}"
+    # A device the kernel treats as a joystick has a js* handler. This is the layer-3 verdict.
+    _js: "{{ _dev.split('\n') | select('search', 'Handlers=.*js[0-9]') | list }}"
+    _usb_hits: >-
+      {{ _bz_usb.stdout_lines | default([])
+         | select('search', '(?i)8bitdo|2dc8|045e|054c|nintendo|xbox|controller|gamepad') | list }}
+    _report: |
+      ===== 1. USB / BLUETOOTH =====
+      {{ (_usb_hits | join('
+      ')) if (_usb_hits | length > 0) else '(no controller-like USB device matched)' }}
+      bluetooth: {{ (_bz_bt.stdout_lines | default([]) | join(', ')) | default('(none paired)', true) }}
+
+      ===== 2/3. KERNEL INPUT DEVICES =====
+      {{ _names | join('
+      ') }}
+
+      joystick nodes (js*): {{ (_js | length) }}
+      {{ 'A device with a js* handler IS seen as a gamepad by the kernel.'
+         if (_js | length) > 0
+         else 'NO js* handler — the kernel is NOT treating anything as a joystick. The pad is
+               probably in the wrong INPUT MODE. On 8BitDo, hold a mode combo at power-on:
+               START+X = XInput (best for Steam), START+B = DInput, START+Y = Switch,
+               START+A = macOS/Bluetooth. XInput is the one Steam handles best.' }}
+
+      ===== 4. UDEV RULES =====
+      {{ (_bz_udev.stdout_lines | default([]) | join(', ')) | default('(none found)', true) }}
+
+      ===== 4b. 8BITDO MODE IDS (from the vendor's own udev rules) =====
+      {{ (_bz_pad_modes.stdout | default('(unreadable)')) | trim }}
+
+      ===== 4c. WHAT EACH GAMEPAD ACTUALLY REPORTS =====
+      {{ (_bz_pad_caps.stdout | default('(unreadable)')) | trim }}
+
+      {{ 'A pad listed as KEYBOARD or MOUSE above is NOT in a clean gamepad mode: those interfaces
+      send keystrokes rather than button codes, so a game binding controller buttons cannot see
+      them, and keyboard HID rollover is why simultaneous holds get dropped. Switch the pad to its
+      XInput mode. If instead the pad shows GAMEPAD(js) with a full button count but the WRONG
+      labels (A where B should be), that is a LAYOUT difference — Nintendo and Xbox transpose A/B
+      physically — and is fixed in Steam per-controller, not by changing mode.'
+         if ('KEYBOARD' in (_bz_pad_caps.stdout | default('')))
+         else 'No gamepad is presenting keyboard/mouse interfaces, so any wrong-button problem is
+      a LAYOUT/mapping question rather than an input-mode one.' }}
+
+      ===== 5. STEAM =====
+      {{ (_bz_steamcfg.stdout_lines | default([]) | join('
+      ')) | default('(nothing)', true) }}
+
+      If the kernel sees a js* device but Steam does not list it as a controller, the cause is
+      almost always Steam Input's per-type support: Steam > Settings > Controller, and enable
+      the box matching how the pad presents (Xbox / PlayStation / Switch / Generic).

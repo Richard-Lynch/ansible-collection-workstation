@@ -1,0 +1,125 @@
+---
+# ENTRYPOINT: gaming tunables that live in the user's own config, not the system image.
+#
+# Everything here is a dotfile under ~/.config. That is deliberate: it survives an image rebase
+# untouched, needs no root, needs no reboot, and can be reverted by deleting a file. Nothing in
+# this entrypoint touches rpm-ostree.
+#
+# WHAT IT DOES NOT DO. It does not install Steam, Proton, MangoHud or gamescope — Bazzite ships
+# all of those. Re-installing them would be wasted work at best and a conflict at worst. This
+# configures what is already there.
+
+- name: Apply role defaults
+  ansible.builtin.include_tasks: setup_vars.yml
+
+- name: Ensure the config directories exist
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0755"
+  loop:
+    - "{{ ansible_env.HOME }}/.config/MangoHud"
+    - "{{ ansible_env.HOME }}/.config"
+  when: bazzite_apply | bool
+
+- name: Write the MangoHud configuration
+  # A readable default overlay rather than the everything-on wall of numbers. Toggle keybind is
+  # set explicitly so the overlay is off until asked for — an always-on overlay is the fastest
+  # way to make someone uninstall it.
+  ansible.builtin.copy:
+    dest: "{{ ansible_env.HOME }}/.config/MangoHud/MangoHud.conf"
+    mode: "0644"
+    content: |
+      # Managed by roles/bazzite_workstation — edits will be overwritten.
+      #
+      # Deliberately minimal: frame timing, GPU/CPU load and temps, and nothing else. The full
+      # set of MangoHud metrics is overwhelming in motion and makes the overlay a distraction
+      # rather than a diagnostic.
+      fps
+      frametime
+      frame_timing=1
+      gpu_stats
+      gpu_temp
+      gpu_load_change
+      cpu_stats
+      cpu_temp
+      cpu_load_change
+      ram
+      vram
+      # Bottom-left keeps it clear of most games' own HUD elements.
+      position=bottom-left
+      font_size=20
+      background_alpha=0.4
+      # OFF until toggled. R_SHIFT+F12 matches Bazzite's own documented default.
+      no_display=1
+      toggle_hud=Shift_R+F12
+      # Logging is opt-in; the keybind exists so a bad frametime spike can be captured when it
+      # happens rather than reproduced later.
+      toggle_logging=Shift_L+F2
+      output_folder={{ ansible_env.HOME }}/mangohud-logs
+  when:
+    - bazzite_apply | bool
+    - bazzite_mangohud_config | bool
+
+- name: Write the GameMode configuration
+  # Tuned for a DESKTOP, which is the distinction that matters: Bazzite's defaults lean toward
+  # handheld/Deck power behaviour, where conserving battery outranks sustained performance. On a
+  # mains-powered tower the opposite is true.
+  ansible.builtin.copy:
+    dest: "{{ ansible_env.HOME }}/.config/gamemode.ini"
+    mode: "0644"
+    content: |
+      ; Managed by roles/bazzite_workstation — edits will be overwritten.
+      [general]
+      ; Ask the CPU governor for performance while a game is running, and hand it back after.
+      desiredgov=performance
+      defaultgov=schedutil
+      ; Renice the game process. 10 is meaningful without starving the compositor, which is what
+      ; happens at the maximum and shows up as a stuttering desktop rather than a faster game.
+      renice=10
+      softrealtime=auto
+      inhibit_screensaver=1
+
+      [filter]
+      ; No whitelist: GameMode is opt-in per title via Steam launch options, so filtering here
+      ; would be a second place to maintain the same list.
+
+      [custom]
+      ; Hooks left empty deliberately — a start/end script that fails silently is worse than no
+      ; script, and there is nothing this machine needs to do around a game launch yet.
+  when:
+    - bazzite_apply | bool
+    - bazzite_gamemode | bool
+
+- name: Read back what was written
+  # Verifies the files exist and are non-empty rather than trusting copy's changed status. A
+  # template that renders to nothing still "succeeds".
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  register: _bz_written
+  loop: "{{ _expected }}"
+  vars:
+    _expected: >-
+      {{ ([ansible_env.HOME ~ '/.config/MangoHud/MangoHud.conf'] if (bazzite_mangohud_config | bool) else [])
+       + ([ansible_env.HOME ~ '/.config/gamemode.ini'] if (bazzite_gamemode | bool) else []) }}
+  when: bazzite_apply | bool
+
+- name: Assert the configuration landed
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists
+      - item.stat.size > 0
+    fail_msg: "Config file {{ item.item }} is missing or empty after the write."
+    quiet: true
+  loop: "{{ _bz_written.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item | default('') }}"
+  when: bazzite_apply | bool
+
+- name: Report
+  ansible.builtin.debug:
+    msg: >-
+      {{ 'Wrote' if (bazzite_apply | bool) else 'WOULD write' }}
+      MangoHud={{ bazzite_mangohud_config }} GameMode={{ bazzite_gamemode }}
+      into ~/.config. These are user dotfiles: they survive an image rebase and need no reboot.
+      {{ '' if (bazzite_apply | bool) else 'Re-run with bazzite_apply=true.' }}

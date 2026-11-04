@@ -1,0 +1,351 @@
+---
+# ENTRYPOINT: make this machine's network identity STABLE, so a DHCP reservation can hold.
+#
+# THE PROBLEM THIS SOLVES. NetworkManager randomises WiFi MAC addresses by default — a privacy
+# feature that is exactly wrong for a desktop you want to reserve an address for. The adapter
+# associates with a software-assigned address — the locally-administered bit (the `2` in the
+# second nibble, e.g. x2:xx:...) marks it — rather than its permanent one. That rotates, and a
+# DHCP reservation keyed to it silently stops matching. The symptom is "it used to get the right IP and now it doesn't", weeks later.
+#
+# So: pin the connection to the adapter's PERMANENT hardware address. The reservation in
+# inventory keys off that same permanent MAC, and the two stay in agreement.
+#
+# WIRED NEEDS NOTHING — ethernet MACs are not randomised. It is listed by the report below purely
+# so the caller can see both interfaces and confirm the reservation matches reality.
+
+- name: Apply role defaults
+  ansible.builtin.include_tasks: setup_vars.yml
+
+- name: Find every connection profile and its autoconnect state
+  # WHY THIS MATTERS MORE THAN IT LOOKS. A NetworkManager profile with autoconnect=no never comes
+  # up on its own — the machine boots, the cable has link, and the interface simply sits idle.
+  # After an image update a wired profile can read `<iface>::no:` with carrier=1, so the machine is
+  # reachable only over WiFi and appears to have "lost" its wired connection.
+  #
+  # For a headless, Ansible-managed box this is the difference between "available after a restart"
+  # and "available after someone logs in and clicks something".
+  ansible.builtin.command:
+    cmd: "nmcli -t -f NAME,DEVICE,TYPE,AUTOCONNECT connection show"
+  register: _bz_conns
+  changed_when: false
+
+- name: Select the wired profiles that will not auto-connect
+  # Wired only. A WiFi profile that does not autoconnect is often deliberate (a network you join
+  # occasionally); an ethernet one almost never is.
+  ansible.builtin.set_fact:
+    _bz_noauto: >-
+      {{ _bz_conns.stdout_lines
+         | select('search', ':(802-3-)?ethernet:no$')
+         | map('split', ':') | map('first') | list }}
+
+- name: Report
+  ansible.builtin.debug:
+    msg: >-
+      {{ ('Wired profiles NOT set to autoconnect: ' ~ (_bz_noauto | join(', ')) ~
+          ' — these will not come up after a reboot until someone brings them up by hand.')
+         if (_bz_noauto | length > 0)
+         else 'All wired profiles already autoconnect.' }}
+
+- name: Enable autoconnect on wired profiles
+  # Also sets a connection PRIORITY so that, with both links present, wired wins. Without it
+  # NetworkManager keeps whichever came up first, which can mean staying on WiFi with a
+  # perfectly good cable attached.
+  ansible.builtin.command:
+    argv:
+      - nmcli
+      - connection
+      - modify
+      - "{{ item }}"
+      - connection.autoconnect
+      - "yes"
+      - connection.autoconnect-priority
+      - "{{ bazzite_wired_priority | int }}"
+  become: true
+  changed_when: true
+  loop: "{{ _bz_noauto }}"
+  when:
+    - bazzite_apply | bool
+    - _bz_noauto | length > 0
+
+- name: Bring the wired connections up now
+  ansible.builtin.command:
+    argv: [nmcli, connection, up, "{{ item }}"]
+  become: true
+  changed_when: true
+  failed_when: false
+  loop: "{{ _bz_noauto }}"
+  when:
+    - bazzite_apply | bool
+    - _bz_noauto | length > 0
+
+- name: Read back the autoconnect state
+  # An independent re-read, not a trust of nmcli's exit code — the setting only matters if it
+  # persisted to the profile, which is what the next boot will consult.
+  ansible.builtin.command:
+    cmd: "nmcli -t -f NAME,TYPE,AUTOCONNECT connection show"
+  register: _bz_conns_after
+  changed_when: false
+  when:
+    - bazzite_apply | bool
+    - _bz_noauto | length > 0
+
+- name: Assert no wired profile is left without autoconnect
+  ansible.builtin.assert:
+    that:
+      - (_bz_conns_after.stdout_lines | select('search', ':(802-3-)?ethernet:no$') | list | length) == 0
+    fail_msg: >-
+      A wired profile still has autoconnect=no after the change:
+      {{ _bz_conns_after.stdout_lines | select('search', 'ethernet:no$') | list }}.
+      The machine will come back from a reboot without its wired connection.
+    quiet: true
+  when:
+    - bazzite_apply | bool
+    - _bz_noauto | length > 0
+
+- name: Find the wireless interfaces
+  # Derived, not hardcoded: interface names are predictable-but-not-guessable (e.g. wlp3s0) and
+  # change with hardware. A hardcoded name is the kind of thing that works until the day it does
+  # not, so the interface is derived from facts.
+  ansible.builtin.command:
+    cmd: "nmcli -t -f DEVICE,TYPE,STATE device status"
+  register: _bz_devices
+  changed_when: false
+
+- name: Select the wireless devices
+  ansible.builtin.set_fact:
+    _bz_wifi: >-
+      {{ _bz_devices.stdout_lines
+         | select('search', ':wifi:')
+         | map('split', ':') | map('first') | list }}
+
+- name: Read each wireless adapter's PERMANENT address
+  # ethtool -P, not `ip link` or nmcli's HWADDR: those report the address currently IN USE, which
+  # is the randomised one. Only the permanent address is stable enough to reserve against, and
+  # ethtool is the reliable way to read it.
+  ansible.builtin.command:
+    cmd: "ethtool -P {{ item }}"
+  register: _bz_perm
+  changed_when: false
+  loop: "{{ _bz_wifi }}"
+
+- name: Find the active connection profile for each wireless device
+  ansible.builtin.command:
+    cmd: "nmcli -t -f NAME,DEVICE connection show --active"
+  register: _bz_active
+  changed_when: false
+
+- name: Report the current addressing
+  ansible.builtin.debug:
+    msg: >-
+      {{ item.item }}: permanent={{ item.stdout | regex_search('([0-9a-f:]{17})', '\1') | first | default('?') }}
+      in-use={{ (ansible_facts[item.item | replace('-', '_')].macaddress) | default('?') }}
+      {{ '(RANDOMISED — a reservation keyed to the in-use address will not hold)'
+         if (item.stdout | regex_search('([0-9a-f:]{17})', '\1') | first | default(''))
+            != (ansible_facts[item.item | replace('-', '_')].macaddress | default('') | lower)
+         else '(already using its permanent address)' }}
+  loop: "{{ _bz_perm.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Pin each wireless connection to its permanent MAC
+  # `cloned-mac-address permanent` is NetworkManager's own supported way to say "use the hardware
+  # address" — better than writing the address literally, which would need updating if the adapter
+  # is ever replaced.
+  #
+  # Applied to the CONNECTION PROFILE, so it persists across reboots and reconnects rather than
+  # being a runtime override.
+  ansible.builtin.command:
+    argv:
+      - nmcli
+      - connection
+      - modify
+      - "{{ _con }}"
+      - 802-11-wireless.cloned-mac-address
+      - permanent
+  become: true
+  changed_when: true
+  vars:
+    _con: >-
+      {{ (_bz_active.stdout_lines | select('search', ':' ~ item.item ~ '$') | first | default(':')).split(':')[0] }}
+  loop: "{{ _bz_perm.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when:
+    - bazzite_apply | bool
+    - _con | length > 0
+
+- name: Report what would change
+  ansible.builtin.debug:
+    msg: >-
+      WOULD pin {{ _bz_wifi | join(', ') }} to their permanent MAC addresses so the DHCP
+      reservations hold. Re-run with bazzite_apply=true.
+  when:
+    - not (bazzite_apply | bool)
+    - _bz_wifi | length > 0
+
+- name: Confirm the pin was recorded
+  # A read-back of the stored profile, not a trust of nmcli's exit code — the setting is only
+  # useful if it persisted to the connection, and that is what the next reconnect will read.
+  ansible.builtin.command:
+    cmd: "nmcli -t -f 802-11-wireless.cloned-mac-address connection show {{ _con }}"
+  register: _bz_pinned
+  changed_when: false
+  vars:
+    _con: >-
+      {{ (_bz_active.stdout_lines | select('search', ':' ~ item.item ~ '$') | first | default(':')).split(':')[0] }}
+  loop: "{{ _bz_perm.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when:
+    - bazzite_apply | bool
+    - _con | length > 0
+
+- name: Assert every wireless connection is pinned
+  ansible.builtin.assert:
+    that:
+      - "'permanent' in item.stdout"
+    fail_msg: >-
+      {{ item.item.item | default('a wireless connection') }} is not pinned to its permanent MAC
+      (got '{{ item.stdout | default('') | trim }}'). The DHCP reservation will stop matching when
+      NetworkManager next rotates the address.
+    quiet: true
+  loop: "{{ _bz_pinned.results | default([]) | selectattr('stdout', 'defined') | list }}"
+  loop_control:
+    label: "{{ item.item.item | default('') }}"
+  when: bazzite_apply | bool
+
+- name: Note that the change needs a reconnect
+  ansible.builtin.debug:
+    msg: >-
+      Pinned. The new address takes effect on the next reconnect — either `nmcli connection up`
+      the profile, or simply reboot. Until then the adapter keeps its current randomised MAC and
+      the reservation will not match.
+  when: bazzite_apply | bool
+
+- name: Read the routing table
+  ansible.builtin.command:
+    cmd: ip route show default
+  register: _bz_routes
+  changed_when: false
+
+- name: Note whether ethernet carries a default route
+  ansible.builtin.set_fact:
+    _bz_wired_default: >-
+      {{ _bz_routes.stdout_lines | default([]) | select('search', 'dev (eno|enp)') | list }}
+
+- name: List the WiFi connection PROFILES
+  # Profiles, not devices. `_bz_wifi` above holds DEVICE names (e.g. wlp3s0) because the MAC-pinning
+  # code needs them, but `nmcli connection modify` takes a PROFILE name (usually the SSID) — passing a
+  # device there fails with "unknown connection". One nmcli noun apart, and the failure names the
+  # device you passed, which reads as the device being missing.
+  ansible.builtin.command:
+    cmd: nmcli -t -f NAME,TYPE connection show
+  register: _bz_conn_profiles
+  changed_when: false
+
+- name: Select the WiFi profile names
+  ansible.builtin.set_fact:
+    _bz_wifi_profiles: >-
+      {{ _bz_conn_profiles.stdout_lines | default([])
+         | select('search', ':(802-11-)?wireless$')
+         | map('regex_replace', ':[^:]*$', '') | list }}
+
+# ------------------------------------------------------------------------------------------
+# WIFI ON A WIRED MACHINE. Optional, off by default, because it is only right for a desktop.
+# ------------------------------------------------------------------------------------------
+#
+# WHY A DUAL-HOMED DESKTOP IS A PROBLEM AND NOT JUST REDUNDANCY. With both links up the machine
+# holds an address on BOTH VLANs, and the default-route metric only decides traffic leaving the
+# subnet. Anything on the WiFi VLAN is reached over the DIRECTLY-CONNECTED wireless route, no
+# matter how the default route is weighted.
+#
+# The symptom: a handheld streams from the desktop over WiFi->AP->WiFi with both endpoints
+# sharing one radio, while a 5ms wired path sits unused — both addresses wireless, on a machine
+# with working ethernet. The wired autoconnect priority above does not cover this case.
+#
+# Set to not-autoconnect rather than deleted: the profile and its credentials survive, so
+# restoring it is one nmcli call if the cable is ever pulled.
+
+- name: Report the WiFi plan
+  ansible.builtin.debug:
+    msg: >-
+      {{ 'Disabling' if (bazzite_apply | bool) else 'WOULD disable' }} autoconnect on WiFi
+      profiles ({{ _bz_wifi_profiles | join(', ') }}) because bazzite_disable_wifi is set.
+      The profile is KEPT — re-enable with `nmcli connection modify <name> connection.autoconnect yes`.
+  when:
+    - bazzite_disable_wifi | bool
+    - _bz_wifi_profiles | length > 0
+
+- name: Assert ethernet is actually carrying a route before removing WiFi
+  # THE SAFETY GATE. Disabling the only working link would strand the machine, and this play is
+  # itself running over the network it is about to change. Gated on a wired DEFAULT ROUTE being
+  # present, not merely on the interface being up — a cable in a dead switch port shows UP.
+  ansible.builtin.assert:
+    that:
+      - _bz_wired_default | length > 0
+    fail_msg: >-
+      Refusing to disable WiFi: no wired default route found, so ethernet is not carrying
+      traffic and this would strand the machine. Routes seen:
+      {{ _bz_routes.stdout_lines | default([]) | join(' | ') }}
+    quiet: true
+  when: bazzite_disable_wifi | bool
+
+- name: Disable autoconnect on WiFi profiles
+  ansible.builtin.command:
+    argv:
+      - nmcli
+      - connection
+      - modify
+      - "{{ item }}"
+      - connection.autoconnect
+      - "no"
+  loop: "{{ _bz_wifi_profiles }}"
+  changed_when: true
+  become: true
+  when:
+    - bazzite_apply | bool
+    - bazzite_disable_wifi | bool
+    - _bz_wifi_profiles | length > 0
+
+- name: Bring the WiFi interface down now
+  # The profile change only governs the NEXT connect; the interface stays up until told
+  # otherwise, so the dual-homing would persist until a reboot without this.
+  ansible.builtin.command:
+    argv: [nmcli, connection, down, "{{ item }}"]
+  loop: "{{ _bz_wifi_profiles }}"
+  changed_when: true
+  become: true
+  failed_when: false
+  when:
+    - bazzite_apply | bool
+    - bazzite_disable_wifi | bool
+    - _bz_wifi_profiles | length > 0
+
+- name: Confirm the machine is still reachable and single-homed
+  # Read back over the connection this play is using: if disabling WiFi had broken connectivity,
+  # this task is what fails rather than the play reporting success into a void.
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      printf 'addrs=%s\n'  "$(ip -brief addr show 2>/dev/null | grep -cE '^(eno|enp|wlp).*UP.*[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+')"
+      printf 'wifi_up=%s\n' "$(ip -brief addr show 2>/dev/null | grep -cE '^wlp.*UP.*[0-9]+\.')"
+      printf 'wired=%s\n'   "$(ip route show default 2>/dev/null | grep -cE 'dev (eno|enp)')"
+  register: _bz_wifi_after
+  changed_when: false
+  when:
+    - bazzite_apply | bool
+    - bazzite_disable_wifi | bool
+
+- name: Assert the box is on ethernet only
+  ansible.builtin.assert:
+    that:
+      - "'wifi_up=0' in _bz_wifi_after.stdout"
+      - "'wired=0' not in _bz_wifi_after.stdout"
+    fail_msg: >-
+      WiFi teardown did not leave a clean single-homed machine:
+      {{ _bz_wifi_after.stdout_lines | default([]) | join(' ') }}
+    quiet: true
+  when:
+    - bazzite_apply | bool
+    - bazzite_disable_wifi | bool

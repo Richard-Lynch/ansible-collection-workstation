@@ -1,0 +1,85 @@
+---
+# ENTRYPOINT: is an update running, how far along, and how much is it pulling?
+#
+# WHY THIS EXISTS SEPARATELY FROM `image`. The image entrypoint reports the deployment and can
+# stage an update. This answers a different question, asked WHILE one is in flight: is something
+# happening right now, how big is it, and should I wait or go and plug in an ethernet cable.
+#
+# That question comes up every time — an rpm-ostree pull gives no progress output through
+# Ansible, and "is it stuck or is it working" is unanswerable from the outside. Rather than
+# hand-running `systemctl is-active` over SSH each time, it lives here.
+#
+# Writes nothing. Safe at any time, including mid-update — that is the point.
+
+- name: Apply role defaults
+  ansible.builtin.include_tasks: setup_vars.yml
+
+- name: Read the update services
+  # noqa: command-instead-of-module — reads the state of several units at once; the systemd
+  # module manages one unit and cannot enumerate.
+  ansible.builtin.command:
+    cmd: "systemctl is-active uupd.service rpm-ostreed.service rpm-ostreed-automatic.service"
+  register: _bz_units
+  changed_when: false
+  failed_when: false
+
+- name: Measure the ostree repository
+  # The repo grows as objects are pulled, so two readings a few seconds apart show whether a
+  # download is actually progressing. A single number cannot distinguish "downloading" from
+  # "hung", which is exactly the ambiguity being resolved.
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      du -sb /sysroot/ostree/repo 2>/dev/null | awk '{print $1}' || echo 0
+  register: _bz_repo_a
+  changed_when: false
+  become: true
+
+- name: Wait a moment
+  ansible.builtin.pause:
+    seconds: "{{ bazzite_status_sample_seconds | int }}"
+
+- name: Measure it again
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      du -sb /sysroot/ostree/repo 2>/dev/null | awk '{print $1}' || echo 0
+  register: _bz_repo_b
+  changed_when: false
+  become: true
+
+- name: Read the deployment list
+  ansible.builtin.command:
+    cmd: rpm-ostree status --json
+  register: _bz_st
+  changed_when: false
+
+- name: Report
+  ansible.builtin.debug:
+    msg: "{{ _report.splitlines() }}"
+  vars:
+    _deps: "{{ (_bz_st.stdout | from_json).deployments | default([]) }}"
+    _delta: "{{ (_bz_repo_b.stdout | int) - (_bz_repo_a.stdout | int) }}"
+    _rate: "{{ ((_delta | int) / (bazzite_status_sample_seconds | int) / 1000000) | round(2) }}"
+    _busy: "{{ 'activating' in _bz_units.stdout or 'active' in _bz_units.stdout }}"
+    _report: |
+      update services : {{ _bz_units.stdout_lines | join(', ') }}
+      ostree repo     : {{ ((_bz_repo_b.stdout | int) / 1000000000) | round(2) }} GB
+      growth          : {{ ((_delta | int) / 1000000) | round(1) }} MB in {{ bazzite_status_sample_seconds }}s
+                        ({{ _rate }} MB/s)
+      deployments     : {{ _deps | length }}
+      {% for d in _deps %}
+        {{ '*' if d.booted | default(false) else ' ' }} {{ d.version | default('?') }}  {{ (d.checksum | default(''))[:12] }}
+      {% endfor %}
+
+      {{ 'A PULL IS IN PROGRESS — the repo is growing. Leave it alone.'
+         if (_delta | int) > 1000000
+         else ('Services report busy but the repo is NOT growing. Either it is unpacking/verifying
+                (normal, can take minutes) or it is stalled — re-run to compare.'
+               if _busy else 'Idle. Nothing is downloading.') }}
+
+      {{ 'A second deployment is staged — the update has downloaded and needs a REBOOT.'
+         if (_deps | length) > 1 and ((_deps[0].version | default('')) != (_deps[1].version | default('')))
+         else '' }}

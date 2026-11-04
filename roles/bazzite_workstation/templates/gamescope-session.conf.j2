@@ -1,0 +1,67 @@
+# {{ ansible_managed }}
+#
+# Game Mode (gamescope) session environment, read by gamescope-session-plus from
+# ~/.config/environment.d/*.conf.
+#
+# WHY THIS FILE EXISTS SEPARATELY FROM 50-iaac-hdr.conf. HDR is a streaming/display preference
+# owned by the `sunshine` entrypoint; these are properties of the SESSION itself — which output
+# it drives and how many X displays it runs. Mixing them put session config in a file named for
+# HDR, under an entrypoint about game streaming, which is where it goes unnoticed.
+#
+# THE SUPPORTED OVERRIDE POINT. gamescope-session-plus assigns these with `:=` defaults:
+#
+#     : "${OUTPUT_CONNECTOR:=*,eDP-1}"
+#     : "${XWAYLAND_COUNT:=2}"
+#     ...
+#     --prefer-output $OUTPUT_CONNECTOR \
+#     --xwayland-count $XWAYLAND_COUNT \
+#
+# `:=` means "use the environment if set", so exporting them here changes the argv without
+# touching the script under /usr — which an image update would revert anyway.
+
+# ---------------------------------------------------------------------------------------------
+# WHICH OUTPUT GAME MODE DRIVES
+# ---------------------------------------------------------------------------------------------
+# The image default is `*,eDP-1` — a wildcard, then a LAPTOP INTERNAL PANEL. That is correct for
+# a Steam Deck and wrong on a desktop, where eDP-1 does not exist; this machine declares
+# {{ bazzite_gamescope_output }}.
+#
+# With one display the `*` wildcard happens to match it first. That is a coincidence, not a
+# configuration: plug in a second display and which output Game Mode claims becomes
+# order-dependent. (It is NOT the cause of the black screen below, but an ambiguous output is
+# worth removing.)
+#
+# Naming the connector explicitly makes it deterministic.
+{% if 'OUTPUT_CONNECTOR' in _bz_gs_overrides %}OUTPUT_CONNECTOR={{ _bz_gs_overrides['OUTPUT_CONNECTOR'] }}
+{% else %}# OUTPUT_CONNECTOR: image default ({{ bazzite_gamescope_output }}), not set here
+{% endif %}
+
+# ---------------------------------------------------------------------------------------------
+# HOW MANY XWAYLAND SERVERS
+# ---------------------------------------------------------------------------------------------
+# The image default is 2, and the second server is what Steam Remote Play renders a nested
+# session into. That server can cause a recurring black screen: launching a game via Remote Play
+# moves presentation to the nested server #1, and when the stream ends nothing moves it back,
+# while gamescope keeps trying to open input devices that no longer exist.
+#
+# The symptom triad follows from that: the TV still shows server #0, which has nothing presenting
+# to it (black); audio never went through the display (fine); gamescope draws its own overlay
+# outside the app layer (visible). A later Remote Play launch "does nothing" because it goes to the
+# orphaned server #1. Nothing CRASHES, so nothing self-heals: only a session restart clears it.
+#
+# A TV hotplug is a plausible alternative mechanism; the kernel log tells them apart (no HDMI
+# hotplug, disconnect, re-train or EDID change means the link never dropped).
+#
+{% if 'XWAYLAND_COUNT' in _bz_gs_overrides %}XWAYLAND_COUNT={{ _bz_gs_overrides['XWAYLAND_COUNT'] }}
+{% else %}# XWAYLAND_COUNT: image default ({{ bazzite_gamescope_xwayland_count }}), not set here
+{% endif %}
+
+# ---------------------------------------------------------------------------------------------
+# ONE SERVER BREAKS EVERY GAME LAUNCH, and why there is no override here
+# ---------------------------------------------------------------------------------------------
+# Bazzite's sessions.d/steam:68 exports STEAM_MULTIPLE_XWAYLANDS=1, and Steam then launches every
+# game on DISPLAY=:1. With XWAYLAND_COUNT=1 that display does not exist (only X0), so no game can
+# open a window (Proton and native builds alike are handed :1). Exporting
+# STEAM_MULTIPLE_XWAYLANDS=0 from this file does NOT help: the client's env reads 0 and the next
+# launch still gets DISPLAY=:1. So the count stays at
+# the image default of 2, and any fix for the orphaned-server fault above must keep :1 alive.

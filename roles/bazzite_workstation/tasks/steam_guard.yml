@@ -1,0 +1,142 @@
+---
+# ENTRYPOINT: the Steam guard — a watchdog that restarts a DEAD Game Mode Steam, plus an endpoint
+# the Steam Deck tile calls to restart it on request.
+#
+#   bazzite_action=steam_guard                     (report)
+#   bazzite_action=steam_guard bazzite_apply=true  (install)
+#
+# WHY. A streaming client can lose sight of the host while the machine is awake and Steam is
+# running: a stuck game launch holds the host, or Steam dies outright. Fixing either from a
+# controller with a full Ansible run is the wrong shape for "sitting on the sofa with a handheld".
+#
+# TWO DIFFERENT FAILURES, TWO DIFFERENT CONTROLS, and the split is the design:
+#
+#   Steam DEAD (client / web helper gone, Remote Play discovery closed)
+#       -> the WATCHDOG restarts the session by itself. Nobody is playing a dead Steam, so the
+#          restart costs nothing. Capped at bazzite_steam_guard_max_restarts per
+#          bazzite_steam_guard_window (default: 6 in 3 hours) so a fault that a restart
+#          cannot fix does not become a restart loop.
+#
+#   A game STUCK holding the host
+#       -> a TILE on the Deck, pressed by a human. Not automated, because a stuck launch and a
+#          paused game are indistinguishable from outside (GPU busy reads about the same either
+#          way), and auto-killing a paused game loses progress.
+#
+# OBSERVE BEFORE ENFORCE. bazzite_steam_guard_mode defaults to `observe`: the watchdog logs
+# "WOULD RESTART" and acts on nothing, while the endpoint still honours an explicit tile press.
+# Run it in observe mode until the journal shows it judging real state correctly, then set
+# `enforce` in inventory.
+#
+# KNOWN GAP — THE CONTROLLER SETUP SCREEN. A restart that coincides with a Steam client
+# self-update can land on SteamOS's "connect your controller" step, which only
+# a controller press advances. The guard does not see that screen: Steam is running and Remote
+# Play is listening, so it reads as healthy. Recorded rather than papered over.
+
+- name: Apply role defaults
+  ansible.builtin.include_tasks: setup_vars.yml
+
+- name: Assert the allowlist is declared
+  # INVENTORY CONFIG: which clients may restart Steam is a property of the network it runs on,
+  # so it has no role default. An empty list would leave the endpoint answering only localhost —
+  # which is safe, but would make the tile fail with a 403 for a reason nobody would guess.
+  ansible.builtin.assert:
+    that:
+      - bazzite_steam_guard_allow | length > 0
+      - bazzite_steam_guard_allow | select('match', '^\d{1,3}(\.\d{1,3}){3}$') | list | length == bazzite_steam_guard_allow | length
+    fail_msg: >-
+      Declare bazzite_steam_guard_allow in inventory: the exact IPv4 addresses allowed to call the
+      restart endpoint (for example a handheld's reserved WiFi and dock addresses). Got
+      {{ bazzite_steam_guard_allow }}.
+    quiet: true
+
+- name: Read the current guard state
+  # Through the guard's own endpoint, from the box itself (127.0.0.1 is always allowed). This is
+  # what it ACTUALLY sees, rather than whether its unit file is present.
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ bazzite_steam_guard_port }}/healthz"
+    return_content: true
+    timeout: 5
+  register: _bz_guard_before
+  failed_when: false
+  changed_when: false
+
+- name: Report
+  ansible.builtin.debug:
+    msg:
+      - >-
+        Guard currently: {{ (_bz_guard_before.content | from_json)
+        if (_bz_guard_before.status | default(0)) == 200 else 'NOT RUNNING (status '
+        ~ (_bz_guard_before.status | default('no response') | string) ~ ')' }}
+      - >-
+        Would install: mode={{ bazzite_steam_guard_mode }} port={{ bazzite_steam_guard_port }}
+        allow={{ bazzite_steam_guard_allow | join(',') }}
+        max={{ bazzite_steam_guard_max_restarts }} per {{ bazzite_steam_guard_window }}s,
+        acting after {{ bazzite_steam_guard_unhealthy_for }}s of sustained failure.
+      - "{{ 'Set bazzite_apply=true to install.' if not (bazzite_apply | bool) else 'INSTALLING.' }}"
+
+- name: Install the guard
+  when: bazzite_apply | bool
+  block:
+    - name: Ensure the local bin directory exists
+      ansible.builtin.file:
+        path: "{{ bazzite_steam_guard_path | dirname }}"
+        state: directory
+        mode: "0755"
+
+    - name: Install the guard script
+      ansible.builtin.copy:
+        src: steam_guard.py
+        dest: "{{ bazzite_steam_guard_path }}"
+        mode: "0755"
+      register: _bz_guard_script
+
+    - name: Create the user unit directory
+      ansible.builtin.file:
+        path: "{{ ansible_env.HOME }}/.config/systemd/user"
+        state: directory
+        mode: "0755"
+
+    - name: Install the guard unit
+      ansible.builtin.template:
+        src: steam-guard.service.j2
+        dest: "{{ ansible_env.HOME }}/.config/systemd/user/{{ bazzite_steam_guard_unit }}"
+        mode: "0644"
+      register: _bz_guard_unit
+
+    - name: Enable and start the guard
+      # Restarting the GUARD never touches Steam: it only re-reads its config. Its first action
+      # after any start is a startup_grace hold, so a fresh guard cannot restart anything for
+      # bazzite_steam_guard_startup_grace seconds even in enforce mode.
+      ansible.builtin.systemd_service:
+        name: "{{ bazzite_steam_guard_unit }}"
+        scope: user
+        enabled: true
+        # Reload only when the unit file changed — folded in here rather than a separate task.
+        daemon_reload: "{{ _bz_guard_unit is changed }}"
+        state: "{{ 'restarted' if (_bz_guard_unit is changed or _bz_guard_script is changed) else 'started' }}"
+
+    - name: Read the guard back through its own endpoint
+      # Proves the process is listening AND judging live state — not merely that the unit is
+      # active. Retries because the first observation lands one interval after start.
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ bazzite_steam_guard_port }}/healthz"
+        return_content: true
+        timeout: 5
+      register: _bz_guard_after
+      until: >-
+        (_bz_guard_after.status | default(0)) == 200
+        and (_bz_guard_after.content | from_json).verdict != 'starting'
+      retries: 12
+      delay: 5
+      changed_when: false
+
+    - name: The guard must be up and in the declared mode
+      ansible.builtin.assert:
+        that:
+          - _guard.mode == bazzite_steam_guard_mode
+          - _guard.verdict in ['idle', 'healthy', 'grace', 'waiting', 'rate_limited']
+        fail_msg: "Guard not serving the declared state: {{ _guard }}"
+        success_msg: "Guard running: {{ _guard }}"
+        quiet: true
+      vars:
+        _guard: "{{ _bz_guard_after.content | from_json }}"

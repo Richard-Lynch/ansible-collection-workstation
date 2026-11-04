@@ -1,0 +1,231 @@
+---
+# ENTRYPOINT: make suspend IMPOSSIBLE at the systemd level, or hand control back.
+#
+# WHY THIS EXISTS AND `power` IS NOT ENOUGH. `power` writes powerdevilrc, which is KDE's power
+# daemon. On the GAME MODE image (bazzite-deck)
+# powerdevil DOES NOT RUN — the session is gamescope, not Plasma. powerdevilrc can read
+# AutoSuspendAction=0 (suspend disabled) with no powerdevil process to honour it, and the machine
+# suspends anyway. `power` would run green, pass its own read-back assert, and change nothing
+# about whether it sleeps.
+#
+# WHY NOT FIX IT AT THE REAL REQUESTER INSTEAD. Because it is not reachable. Two suspend paths exist
+# on this image, and neither can be converged from the filesystem:
+#
+#   1. Steam Game Mode's own idle auto-suspend. Verified absent from every on-disk store —
+#      localconfig.vdf, registry.vdf, steam.cfg — because Steam keeps it in CLOUD-SYNCED user
+#      settings. There is no file to template and no CLI to call. (Its default is one hour:
+#      suspends land almost exactly an hour after the preceding wake.)
+#   2. HDMI-CEC via cecd, which holds a logind sleep inhibitor labelled "Put TV to sleep".
+#      On a desktop Radeon it is inert — see the note below — but on hardware with a real CEC
+#      adapter it is a genuine second path.
+#
+# So the only place that catches EVERY requester is the layer they all pass through: logind's
+# sleep targets. Masking them is a blunt instrument, and that is precisely the property wanted —
+# it does not care who asks or which desktop stack is live.
+#
+# WHAT THIS IS FOR. A machine that must stay reachable: Wake-on-LAN not yet working, a headless
+# streaming host, anything where "it went to sleep" means "it is gone until someone walks over to
+# it".
+#
+# THE COST, stated plainly because masking sleep is not free: the machine draws full idle power
+# forever and will never suspend for any reason, including a deliberate menu choice or a lid
+# close. That is why bazzite_sleep_inhibit defaults to FALSE and is opt-in per host in inventory.
+#
+# REVERSIBILITY IS THE POINT. This entrypoint is declarative in BOTH directions: with
+# bazzite_sleep_inhibit=false it UNMASKS, so the same action that applied the hammer also puts it
+# away. Nothing here is one-way, and the read-back proves whichever direction was asked for.
+#
+# WHY `mask` AND NOT `systemd-inhibit` OR sleep.conf. A logind inhibitor lives only as long as the
+# process holding it, so it dies with the session and silently stops protecting anything —
+# exactly the shape of failure this repo bans. AllowSuspend=no in sleep.conf is honoured by logind
+# but NOT by a direct `systemctl suspend`, so it is a partial guard that reads as total. Masking
+# the targets is the one form that is both persistent across reboots and total.
+
+- name: Apply role defaults
+  ansible.builtin.include_tasks: setup_vars.yml
+
+# The full set, not just suspend.target. hibernate and hybrid-sleep reach the same hardware state
+# by a different target, so masking only `suspend.target` leaves two open doors — and
+# suspend-then-hibernate starts as a suspend, so it is caught here too.
+- name: Note which sleep targets this manages
+  ansible.builtin.set_fact:
+    _bz_sleep_units:
+      - sleep.target
+      - suspend.target
+      - hibernate.target
+      - hybrid-sleep.target
+      - suspend-then-hibernate.target
+
+- name: Read the current mask state
+  # `systemctl is-enabled` reports `masked` for a masked unit and `static` for these targets
+  # otherwise. Read BEFORE anything is changed, so the report can say what would move and the
+  # change detection below is honest rather than assumed.
+  ansible.builtin.command:
+    cmd: systemctl is-enabled {{ _bz_sleep_units | join(' ') }} # noqa: command-instead-of-module
+  register: _bz_sleep_before
+  changed_when: false
+  failed_when: false
+
+- name: Report the plan
+  ansible.builtin.debug:
+    msg: "{{ _report.splitlines() | select('string') | list }}"
+  vars:
+    # zip against the unit list: is-enabled emits one line per unit, in the order asked.
+    _have: "{{ dict(_bz_sleep_units | zip(_bz_sleep_before.stdout_lines | default([]))) }}"
+    _want: "{{ 'masked' if bazzite_sleep_inhibit | bool else 'static' }}"
+    _drift: "{{ _have | dict2items | rejectattr('value', 'equalto', _want) | map(attribute='key') | list }}"
+    _report: |
+      ===== SLEEP INHIBIT =====
+      {% for u in _bz_sleep_units %}
+      {{ '%-32s' | format(u) }} have={{ '%-7s' | format(_have[u] | default('?')) }} want={{ _want }}{{ '   <-- would change' if (_have[u] | default('?')) != _want else '' }}
+      {% endfor %}
+
+      intent: {{ 'SUSPEND DISABLED — the machine cannot sleep, whatever asks'
+                 if bazzite_sleep_inhibit | bool
+                 else 'suspend PERMITTED — sleep targets unmasked, normal behaviour restored' }}
+      {{ '-> converging' if (bazzite_apply | bool) and (_drift | length) > 0
+         else ('-> already converged, nothing to do' if (_drift | length) == 0
+               else '-> WOULD change ' ~ (_drift | join(', ')) ~ ' — re-run with bazzite_apply=true') }}
+
+- name: Converge the sleep targets
+  # become: root — masking is a system-level change and the Ansible user has passwordless sudo
+  # (bazzite_action=sudoers). `masked` and `static` are the two states `is-enabled` reports for
+  # these units, so the enabled/masked pair below round-trips cleanly.
+  #
+  # ansible.builtin.systemd_service, NOT a `systemctl mask` command: the module is declarative and
+  # idempotent, which is what makes re-running this safe and the changed count honest.
+  ansible.builtin.systemd_service:
+    name: "{{ _unit }}"
+    masked: "{{ bazzite_sleep_inhibit | bool }}"
+  loop: "{{ _bz_sleep_units }}"
+  loop_control:
+    loop_var: _unit
+  become: true
+  when: bazzite_apply | bool
+
+- name: Read the mask state back
+  # INDEPENDENT read-back, not a re-inspection of the module's own result. This is what logind
+  # will consult, and it is the only statement worth making about whether the machine can sleep.
+  ansible.builtin.command:
+    cmd: systemctl is-enabled {{ _bz_sleep_units | join(' ') }} # noqa: command-instead-of-module
+  register: _bz_sleep_after
+  changed_when: false
+  failed_when: false
+  when: bazzite_apply | bool
+
+- name: Assert the sleep targets are in the declared state
+  # Gates on EVERY unit, not just suspend.target: a run that masked four of five would otherwise
+  # report success while leaving hibernate as a live path to the same "machine is gone" outcome.
+  ansible.builtin.assert:
+    that:
+      - _actual | unique == [_want]
+    fail_msg: >-
+      Sleep targets did not converge. want={{ _want }} actual={{ dict(_bz_sleep_units | zip(_actual)) }}.
+      A target still reading `static` can be reached by logind, so the machine can still suspend.
+    success_msg: >-
+      {{ 'Suspend is now IMPOSSIBLE: ' if bazzite_sleep_inhibit | bool else 'Suspend is now permitted again: ' }}
+      all {{ _bz_sleep_units | length }} sleep targets read `{{ _want }}`.
+    quiet: true
+  vars:
+    _want: "{{ 'masked' if bazzite_sleep_inhibit | bool else 'static' }}"
+    _actual: "{{ _bz_sleep_after.stdout_lines | default([]) }}"
+  when: bazzite_apply | bool
+
+- name: Prove it against logind, not just against the unit files
+  # THE FUNCTIONAL TEST, and the reason this entrypoint does not stop at the assert above. A unit
+  # file reading `masked` is a statement about the filesystem; `CanSuspend` is logind's OWN answer
+  # to the question the machine actually cares about. They can disagree — logind caches, and a
+  # future systemd could treat a masked target differently — so the only honest proof is to ask
+  # the thing that performs the suspend.
+  #
+  # `challenge` is the normal answer for a permitted-but-authorised suspend on a seat, so it is
+  # accepted alongside `yes`; the masked answer is `no`.
+  #
+  # `busctl call`, NOT `busctl get-property`: CanSuspend is a METHOD on the Manager interface, not
+  # a property. get-property fails with "Unknown interface ... or property CanSuspend" and returns
+  # an EMPTY stdout — which a check looking for 'no' reads as "not masked", i.e. it reports failure
+  # on a machine that masked correctly: all five targets read `masked` and the check still fails. The rc/emptiness guards in the
+  # assert below exist so a broken read can never again be mistaken for an answer.
+  ansible.builtin.command:
+    cmd: busctl call org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager CanSuspend
+  register: _bz_can_suspend
+  changed_when: false
+  failed_when: false
+  when: bazzite_apply | bool
+
+- name: Assert logind agrees the machine cannot suspend
+  ansible.builtin.assert:
+    that:
+      - (_bz_sleep_inhibit_expected and '"no"' in _bz_can_suspend.stdout)
+        or ((not _bz_sleep_inhibit_expected) and '"no"' not in _bz_can_suspend.stdout)
+    fail_msg: >-
+      The unit files converged but logind disagrees: CanSuspend={{ _bz_can_suspend.stdout | trim }}
+      while bazzite_sleep_inhibit={{ bazzite_sleep_inhibit }}. The mask is not having the effect it
+      claims — do NOT trust this machine to stay awake (or to be able to sleep) on the strength of
+      the unit files alone. rc={{ _bz_can_suspend.rc | default('?') }}
+      stderr={{ _bz_can_suspend.stderr | default('') | trim }}
+    success_msg: >-
+      logind confirms CanSuspend={{ _bz_can_suspend.stdout | trim }}, which matches
+      bazzite_sleep_inhibit={{ bazzite_sleep_inhibit }}.
+    quiet: true
+  vars:
+    _bz_sleep_inhibit_expected: "{{ bazzite_sleep_inhibit | bool }}"
+  when: bazzite_apply | bool
+
+- name: Report the result
+  ansible.builtin.debug:
+    msg:
+      - "sleep targets: {{ dict(_bz_sleep_units | zip(_bz_sleep_after.stdout_lines | default([]))) }}"
+      - "logind CanSuspend: {{ _bz_can_suspend.stdout | default('') | trim }}"
+      - >-
+        {{ 'This machine can no longer suspend by ANY route — Steam Game Mode idle, HDMI-CEC, a
+        menu choice or `systemctl suspend` alike. Reverse it by setting bazzite_sleep_inhibit=false
+        in inventory and re-running this action; nothing here is one-way.'
+           if bazzite_sleep_inhibit | bool
+           else 'Sleep is permitted again. NOTE the machine may now suspend on Steam Game Mode
+           idle (Settings -> Power -> Sleep after; IdleSuspendACSeconds in config.vdf, checked
+           below when bazzite_steam_idle_suspend_ac_seconds is declared).' }}
+  when: bazzite_apply | bool
+
+# ---------------------------------------------------------------------------------------------
+# STEAM'S OWN IDLE SLEEP. Masking the targets makes a suspend IMPOSSIBLE; it does not stop Steam
+# ASKING. And Steam's UI prepares for the suspend before it asks — so every refused request
+# leaves its main page black until Steam restarts. Steam's idle timer is the usual requester:
+# "Sleep after" defaults to 1 hour, stored as IdleSuspendACSeconds in config.vdf — and ABSENT from the
+# file while it held the default, which makes it look cloud-only.
+#
+# Checked, not written: Steam rewrites config.vdf from memory, so a file edit while it runs is
+# lost. Drift fails the run with the remedy; an alert on refused suspends, where one exists, covers
+# the time until someone acts.
+# ---------------------------------------------------------------------------------------------
+
+- name: Read Steam's idle-sleep setting (IdleSuspendACSeconds) from config.vdf
+  # ONE key, matched by name: config.vdf also holds account data, which is never printed.
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      f="$HOME/.local/share/Steam/config/config.vdf"
+      [ -r "$f" ] || { echo "nofile"; exit 0; }
+      v=$(grep -oE '"IdleSuspendACSeconds"[[:space:]]+"[0-9]+"' "$f" | grep -oE '[0-9]+"$' | tr -d '"' | tail -1 || true)
+      echo "${v:-absent}"
+  register: _bz_idle_suspend
+  changed_when: false
+  when: (bazzite_steam_idle_suspend_ac_seconds | int) >= 0
+
+- name: Assert Steam's idle sleep matches the declaration
+  ansible.builtin.assert:
+    that:
+      - "_bz_idle_suspend.stdout | trim == (bazzite_steam_idle_suspend_ac_seconds | string)"
+    fail_msg: >-
+      Steam's "Sleep after" is {{ _bz_idle_suspend.stdout | trim }}
+      {{ '(the key is ABSENT, so Steam uses its default of 3600 s — 1 hour)'
+         if _bz_idle_suspend.stdout | trim == 'absent' else 'seconds' }}, declared
+      {{ bazzite_steam_idle_suspend_ac_seconds }}. With the sleep targets masked, every idle sleep
+      Steam attempts is refused and leaves its main page black. Fix it on the TV: Steam ->
+      Settings -> Power -> Sleep after -> {{ 'Disabled' if (bazzite_steam_idle_suspend_ac_seconds | int) == 0 else bazzite_steam_idle_suspend_ac_seconds ~ ' s' }}.
+      It cannot be written from here (Steam rewrites config.vdf from memory).
+    success_msg: >-
+      Steam's IdleSuspendACSeconds is {{ _bz_idle_suspend.stdout | trim }}, as declared.
+    quiet: true
+  when: (bazzite_steam_idle_suspend_ac_seconds | int) >= 0

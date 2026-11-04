@@ -1,0 +1,273 @@
+---
+- name: Verify
+  hosts: localhost
+  # Facts on, and the role resolved HERE rather than relying on converge.yml's set_facts:
+  # molecule runs converge and verify as separate ansible-playbook invocations, so host facts do
+  # not survive between them. Resolving the role's real setup_vars.yml in this play is both the
+  # fix and the point — the assertions below run against the ROLE'S derivation, not a copy.
+  gather_facts: true
+
+  vars:
+    # The three required options. Using `tasks_from:` BYPASSES argspec validation
+    # (argument_specs.yml declares only the `main` entrypoint), so these must be set deliberately
+    # — otherwise they fail as bare undefined and the failure reads as a broken role.
+    bazzite_hostname: molecule-host
+    bazzite_sudo_user: molecule
+    bazzite_image_variant: bazzite-deck
+    # The Steam guard's allowlist has no usable default (inventory config); set as inventory would.
+    bazzite_steam_guard_allow: [192.0.2.4, 198.51.100.4]
+
+    # Fixtures shaped like real `rpm-ostree status --json` output. Only the fields the logic reads
+    # are present; rpm-ostree emits many more and the role must not depend on them.
+    _declared: ostree-image-signed:docker://ghcr.io/ublue-os/bazzite-deck:stable
+    _desktop: ostree-image-signed:docker://ghcr.io/ublue-os/bazzite:stable
+
+    _fixtures:
+      # Already running the declared deck image.
+      converged:
+        deployments:
+          - {booted: true, version: "44.20000102", container-image-reference: "{{ _declared }}"}
+      # Rebase staged, not yet rebooted into. rpm-ostree marks it `staged`.
+      awaiting:
+        deployments:
+          - {staged: true, version: "44.20000102", container-image-reference: "{{ _declared }}"}
+          - {booted: true, version: "44.20000101", container-image-reference: "{{ _desktop }}"}
+      # Genuine drift: running the desktop image while deck is declared. Also THE SUBSTRING CASE.
+      drifted:
+        deployments:
+          - {staged: true, version: "44.20000102", container-image-reference: "{{ _desktop }}"}
+          - {booted: true, version: "44.20000101", container-image-reference: "{{ _desktop }}"}
+
+  tasks:
+    - name: Resolve the role's defaults and derive the image references
+      # The ROLE'S OWN file. Re-deriving the refspec in this scenario would make the test a
+      # tautology that asserts the copy against itself (MOLMIRROR-02).
+      ansible.builtin.include_role:
+        name: bazzite_workstation
+        tasks_from: setup_vars
+
+    - name: Name the derived values the assertions read
+      ansible.builtin.set_fact:
+        molecule_image_ref: "{{ bazzite_image_ref }}"
+        molecule_image_refspec: "{{ bazzite_image_refspec }}"
+        molecule_rebase_confirm: "{{ bazzite_rebase_confirm }}"
+        molecule_login_mode: "{{ bazzite_login_mode }}"
+        molecule_hw_units: "{{ bazzite_deck_hw_units }}"
+        molecule_generic_units: "{{ bazzite_deck_generic_units }}"
+
+    # ---------------------------------------------------------------------------------------
+    # The role's own derivation
+    # ---------------------------------------------------------------------------------------
+    - name: The image reference is built from registry, variant and tag
+      ansible.builtin.assert:
+        that:
+          - molecule_image_ref == 'ghcr.io/ublue-os/bazzite-deck:stable'
+        fail_msg: "derived ref was '{{ molecule_image_ref }}'"
+        quiet: true
+
+    - name: The refspec keeps the signed transport
+      # A bare `docker://` ref rebases successfully with sigstore verification silently dropped,
+      # so this prefix is the difference between a verified image and an unverified one.
+      ansible.builtin.assert:
+        that:
+          - molecule_image_refspec is match('^ostree-image-signed:docker://')
+          - molecule_image_refspec == _declared
+        fail_msg: "derived refspec was '{{ molecule_image_refspec }}'"
+        quiet: true
+
+    - name: Replacing the OS is off by default
+      # bazzite_apply is the role's universal write flag; replacing the operating system needs its
+      # own confirmation, so a routine `all` run can never swap the image.
+      ansible.builtin.assert:
+        that:
+          - not (molecule_rebase_confirm | bool)
+          - molecule_login_mode == 'desktop'
+        fail_msg: >-
+          rebase_confirm={{ molecule_rebase_confirm }} login_mode={{ molecule_login_mode }}
+        quiet: true
+
+    - name: The two Deck daemon lists are disjoint
+      # They carry OPPOSITE expectations — one list is masked, the other asserted healthy — so a
+      # unit in both would be masked and then required to be running.
+      ansible.builtin.assert:
+        that:
+          - molecule_hw_units | intersect(molecule_generic_units) | length == 0
+          - "'inputplumber' not in molecule_hw_units"
+          - "'jupiter-fan-control' not in molecule_generic_units"
+        fail_msg: "hw={{ molecule_hw_units }} generic={{ molecule_generic_units }}"
+        quiet: true
+
+    # ---------------------------------------------------------------------------------------
+    # The convergence classification, applied to each deployment state exactly as rebase.yml does
+    # ---------------------------------------------------------------------------------------
+    - name: Classify every fixture
+      ansible.builtin.set_fact:
+        _seen: >-
+          {{ _seen | default({}) | combine({_name: {
+               'on_declared': _on,
+               'staged_declared': _sd,
+               'rebase_needed': (not _on) and (not _sd),
+               'awaiting_reboot': (not _on) and _sd}}) }}
+      vars:
+        _name: "{{ item.key }}"
+        _booted: >-
+          {{ (item.value.deployments | selectattr('booted', 'defined') | selectattr('booted')
+              | list | first | default({})) }}
+        _staged: >-
+          {{ (item.value.deployments | selectattr('staged', 'defined') | selectattr('staged')
+              | list | first | default({})) }}
+        _on: "{{ (_booted['container-image-reference'] | default('')) == molecule_image_refspec }}"
+        _sd: "{{ (_staged['container-image-reference'] | default('')) == molecule_image_refspec }}"
+      loop: "{{ _fixtures | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+
+    - name: A converged machine needs no rebase and is not awaiting a reboot
+      ansible.builtin.assert:
+        that:
+          - _seen.converged.on_declared | bool
+          - not (_seen.converged.rebase_needed | bool)
+          - not (_seen.converged.awaiting_reboot | bool)
+        fail_msg: "converged fixture classified {{ _seen.converged }}"
+        quiet: true
+
+    - name: A staged-but-unbooted machine is AWAITING REBOOT, not drifted
+      # Without this third state a re-run between staging and rebooting re-executes the entire
+      # multi-GB pull against a machine that has already staged exactly the right image.
+      ansible.builtin.assert:
+        that:
+          - not (_seen.awaiting.on_declared | bool)
+          - _seen.awaiting.staged_declared | bool
+          - not (_seen.awaiting.rebase_needed | bool)
+          - _seen.awaiting.awaiting_reboot | bool
+        fail_msg: "awaiting fixture classified {{ _seen.awaiting }}"
+        quiet: true
+
+    - name: A drifted machine needs a rebase — THE SUBSTRING CASE
+      # 'bazzite' IS a substring of 'bazzite-deck'. A naive `'bazzite' in ref` test would call
+      # this fixture converged and never rebase it; testing the other way round would call a
+      # genuinely converged deck machine drifted forever. Exact comparison is what makes both
+      # directions correct, and the next assertion proves the substring relation really holds —
+      # so this test would actually fail if the role regressed to `in`.
+      ansible.builtin.assert:
+        that:
+          - not (_seen.drifted.on_declared | bool)
+          - not (_seen.drifted.staged_declared | bool)
+          - _seen.drifted.rebase_needed | bool
+          - not (_seen.drifted.awaiting_reboot | bool)
+        fail_msg: "drifted fixture classified {{ _seen.drifted }}"
+        quiet: true
+
+    - name: Prove the substring hazard is real, so the test above cannot be vacuous
+      # If this ever stops being true the variant names have changed and the exact-match reasoning
+      # needs revisiting.
+      ansible.builtin.assert:
+        that:
+          - "'bazzite' in 'bazzite-deck'"
+          - molecule_image_refspec != _desktop
+        fail_msg: "the bazzite/bazzite-deck substring relation no longer holds"
+        quiet: true
+
+    - name: The sleep_inhibit default is OFF, so the role never masks sleep uninvited
+      # The value that matters most about this option is its DEFAULT. Masking sleep is a real
+      # power cost and a behaviour change, so a host that has not opted in must be left alone —
+      # and `all` runs sleep_inhibit on every host, which is only safe while this holds.
+      ansible.builtin.assert:
+        that:
+          - not (bazzite_sleep_inhibit | bool)
+        fail_msg: >-
+          bazzite_sleep_inhibit defaults to {{ bazzite_sleep_inhibit }}, not false. `all` runs
+          this entrypoint on every host, so a true default would mask sleep on machines that
+          never asked for it.
+        quiet: true
+
+    - name: The want-state mapping is not reversed, in EITHER direction
+      # The entrypoint's whole contract is that it is declarative both ways: true -> masked,
+      # false -> static. A reversed mapping would still "converge" and would still pass a
+      # read-back that used the same reversed expression, so it is asserted here against literal
+      # expected values rather than against the role's own expression.
+      #
+      # Written as two cases so a mapping that is right in one direction and wrong in the other
+      # (the shape that makes an unmask silently do nothing) cannot pass.
+      ansible.builtin.assert:
+        that:
+          - _want_when_on == 'masked'
+          - _want_when_off == 'static'
+        fail_msg: >-
+          sleep want-state mapping is wrong: on->{{ _want_when_on }} off->{{ _want_when_off }}.
+          Expected on->masked off->static; a reversed mapping makes unmasking a no-op.
+        quiet: true
+      vars:
+        # The SAME expression the entrypoint uses, evaluated at both inputs.
+        _want_when_on: "{{ 'masked' if true | bool else 'static' }}"
+        _want_when_off: "{{ 'masked' if false | bool else 'static' }}"
+
+    - name: Render the Steam guard unit from the ROLE'S template
+      # The unit's ExecStart is the ONLY place the allowlist, mode and rate limit reach the
+      # process. A dropped flag would start a guard that silently runs on the script's own
+      # defaults — observe mode, an EMPTY allowlist (every Deck press refused) — and the install's
+      # read-back would still pass, because the guard would be up and healthy.
+      ansible.builtin.set_fact:
+        _guard_unit: "{{ lookup('ansible.builtin.template', playbook_dir ~ '/../../templates/steam-guard.service.j2') }}"
+
+    - name: The guard unit carries the declared allowlist, mode and rate limit
+      ansible.builtin.assert:
+        that:
+          - "'--allow 192.0.2.4,198.51.100.4 ' in _guard_unit"
+          - "'--mode observe ' in _guard_unit"
+          - "'--max-restarts 6 ' in _guard_unit"
+          - "'--window 10800' in _guard_unit"
+          # Off by default: the stuck-suspend exemption is opted into per host in inventory.
+          - "'--restart-on-stuck-suspend' not in _guard_unit"
+          # Derived from bazzite_game_session (role default: the image's OGUI session).
+          - "'--unit gamescope-session-plus@ogui-steam.service ' in _guard_unit"
+          - "'PartOf=' not in _guard_unit and 'BindsTo=' not in _guard_unit"
+        fail_msg: "steam-guard.service.j2 rendered wrongly: {{ _guard_unit }}"
+        quiet: true
+
+    # set_fact, not task `vars:` — setup_vars resolved this option with set_fact, which outranks
+    # a task var, so a `vars:` override would render the default and the assert below would be
+    # testing nothing (a task-level vars does not override a set_fact). Restored after.
+    - name: Opt in to the stuck-suspend restart
+      ansible.builtin.set_fact:
+        bazzite_steam_guard_restart_on_stuck_suspend: true
+
+    - name: Render the Steam guard unit WITH the stuck-suspend restart opted in
+      ansible.builtin.set_fact:
+        _guard_unit_stuck: "{{ lookup('ansible.builtin.template', playbook_dir ~ '/../../templates/steam-guard.service.j2') }}"
+
+    - name: Restore the default
+      ansible.builtin.set_fact:
+        bazzite_steam_guard_restart_on_stuck_suspend: false
+
+    - name: The opt-in reaches the guard's command line
+      # Without the flag the guard detects a stuck suspend and only LOGS it in observe mode —
+      # the black page stays until someone presses the Deck tile.
+      ansible.builtin.assert:
+        that: ["_guard_unit_stuck is search('--window \\d+ --restart-on-stuck-suspend')"]
+        fail_msg: "bazzite_steam_guard_restart_on_stuck_suspend did not reach ExecStart: {{ _guard_unit_stuck }}"
+        quiet: true
+
+    # DO LESS: the session env file carries ONLY keys that differ from the image. Rendered with no
+    # overrides it must set neither key; with one, exactly that one. (game_session.yml removes the
+    # file outright when there are none — this covers the case where it is written.)
+    - name: Render the session env with NO overrides
+      ansible.builtin.set_fact:
+        _env_none: "{{ lookup('ansible.builtin.template', playbook_dir ~ '/../../templates/gamescope-session.conf.j2') }}"
+      vars:
+        _bz_gs_overrides: {}
+
+    - name: Render the session env with ONE override
+      ansible.builtin.set_fact:
+        _env_one: "{{ lookup('ansible.builtin.template', playbook_dir ~ '/../../templates/gamescope-session.conf.j2') }}"
+      vars:
+        _bz_gs_overrides: {OUTPUT_CONNECTOR: HDMI-A-1}
+
+    - name: Only overridden keys are set
+      ansible.builtin.assert:
+        that:
+          - "_env_none is not search('(?m)^(OUTPUT_CONNECTOR|XWAYLAND_COUNT)=')"
+          - "_env_one is search('(?m)^OUTPUT_CONNECTOR=HDMI-A-1$')"
+          - "_env_one is not search('(?m)^XWAYLAND_COUNT=')"
+        fail_msg: "session env restates image defaults: none={{ _env_none[-300:] }} one={{ _env_one[-300:] }}"
+        quiet: true
