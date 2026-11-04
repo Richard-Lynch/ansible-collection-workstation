@@ -1,0 +1,13 @@
+---
+galaxy_info:
+  namespace: richard_lynch
+  author: Richard Lynch
+  description: >-
+    Post-install setup and live-state reports for a Bazzite gaming workstation: flatpaks, gaming
+    tunables, image tracking and gated rebase, Game Mode session and autologin, sleep inhibition,
+    HDMI-CEC, Sunshine streaming, OpenRGB lighting, Super-I/O fan sweeps and curves, Wake-on-LAN
+    and a Steam watchdog. Every write reports first and acts only behind an explicit flag.
+  license: GPL-3.0-or-later
+  min_ansible_version: "2.19"
+  galaxy_tags: [bazzite, gaming, steam, workstation]
+dependencies: []

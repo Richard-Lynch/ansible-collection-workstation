@@ -1,0 +1,152 @@
+---
+# ONE HEADER of the fan_sweep loop. Included per entry in `bazzite_fan_sweep_headers` by
+# fan_sweep.yml; not an entrypoint. `_sweep` is the current list entry.
+#
+# WHY THE PER-HEADER BODY IS ITS OWN FILE. The restore has to be scoped to ONE header. If the
+# block/always lived in the loop's caller, a sweep interrupted on the third header would run its
+# `always` once, against whichever header was current — leaving the other two in manual mode
+# with nothing to put them back. Included per iteration, each header gets its own guaranteed
+# restore, and an interrupt mid-loop restores the header it was actually working on.
+
+- name: Refuse to sweep a header that drives a pump
+  # A pump is not a fan. The sweep searches DOWNWARD for the duty at which the thing stops,
+  # which on a pump risks cavitation and loss of coolant flow with only the CPU's own thermal
+  # protection left. A pump's RPM reading also says nothing about whether
+  # coolant is moving, so the sweep could not even detect the harm it was doing.
+  #
+  # This REFUSES rather than warns, and it is checked per iteration rather than once over the
+  # list: a warning someone can scroll past is not a safety control, and a list-level check
+  # would pass a list that gains a pump entry later. Quietening a pump is a different job —
+  # fixed duty, under real load, judged on CPU temperature.
+  ansible.builtin.assert:
+    that:
+      - "(_sweep.header | int) not in (bazzite_fan_sweep_pump_headers | map('int') | list)"
+    fail_msg: >-
+      Header {{ _sweep.header }} is declared as a PUMP header in inventory
+      (bazzite_fan_sweep_pump_headers={{ bazzite_fan_sweep_pump_headers }}). The duty sweep
+      steps downward to find a stall point, which risks cavitation and loss of coolant flow.
+      Quieten a pump at a fixed duty under real load, judged on CPU temperature.
+    quiet: true
+
+- name: Read the header's current state
+  # Captured before the sweep so the report shows what it started from, and so a human can put
+  # it back by hand if everything else fails.
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      h=""
+      for d in /sys/class/hwmon/hwmon*; do
+        [ "$(cat "$d/name" 2>/dev/null)" = "{{ bazzite_fan_sweep_chip }}" ] && h="$d"
+      done
+      if [ -z "$h" ]; then echo "chip_missing=true"; exit 0; fi
+      i="{{ _sweep.header }}"
+      printf 'chip_missing=false\nhwmon=%s\nenable=%s\npwm=%s\nrpm=%s\n' \
+        "$h" \
+        "$(cat "$h/pwm${i}_enable" 2>/dev/null || echo na)" \
+        "$(cat "$h/pwm${i}" 2>/dev/null || echo na)" \
+        "$(cat "$h/fan${i}_input" 2>/dev/null || echo na)"
+  register: _bz_sweep_before
+  changed_when: false
+
+- name: Parse the starting state
+  ansible.builtin.set_fact:
+    _sweep_before: >-
+      {{ dict(_bz_sweep_before.stdout_lines | default([]) | select('search', '=')
+              | map('split', '=') | map('list')) }}
+
+- name: Refuse to sweep a header that does not exist
+  # Sweeping a non-existent header would write nothing and report a clean run of zero steps —
+  # a green result proving nothing, which is worse than a failure.
+  ansible.builtin.assert:
+    that:
+      - "_sweep_before.chip_missing | default('true') == 'false'"
+      - "_sweep_before.enable | default('na') != 'na'"
+    fail_msg: >-
+      Header {{ _sweep.header }} is not present on chip {{ bazzite_fan_sweep_chip }}
+      (enable={{ _sweep_before.enable | default('na') }},
+      chip_missing={{ _sweep_before.chip_missing | default('true') }}). Run
+      bazzite_action=fan_report to see which headers exist.
+    quiet: true
+
+- name: Report what the sweep would do
+  ansible.builtin.debug:
+    msg: "{{ _preview.splitlines() | select('string') | list }}"
+  vars:
+    _preview: |
+      ===== FAN SWEEP (preview) — header {{ _sweep.header }} =====
+      what   : {{ _sweep.note | default('(no note declared)') }}
+      now    : mode={{ _sweep_before.enable | default('?') }} pwm={{ _sweep_before.pwm | default('?') }} rpm={{ _sweep_before.rpm | default('?') }}
+      steps  : {{ _sweep.steps | default(bazzite_fan_sweep_steps) }} (percent duty, held {{ bazzite_fan_sweep_settle }}s each)
+      The header goes to MANUAL for the sweep and is returned to automatic afterwards.
+      {{ 'Set bazzite_fan_sweep_apply=true to run it.' if not (bazzite_fan_sweep_apply | bool) else 'APPLYING.' }}
+  when: not (bazzite_fan_sweep_apply | bool)
+
+- name: Sweep the header
+  when: bazzite_fan_sweep_apply | bool
+  block:
+    # The sweep itself is INSIDE the block, so the `always` restore below covers it however it
+    # exits. Putting it before the block would look equivalent and would not be: if it started
+    # and the play were then interrupted, the header would be left in manual with nothing to
+    # re-enable the curve.
+    - name: Run the duty sweep
+      ansible.builtin.command:
+        argv:
+          - "{{ bazzite_python }}"
+          - "{{ bazzite_fan_sweep_path }}"
+          - --chip={{ bazzite_fan_sweep_chip }}
+          - --header={{ _sweep.header }}
+          - --steps={{ _sweep.steps | default(bazzite_fan_sweep_steps) }}
+          - --settle={{ bazzite_fan_sweep_settle }}
+          - --samples={{ bazzite_fan_sweep_samples }}
+          - --json={{ bazzite_fan_sweep_results | regex_replace('\.json$', '') }}-hdr{{ _sweep.header }}.json
+      become: true
+      register: _bz_sweep_run
+      changed_when: true
+
+    - name: Show the sweep
+      ansible.builtin.debug:
+        msg: "{{ [_sweep.note | default('header ' ~ _sweep.header)] + (_bz_sweep_run.stdout_lines | default([])) }}"
+
+  always:
+    # Belt and braces. The script restores on every exit path it controls; this covers the paths
+    # it does not — killed before its handlers were installed, or the interpreter never started.
+    # Writing the original mode when it is already set is a no-op, so this is safe to run twice.
+    - name: Return the header to automatic control, whatever happened
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: |
+          set -o pipefail
+          h=""
+          for d in /sys/class/hwmon/hwmon*; do
+            [ "$(cat "$d/name" 2>/dev/null)" = "{{ bazzite_fan_sweep_chip }}" ] && h="$d"
+          done
+          [ -n "$h" ] || { echo "restored=unknown reason=chip_missing"; exit 0; }
+          i="{{ _sweep.header }}"
+          want="{{ _sweep_before.enable | default('5') }}"
+          echo "$want" > "$h/pwm${i}_enable" 2>/dev/null || true
+          got="$(cat "$h/pwm${i}_enable" 2>/dev/null || echo na)"
+          # Read-back, not exit code: a write that "succeeded" is not evidence the value landed,
+          # because the chip can silently clamp or reject it.
+          if [ "$got" = "$want" ]; then
+            echo "restored=true mode=$got"
+          else
+            echo "restored=false mode=$got wanted=$want"
+          fi
+      become: true
+      register: _bz_sweep_restore
+      changed_when: false
+
+    - name: Fail loudly if the header was left under no thermal control
+      # The one outcome that must never pass quietly. A header left in manual mode is not
+      # protected by the hardware curve, and nothing else on the box will notice.
+      ansible.builtin.assert:
+        that:
+          - "'restored=true' in (_bz_sweep_restore.stdout | default(''))"
+        fail_msg: >-
+          Header {{ _sweep.header }} may still be in MANUAL mode and under NO thermal control:
+          {{ _bz_sweep_restore.stdout | default('(no output)') | trim }}.
+          Fix on the box with: echo {{ _sweep_before.enable | default('5') }} | sudo tee
+          /sys/class/hwmon/<chip>/pwm{{ _sweep.header }}_enable
+        success_msg: "Header {{ _sweep.header }} is back under automatic control."
+        quiet: true

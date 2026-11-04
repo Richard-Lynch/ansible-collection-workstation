@@ -1,0 +1,273 @@
+---
+# ENTRYPOINT: report what this Bazzite box ALREADY has, changing nothing.
+#
+# WHY THIS COMES FIRST. Bazzite ships a great deal pre-configured — Steam, Proton, MangoHud,
+# gamescope, GPU drivers, flatpak remotes — and the fastest way to make a post-install play
+# useless is to have it re-do work the image already did, or fight a default that exists for a
+# reason. This is the read-only survey the rest of the role is written against.
+#
+# It is also the honest answer to "what should the setup play do?" before anyone has seen the
+# machine: run this, look at the gaps, THEN decide. Everything it reports is a fact about the
+# real system rather than an assumption about the image.
+#
+# Writes nothing. Safe at any time, including on a machine mid-setup.
+#
+#   bazzite_action=probe
+
+- name: Apply role defaults
+  # probe.yml is the ONE entrypoint a caller reaches with no other setup, so it must resolve its
+  # own defaults — omitting this left bazzite_probe_save undefined and the survey died at the
+  # final save step, after doing all the work.
+  ansible.builtin.include_tasks: setup_vars.yml
+
+- name: Read the OS image identity
+  # rpm-ostree status is the authoritative "what am I running" on an image-based system — the
+  # deployed image, its version, and any packages layered on top. Layered packages matter: each
+  # one slows updates and adds rebase risk, so knowing what is already layered shapes whether
+  # adding more is reasonable.
+  ansible.builtin.command:
+    cmd: rpm-ostree status --json
+  register: _bz_ostree
+  changed_when: false
+  failed_when: false
+
+- name: Read the gaming-related packages in the base image
+  # The probe originally reported flatpaks and a hardcoded tool list, and MISSED Lutris entirely
+  # because it ships as an rpm inside the image — neither a flatpak nor on the checked list. An
+  # inventory that silently omits a whole install mechanism is how a setup play ends up
+  # reinstalling something that is already there.
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      rpm -qa --qf '%{NAME}\n' 2>/dev/null \
+        | grep -iE 'lutris|steam|gamescope|mangohud|vkbasalt|heroic|retroarch|emulator|proton' \
+        | sort || true
+  register: _bz_rpms
+  changed_when: false
+
+- name: Read the flatpak inventory
+  # The intended install path for GUI apps on Bazzite. Reported per-remote because an app from
+  # Fedora's remote versus Flathub can differ materially in codec support and permissions.
+  ansible.builtin.command:
+    cmd: flatpak list --columns=application,origin,version
+  register: _bz_flatpaks
+  changed_when: false
+  failed_when: false
+
+- name: Read the configured flatpak remotes
+  ansible.builtin.command:
+    cmd: flatpak remotes --columns=name,url
+  register: _bz_remotes
+  changed_when: false
+  failed_when: false
+
+- name: Look for the tools this role would otherwise install
+  # `command -v` per tool rather than a package query: what matters is whether the binary is
+  # REACHABLE, and on this system a tool can arrive via the base image, a layered package, a
+  # flatpak wrapper or a distrobox export. A package query answers a different question.
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      for t in steam gamescope mangohud vkbasalt goverlay lact distrobox podman docker \
+               lutris heroic protontricks openrgb emudeck retroarch \
+               protonup-qt steamtinkerlaunch xpadneo-dkms; do
+        printf '%s=%s\n' "$t" "$(command -v "$t" >/dev/null 2>&1 && echo present || echo absent)"
+      done
+  register: _bz_tools
+  changed_when: false
+
+- name: Read GPU and driver state
+  # Which GPU, which kernel driver, and whether Resizable BAR actually took effect. ReBAR is set
+  # in firmware but only OBSERVABLE from the OS, so a BIOS setting that silently did not apply
+  # shows up here and nowhere else.
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      echo "--- GPU ---"
+      lspci -nn | grep -Ei 'vga|3d|display' || true
+      echo "--- driver in use ---"
+      lspci -k | grep -A3 -Ei 'vga|3d' | grep -i 'kernel driver' || true
+      echo "--- resizable BAR (prefetchable window vs VRAM) ---"
+      lspci -v 2>/dev/null | grep -A12 -Ei 'vga|3d' | grep -Ei 'prefetchable|BAR' | head -8 || true
+      echo "--- vulkan ---"
+      command -v vulkaninfo >/dev/null 2>&1 && vulkaninfo --summary 2>/dev/null | grep -Ei 'deviceName|driverName' | head -4 || echo "vulkaninfo absent"
+  register: _bz_gpu
+  changed_when: false
+
+- name: Read kernel, session and hardware context
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      echo "kernel=$(uname -r)"
+      # THE MACHINE'S session, not THIS CONNECTION'S. $XDG_SESSION_TYPE describes the session the
+      # command is running in, so over SSH it reports `tty` (and $XDG_CURRENT_DESKTOP reports
+      # nothing) on a machine sitting in a perfectly healthy graphical session. That is not a
+      # harmless inaccuracy: `session=tty desktop=unknown` reads as evidence that Game Mode is
+      # not running when it is, as a Wayland session on seat0.
+      #
+      # So the graphical session is read from logind, which is authoritative and independent of
+      # who is asking. The connection's own type is still reported, clearly labelled as such,
+      # because it is useful context when reading a report and confusing only when unlabelled.
+      _gsess="$(loginctl list-sessions --no-legend 2>/dev/null | awk '{print $1}' | while read -r i; do
+          [ -n "$i" ] || continue
+          t="$(loginctl show-session "$i" -p Type --value 2>/dev/null)"
+          case "$t" in wayland|x11) printf '%s:%s ' "$i" "$t" ;; esac
+        done)"
+      echo "session=${_gsess:-none-on-any-seat}"
+      echo "connection=${XDG_SESSION_TYPE:-unknown}"
+      echo "desktop=${XDG_CURRENT_DESKTOP:-unknown (not set over SSH; see session= above)}"
+      echo "cpu=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | xargs)"
+      echo "memory_gb=$(( $(grep MemTotal /proc/meminfo | awk '{print $2}') / 1024 / 1024 ))"
+      echo "secureboot=$(mokutil --sb-state 2>/dev/null | head -1 || echo 'mokutil absent')"
+  register: _bz_sys
+  changed_when: false
+
+- name: Read ublue's own image identity
+  # image-info.json is ublue's DIRECT statement of which variant this is, which beats inferring it
+  # from the refspec string. Absent on a non-ublue box, hence failed_when:false.
+  ansible.builtin.slurp:
+    src: /usr/share/ublue-os/image-info.json
+  register: _bz_image_info
+  failed_when: false
+
+- name: Survey the image, sessions, login policy and Deck daemons
+  # Everything the rebase plan's verification table needs, in one read. Each line answers a
+  # specific question that was actually wrong at some point:
+  #   sessions/dm  — the deck variant SWAPS the display manager, so autologin written for the old
+  #                  one is dead config in a directory nothing reads.
+  #   uid1000      — bazzite-autologin hardcodes it and rewrites User= every boot.
+  #   sentinel/holo— the two plain files that actually decide the session at next boot.
+  #   kargs        — kargs live in the bootloader, not the image; this proves they survived.
+  #   deckhw_/generic_ — two classes with OPPOSITE expected states (see deck_daemons.yml).
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      printf 'sessions=%s\n'   "$(ls /usr/share/wayland-sessions/ 2>/dev/null | tr '\n' ',')"
+      printf 'dm=%s\n'         "$(systemctl show display-manager.service --property=Id --value 2>/dev/null)"
+      printf 'uid1000=%s\n'    "$(id -nu 1000 2>/dev/null)"
+      printf 'sentinel=%s\n'   "$([ -f /etc/bazzite/desktop_autologin ] && echo present || echo absent)"
+      printf 'holo=%s\n'       "$(grep -hs '^Session=' /etc/sddm.conf.d/zz-holo-autologin.conf 2>/dev/null | cut -d= -f2)"
+      printf 'sddm_dropins=%s\n'        "$(ls /etc/sddm.conf.d/ 2>/dev/null | tr '\n' ',')"
+      printf 'plasmalogin_dropins=%s\n' "$(ls /etc/plasmalogin.conf.d/ 2>/dev/null | tr '\n' ',')"
+      printf 'kargs=%s\n'      "$(rpm-ostree kargs 2>/dev/null)"
+      printf 'sunshine_ports=%s\n'     "$(ss -tuln 2>/dev/null | grep -cE ':(47984|47989|47990|48010)')"
+      printf 'remoteplay_ports=%s\n'   "$(ss -tuln 2>/dev/null | grep -cE ':(27031|27036)')"
+      printf 'sunshine_user_unit=%s\n' "$([ -f "$HOME/.config/systemd/user/sunshine.service" ] && echo present || echo absent)"
+      printf 'steamosctl=%s\n' "$(command -v steamosctl >/dev/null 2>&1 && echo present || echo absent)"
+      for u in {{ bazzite_deck_hw_units | join(' ') }}; do
+        printf 'deckhw_%s=%s/%s\n' "$u" \
+          "$(systemctl show "$u" --property=LoadState --value 2>/dev/null)" \
+          "$(systemctl show "$u" --property=ActiveState --value 2>/dev/null)"
+      done
+      for u in {{ bazzite_deck_generic_units | join(' ') }}; do
+        printf 'generic_%s=%s/%s\n' "$u" \
+          "$(systemctl show "$u" --property=LoadState --value 2>/dev/null)" \
+          "$(systemctl show "$u" --property=ActiveState --value 2>/dev/null)"
+      done
+      # Which connector drives the display: some RDNA 4 cards on HDMI have an upstream bug where
+      # the panel goes dark while SSH and streaming keep working, so a remote check cannot see it.
+      #
+      # `if` rather than `[ ... ] && printf`: the && form returns non-zero when the test fails,
+      # and on the LAST loop iteration that becomes the script's exit status — so a perfectly
+      # successful survey failed the task purely because the final connector was disconnected.
+      for d in /sys/class/drm/card*-*/status; do
+        if [ "$(cat "$d" 2>/dev/null)" = connected ]; then
+          printf 'display=%s\n' "$(basename "$(dirname "$d")")"
+        fi
+      done
+      exit 0
+  register: _bz_survey
+  changed_when: false
+
+- name: Parse the image status defensively
+  # `from_json` on empty input raises rather than returning a default, so a missing or failed
+  # rpm-ostree (absent on a non-Bazzite host, or erroring on a broken one) crashes the REPORT
+  # rather than being reported. Parsed once here into a fact with a real fallback, so the survey
+  # still prints everything else it learned — which is exactly when a survey is most useful.
+  ansible.builtin.set_fact:
+    _bz_ostree_data: >-
+      {{ (_bz_ostree.stdout | from_json)
+         if (_bz_ostree.rc | default(1)) == 0 and (_bz_ostree.stdout | default('') | trim) | length > 0
+         else {} }}
+
+- name: Report the survey
+  ansible.builtin.debug:
+    msg: "{{ _report.splitlines() }}"
+  vars:
+    # First deployment, or an empty dict when rpm-ostree gave us nothing — keeps every reference
+    # below total rather than conditional.
+    # THE BOOTED DEPLOYMENT, not deployments[0]. [0] is whatever boots NEXT, which differs from
+    # what is running whenever an update is staged — so reading it reports the machine as
+    # already on the staged version while it is still running the previous one. A survey that misreports the running version is worse than no survey.
+    _dep: >-
+      {{ (_bz_ostree_data.deployments | default([])
+          | selectattr('booted', 'defined') | selectattr('booted') | list | first
+          | default((_bz_ostree_data.deployments | default([{}]))[0] | default({}))) }}
+    _dep_staged: >-
+      {{ (_bz_ostree_data.deployments | default([])
+          | selectattr('staged', 'defined') | selectattr('staged') | list | first
+          | default({})) }}
+    # GATE ON `content is defined`, never on `.failed` — the slurp carries failed_when:false,
+    # which pins .failed to False even on a genuine failure (FAILED-01). The default()
+    # must wrap the WHOLE expression: a default on the inner key still evaluates
+    # `content | b64decode` first, which dies when the file is absent.
+    _ii: >-
+      {{ (_bz_image_info.content | b64decode | from_json)
+         if (_bz_image_info.content is defined) else {} }}
+    # A LITERAL block scalar and splitlines(): inside a folded scalar a backslash escape is not
+    # an escape, so '\n' would arrive as two characters and never split (YAMLESC-01).
+    _report: |
+      ===== SYSTEM =====
+      {{ _bz_sys.stdout }}
+
+      ===== IMAGE =====
+      booted:   {{ _dep['container-image-reference'] | default(_dep.origin | default('unknown')) }}
+      version:  {{ _dep.version | default('unknown') }}
+      staged:   {{ (_dep_staged.version | default('(nothing staged)', true)) }}
+                {{ _dep_staged['container-image-reference'] | default('', true) }}
+      layered packages: {{ _dep['requested-packages'] | default([]) | join(', ') | default('none', true) }}
+      running variant : {{ _ii['image-name'] | default('?') }}:{{ _ii['image-tag'] | default('?') }}
+      declared variant: {{ bazzite_image_variant }}:{{ bazzite_image_tag }}
+      -> {{ 'MATCH' if _ii['image-name'] | default('') == bazzite_image_variant
+            else 'DRIFT — the machine is not running the image inventory declares. Converge it
+                  with bazzite_action=rebase, or correct bazzite_image_variant.' }}
+
+      ===== SESSION / LOGIN =====
+      {{ _bz_survey.stdout }}
+
+      ===== GPU =====
+      {{ _bz_gpu.stdout }}
+
+      ===== TOOLS =====
+      {{ _bz_tools.stdout }}
+
+      ===== GAMING PACKAGES IN THE IMAGE =====
+      {{ _bz_rpms.stdout | default('(none)') }}
+
+      ===== FLATPAK REMOTES =====
+      {{ _bz_remotes.stdout | default('(none)') }}
+
+      ===== FLATPAKS INSTALLED =====
+      {{ _bz_flatpaks.stdout | default('(none)') }}
+
+- name: Save the survey for comparison after setup
+  # Written to disk so a later run can diff against it — "what did the setup play actually
+  # change" is a question worth being able to answer precisely rather than from memory.
+  ansible.builtin.copy:
+    dest: "{{ bazzite_probe_output }}"
+    mode: "0644"
+    content: |
+      {{ {
+           'system': _bz_sys.stdout_lines,
+           'gpu': _bz_gpu.stdout_lines,
+           'tools': dict(_bz_tools.stdout_lines | map('split', '=') | list),
+           'flatpak_remotes': _bz_remotes.stdout_lines | default([]),
+           'flatpaks': _bz_flatpaks.stdout_lines | default([]),
+           'ostree_raw': _bz_ostree_data,
+         } | to_nice_json }}
+  when: bazzite_probe_save | bool

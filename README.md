@@ -5,13 +5,14 @@ SPDX-License-Identifier: GPL-3.0-or-later
 
 # richard_lynch.workstation
 
-Workstation and device roles: per-component fan control, Raspberry Pi boot media, image seeding, host setup and fleet reports, bootable USB media, and BIOS flashing media for one ASUS board.
+Workstation and device roles: post-install setup and live-state reports for a Bazzite gaming workstation, per-component fan control, Raspberry Pi boot media, image seeding, host setup and fleet reports, bootable USB media, and BIOS flashing media for one ASUS board.
 
 ## Roles
 
 | Role | Description |
 | ---- | ----------- |
 | `asus_tuf_b850m_bios` | BIOS management for the ASUS TUF GAMING B850M-PLUS WIFI7 W |
+| `bazzite_workstation` | Post-install setup for a Bazzite gaming workstation |
 | `config_fan_control` | Fan control by normalised per-component thermal demand |
 | `rpi_boot_media` | Pi 4 boot media: EEPROM order, SSD provisioning, rescue-card sealing |
 | `rpi_fleet_report` | Whole-fleet drift report for the Pi nodes |
@@ -30,7 +31,7 @@ or pin it in `requirements.yml`:
 ```yaml
 collections:
   - name: richard_lynch.workstation
-    version: "1.0.0"
+    version: "1.1.0"
 ```
 
 Requires ansible-core >=2.19.0.
@@ -48,7 +49,7 @@ devkit check all                # the static checks, configured by devkit.toml
 
 CI, the disclosure gate and releases are the shared workflows of
 [ansible-devkit](https://github.com/Richard-Lynch/ansible-devkit), called from
-`.github/workflows/` at tag `v0.2.3`. A release is a merged pull
+`.github/workflows/` at tag `v0.3.2`. A release is a merged pull
 request that bumps `version` in `galaxy.yml` and adds the matching
 `CHANGELOG.md` section. `export.manifest` lists every tracked path; update it in
 the same commit as any file added or removed.

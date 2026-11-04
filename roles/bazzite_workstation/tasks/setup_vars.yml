@@ -1,0 +1,161 @@
+---
+# Resolve caller-supplied vars over the generated defaults (defaults/main.yml is GENERATED from
+# meta/argument_specs.py — see tools/argspec/cli.py — and holds `*__default` vars, not the plain
+# names tasks use). Same pattern as the usb_media role.
+#
+# THIS FILE IS INCLUDED MORE THAN ONCE PER PLAY. Every entrypoint includes it, `all` runs six,
+# and image.yml includes rebase.yml which includes it again. Every resolution here must therefore
+# be IDEMPOTENT: on re-entry `x | default(x__default)` finds x already set by the first pass and
+# returns it unchanged. Do NOT add a non-idempotent transform (a prefix-add, a path-join) — it
+# would apply once or twice depending on the CALL ROUTE, so the value would differ between
+# `bazzite_action=rebase` and `bazzite_action=image`. usb_media's `| expanduser` is the in-repo
+# example of a transforming line; it is safe only because expanduser happens to be idempotent.
+#
+# REQUIRED options are referenced BARE, with no `| default(...)`: the generator emits no
+# `__default` for them, so a default() argument would name a variable that does not exist.
+- name: Store vars
+  ansible.builtin.set_fact:
+    bazzite_action: "{{ bazzite_action | default(bazzite_action__default) }}"
+    bazzite_apply: "{{ bazzite_apply | default(bazzite_apply__default) }}"
+    bazzite_flatpaks: "{{ bazzite_flatpaks | default(bazzite_flatpaks__default) }}"
+    bazzite_controller_probe_seconds: "{{ bazzite_controller_probe_seconds | default(bazzite_controller_probe_seconds__default) }}"
+    bazzite_controller_probe_device: "{{ bazzite_controller_probe_device | default(bazzite_controller_probe_device__default) }}"
+    bazzite_openrgb_udev: "{{ bazzite_openrgb_udev | default(bazzite_openrgb_udev__default) }}"
+    bazzite_openrgb_udev_vendors: "{{ bazzite_openrgb_udev_vendors | default(bazzite_openrgb_udev_vendors__default) }}"
+    bazzite_layer_packages: "{{ bazzite_layer_packages | default(bazzite_layer_packages__default) }}"
+    bazzite_python: "{{ bazzite_python | default(bazzite_python__default) }}"
+    bazzite_steam_guard_allow: "{{ bazzite_steam_guard_allow | default(bazzite_steam_guard_allow__default) }}"
+    bazzite_steam_guard_mode: "{{ bazzite_steam_guard_mode | default(bazzite_steam_guard_mode__default) }}"
+    bazzite_steam_guard_restart_on_stuck_suspend: "{{ bazzite_steam_guard_restart_on_stuck_suspend | default(bazzite_steam_guard_restart_on_stuck_suspend__default) }}"
+    bazzite_steam_idle_suspend_ac_seconds: "{{ bazzite_steam_idle_suspend_ac_seconds | default(bazzite_steam_idle_suspend_ac_seconds__default) }}"
+    bazzite_steam_guard_port: "{{ bazzite_steam_guard_port | default(bazzite_steam_guard_port__default) }}"
+    bazzite_steam_guard_path: "{{ bazzite_steam_guard_path | default(bazzite_steam_guard_path__default) }}"
+    bazzite_steam_guard_unit: "{{ bazzite_steam_guard_unit | default(bazzite_steam_guard_unit__default) }}"
+    bazzite_steam_guard_session_unit: "{{ bazzite_steam_guard_session_unit | default(bazzite_steam_guard_session_unit__default) }}"
+    bazzite_steam_guard_interval: "{{ bazzite_steam_guard_interval | default(bazzite_steam_guard_interval__default) }}"
+    bazzite_steam_guard_unhealthy_for: "{{ bazzite_steam_guard_unhealthy_for | default(bazzite_steam_guard_unhealthy_for__default) }}"
+    bazzite_steam_guard_startup_grace: "{{ bazzite_steam_guard_startup_grace | default(bazzite_steam_guard_startup_grace__default) }}"
+    bazzite_steam_guard_max_restarts: "{{ bazzite_steam_guard_max_restarts | default(bazzite_steam_guard_max_restarts__default) }}"
+    bazzite_steam_guard_window: "{{ bazzite_steam_guard_window | default(bazzite_steam_guard_window__default) }}"
+    bazzite_sunshine_enabled: "{{ bazzite_sunshine_enabled | default(bazzite_sunshine_enabled__default) }}"
+    bazzite_sunshine_restart: "{{ bazzite_sunshine_restart | default(bazzite_sunshine_restart__default) }}"
+    bazzite_sunshine_manage_config: "{{ bazzite_sunshine_manage_config | default(bazzite_sunshine_manage_config__default) }}"
+    bazzite_sunshine_apps: "{{ bazzite_sunshine_apps | default(bazzite_sunshine_apps__default) }}"
+    bazzite_sunshine_covers_dir: "{{ bazzite_sunshine_covers_dir | default(bazzite_sunshine_covers_dir__default) }}"
+    bazzite_sunshine_covers_helper: "{{ bazzite_sunshine_covers_helper | default(bazzite_sunshine_covers_helper__default) }}"
+    bazzite_sunshine_adapter: "{{ bazzite_sunshine_adapter | default(bazzite_sunshine_adapter__default) }}"
+    bazzite_sunshine_hevc: "{{ bazzite_sunshine_hevc | default(bazzite_sunshine_hevc__default) }}"
+    bazzite_sunshine_hdr: "{{ bazzite_sunshine_hdr | default(bazzite_sunshine_hdr__default) }}"
+    bazzite_sunshine_av1: "{{ bazzite_sunshine_av1 | default(bazzite_sunshine_av1__default) }}"
+    bazzite_sunshine_resolution_match: "{{ bazzite_sunshine_resolution_match | default(bazzite_sunshine_resolution_match__default) }}"
+    bazzite_sunshine_resolutions: "{{ bazzite_sunshine_resolutions | default(bazzite_sunshine_resolutions__default) }}"
+    bazzite_sunshine_fps: "{{ bazzite_sunshine_fps | default(bazzite_sunshine_fps__default) }}"
+    bazzite_sunshine_max_bitrate: "{{ bazzite_sunshine_max_bitrate | default(bazzite_sunshine_max_bitrate__default) }}"
+    bazzite_sunshine_qp: "{{ bazzite_sunshine_qp | default(bazzite_sunshine_qp__default) }}"
+    bazzite_sunshine_gamepad: "{{ bazzite_sunshine_gamepad | default(bazzite_sunshine_gamepad__default) }}"
+    bazzite_sunshine_log_level: "{{ bazzite_sunshine_log_level | default(bazzite_sunshine_log_level__default) }}"
+    bazzite_sunshine_extra_origins: "{{ bazzite_sunshine_extra_origins | default(bazzite_sunshine_extra_origins__default) }}"
+    bazzite_disable_wifi: "{{ bazzite_disable_wifi | default(bazzite_disable_wifi__default) }}"
+    bazzite_autologin_session: "{{ bazzite_autologin_session | default(bazzite_autologin_session__default) }}"
+    bazzite_autologin_relogin: "{{ bazzite_autologin_relogin | default(bazzite_autologin_relogin__default) }}"
+    bazzite_rgb_identify_path: "{{ bazzite_rgb_identify_path | default(bazzite_rgb_identify_path__default) }}"
+    bazzite_fan_sweep_apply: "{{ bazzite_fan_sweep_apply | default(bazzite_fan_sweep_apply__default) }}"
+    bazzite_fan_sweep_headers: "{{ bazzite_fan_sweep_headers | default(bazzite_fan_sweep_headers__default) }}"
+    bazzite_fan_sweep_steps: "{{ bazzite_fan_sweep_steps | default(bazzite_fan_sweep_steps__default) }}"
+    bazzite_fan_sweep_settle: "{{ bazzite_fan_sweep_settle | default(bazzite_fan_sweep_settle__default) }}"
+    bazzite_fan_sweep_samples: "{{ bazzite_fan_sweep_samples | default(bazzite_fan_sweep_samples__default) }}"
+    bazzite_fan_hold_apply: "{{ bazzite_fan_hold_apply | default(bazzite_fan_hold_apply__default) }}"
+    bazzite_fan_hold_release: "{{ bazzite_fan_hold_release | default(bazzite_fan_hold_release__default) }}"
+    bazzite_fan_hold_header: "{{ bazzite_fan_hold_header | default(bazzite_fan_hold_header__default) }}"
+    bazzite_fan_hold_percent: "{{ bazzite_fan_hold_percent | default(bazzite_fan_hold_percent__default) }}"
+    bazzite_fan_hold_deadman: "{{ bazzite_fan_hold_deadman | default(bazzite_fan_hold_deadman__default) }}"
+    bazzite_fan_curve_apply: "{{ bazzite_fan_curve_apply | default(bazzite_fan_curve_apply__default) }}"
+    bazzite_fan_curves: "{{ bazzite_fan_curves | default(bazzite_fan_curves__default) }}"
+    bazzite_fan_curve_persist: "{{ bazzite_fan_curve_persist | default(bazzite_fan_curve_persist__default) }}"
+    bazzite_fan_curve_wait_seconds: "{{ bazzite_fan_curve_wait_seconds | default(bazzite_fan_curve_wait_seconds__default) }}"
+    bazzite_fan_curve_script: "{{ bazzite_fan_curve_script | default(bazzite_fan_curve_script__default) }}"
+    bazzite_fan_curve_unit: "{{ bazzite_fan_curve_unit | default(bazzite_fan_curve_unit__default) }}"
+    bazzite_fan_curve_unit_before: "{{ bazzite_fan_curve_unit_before | default(bazzite_fan_curve_unit_before__default) }}"
+    bazzite_fan_sweep_pump_headers: "{{ bazzite_fan_sweep_pump_headers | default(bazzite_fan_sweep_pump_headers__default) }}"
+    bazzite_fan_sweep_path: "{{ bazzite_fan_sweep_path | default(bazzite_fan_sweep_path__default) }}"
+    bazzite_fan_sweep_results: "{{ bazzite_fan_sweep_results | default(bazzite_fan_sweep_results__default) }}"
+    bazzite_rgb_identify_phase: "{{ bazzite_rgb_identify_phase | default(bazzite_rgb_identify_phase__default) }}"
+    bazzite_rgb_identify_zone: "{{ bazzite_rgb_identify_zone | default(bazzite_rgb_identify_zone__default) }}"
+    bazzite_rgb_identify_step: "{{ bazzite_rgb_identify_step | default(bazzite_rgb_identify_step__default) }}"
+    bazzite_rgb_identify_loops: "{{ bazzite_rgb_identify_loops | default(bazzite_rgb_identify_loops__default) }}"
+    bazzite_rgb_identify_timeout: "{{ bazzite_rgb_identify_timeout | default(bazzite_rgb_identify_timeout__default) }}"
+    bazzite_rgb_profile: "{{ bazzite_rgb_profile | default(bazzite_rgb_profile__default) }}"
+    bazzite_rgb_zone_sizes: "{{ bazzite_rgb_zone_sizes | default(bazzite_rgb_zone_sizes__default) }}"
+    bazzite_rgb_daemon_mode: "{{ bazzite_rgb_daemon_mode | default(bazzite_rgb_daemon_mode__default) }}"
+    bazzite_rgb_daemon_path: "{{ bazzite_rgb_daemon_path | default(bazzite_rgb_daemon_path__default) }}"
+    bazzite_rgb_server_unit: "{{ bazzite_rgb_server_unit | default(bazzite_rgb_server_unit__default) }}"
+    bazzite_rgb_daemon_unit: "{{ bazzite_rgb_daemon_unit | default(bazzite_rgb_daemon_unit__default) }}"
+    bazzite_rgb_server_host: "{{ bazzite_rgb_server_host | default(bazzite_rgb_server_host__default) }}"
+    bazzite_rgb_server_port: "{{ bazzite_rgb_server_port | default(bazzite_rgb_server_port__default) }}"
+    bazzite_rgb_interval: "{{ bazzite_rgb_interval | default(bazzite_rgb_interval__default) }}"
+    bazzite_rgb_cpu_min: "{{ bazzite_rgb_cpu_min | default(bazzite_rgb_cpu_min__default) }}"
+    bazzite_rgb_cpu_max: "{{ bazzite_rgb_cpu_max | default(bazzite_rgb_cpu_max__default) }}"
+    bazzite_rgb_gpu_min: "{{ bazzite_rgb_gpu_min | default(bazzite_rgb_gpu_min__default) }}"
+    bazzite_rgb_gpu_max: "{{ bazzite_rgb_gpu_max | default(bazzite_rgb_gpu_max__default) }}"
+    bazzite_rgb_color: "{{ bazzite_rgb_color | default(bazzite_rgb_color__default) }}"
+    bazzite_rgb_mode: "{{ bazzite_rgb_mode | default(bazzite_rgb_mode__default) }}"
+    bazzite_rgb_brightness: "{{ bazzite_rgb_brightness | default(bazzite_rgb_brightness__default) }}"
+    bazzite_rgb_static_modes: "{{ bazzite_rgb_static_modes | default(bazzite_rgb_static_modes__default) }}"
+    bazzite_probe_output: "{{ bazzite_probe_output | default(bazzite_probe_output__default) }}"
+    bazzite_probe_save: "{{ bazzite_probe_save | default(bazzite_probe_save__default) }}"
+    bazzite_session_report_connector: "{{ bazzite_session_report_connector | default(bazzite_session_report_connector__default) }}"
+    bazzite_sudo_from_1password: "{{ bazzite_sudo_from_1password | default(bazzite_sudo_from_1password__default) }}"
+    # bazzite_sudo_user and bazzite_hostname have no default and are NOT resolved here: only
+    # the sudoers and hostname entrypoints need them, and each asserts its own before use, so a
+    # report entrypoint does not fail for want of a value it never reads.
+    bazzite_sudoers_file: "{{ bazzite_sudoers_file | default(bazzite_sudoers_file__default) }}"
+    bazzite_sensors_load_modules: "{{ bazzite_sensors_load_modules | default(bazzite_sensors_load_modules__default) }}"
+    bazzite_sensor_modules: "{{ bazzite_sensor_modules | default(bazzite_sensor_modules__default) }}"
+    bazzite_status_sample_seconds: "{{ bazzite_status_sample_seconds | default(bazzite_status_sample_seconds__default) }}"
+    # bazzite_image_ref / _refspec are DERIVED below, not bound here — see the second task.
+    bazzite_image_registry: "{{ bazzite_image_registry | default(bazzite_image_registry__default) }}"
+    bazzite_image_tag: "{{ bazzite_image_tag | default(bazzite_image_tag__default) }}"
+    bazzite_rebase_confirm: "{{ bazzite_rebase_confirm | default(bazzite_rebase_confirm__default) }}"
+    bazzite_rebase_timeout: "{{ bazzite_rebase_timeout | default(bazzite_rebase_timeout__default) }}"
+    bazzite_rebase_min_free_gb: "{{ bazzite_rebase_min_free_gb | default(bazzite_rebase_min_free_gb__default) }}"
+    bazzite_login_mode: "{{ bazzite_login_mode | default(bazzite_login_mode__default) }}"
+    bazzite_game_session: "{{ bazzite_game_session | default(bazzite_game_session__default) }}"
+    bazzite_autologin_cleanup_stale: "{{ bazzite_autologin_cleanup_stale | default(bazzite_autologin_cleanup_stale__default) }}"
+    bazzite_deck_hw_units: "{{ bazzite_deck_hw_units | default(bazzite_deck_hw_units__default) }}"
+    bazzite_deck_generic_units: "{{ bazzite_deck_generic_units | default(bazzite_deck_generic_units__default) }}"
+    bazzite_cec_manage: "{{ bazzite_cec_manage | default(bazzite_cec_manage__default) }}"
+    bazzite_cec_control: "{{ bazzite_cec_control | default(bazzite_cec_control__default) }}"
+    bazzite_cec_suspend_tv: "{{ bazzite_cec_suspend_tv | default(bazzite_cec_suspend_tv__default) }}"
+    bazzite_cec_suspend_device: "{{ bazzite_cec_suspend_device | default(bazzite_cec_suspend_device__default) }}"
+    bazzite_cec_wake_tv: "{{ bazzite_cec_wake_tv | default(bazzite_cec_wake_tv__default) }}"
+    bazzite_cec_wake_device: "{{ bazzite_cec_wake_device | default(bazzite_cec_wake_device__default) }}"
+    bazzite_image_auto: "{{ bazzite_image_auto | default(bazzite_image_auto__default) }}"
+    bazzite_image_auto_unit: "{{ bazzite_image_auto_unit | default(bazzite_image_auto_unit__default) }}"
+    bazzite_image_timeout: "{{ bazzite_image_timeout | default(bazzite_image_timeout__default) }}"
+    bazzite_wired_priority: "{{ bazzite_wired_priority | default(bazzite_wired_priority__default) }}"
+    bazzite_reboot_timeout: "{{ bazzite_reboot_timeout | default(bazzite_reboot_timeout__default) }}"
+    bazzite_gamescope_output: "{{ bazzite_gamescope_output | default(bazzite_gamescope_output__default) }}"
+    bazzite_gamescope_xwayland_count: "{{ bazzite_gamescope_xwayland_count | default(bazzite_gamescope_xwayland_count__default) }}"
+    bazzite_power_off_confirm: "{{ bazzite_power_off_confirm | default(bazzite_power_off_confirm__default) }}"
+    bazzite_power_off_timeout: "{{ bazzite_power_off_timeout | default(bazzite_power_off_timeout__default) }}"
+    bazzite_power_display_minutes: "{{ bazzite_power_display_minutes | default(bazzite_power_display_minutes__default) }}"
+    bazzite_power_lock_minutes: "{{ bazzite_power_lock_minutes | default(bazzite_power_lock_minutes__default) }}"
+    bazzite_power_suspend_minutes: "{{ bazzite_power_suspend_minutes | default(bazzite_power_suspend_minutes__default) }}"
+    bazzite_sleep_inhibit: "{{ bazzite_sleep_inhibit | default(bazzite_sleep_inhibit__default) }}"
+    bazzite_gamemode: "{{ bazzite_gamemode | default(bazzite_gamemode__default) }}"
+    bazzite_mangohud_config: "{{ bazzite_mangohud_config | default(bazzite_mangohud_config__default) }}"
+
+- name: Derive the image references
+  # SEPARATE TASK, deliberately. Keys within one set_fact template against PRE-TASK values and
+  # cannot see each other. A derivation referencing bazzite_image_registry alongside its own
+  # resolution above would hard-fail ("'bazzite_image_registry' is undefined") whenever the caller
+  # leaves it to its default, and work only when the caller happens to set it. (Tested — a loud
+  # error, not a silent misread.) The split makes the derivation read the resolved facts.
+  #
+  # THE TRANSPORT IS HARDCODED, not a variable: ghcr.io/ublue-os is sigstoreSigned in
+  # /etc/containers/policy.json, and rebasing to a bare `docker://` ref SUCCEEDS with signature
+  # verification silently dropped — the machine then runs an unverified image with nothing saying
+  # so. A knob whose only other setting is forbidden is a footgun, not configuration.
+  ansible.builtin.set_fact:
+    bazzite_image_ref: "{{ bazzite_image_registry }}/{{ bazzite_image_variant }}:{{ bazzite_image_tag }}"
+    bazzite_image_refspec: "ostree-image-signed:docker://{{ bazzite_image_registry }}/{{ bazzite_image_variant }}:{{ bazzite_image_tag }}"

@@ -1,0 +1,1039 @@
+---
+# ENTRYPOINT: Sunshine, the game-streaming host (the thing Moonlight clients connect TO).
+#
+# READ-ONLY BY DEFAULT: reports what is present and what is running. bazzite_apply=true enables
+# and starts the service.
+#
+# WHAT SUNSHINE NEEDS, and why each part is checked separately — any one of them can be the
+# reason a Moonlight client sees nothing while everything looks installed:
+#
+#   1. the binary            — Bazzite ships Sunshine in the image on most variants
+#   2. a USER systemd unit   — it runs as the logged-in user, not system-wide, because it needs
+#                              the graphical session to capture
+#   3. lingering enabled     — without it the user service dies at logout, so a headless box
+#                              streams only while someone is physically logged in
+#   4. uinput permissions    — the virtual gamepad/keyboard it creates for the client needs
+#                              /dev/uinput access, granted by a udev rule
+#   5. KMS capture caps      — on Wayland, grabbing the screen needs CAP_SYS_ADMIN on the binary
+#                              (setcap) or it captures a black frame
+#   6. firewall              — TCP 47984/47989/47990/48010 and UDP 47998-48000
+#
+# HOW IT IS INSTALLED, AND WHY NOT VIA `ujust`. Bazzite's own supported path is
+# `ujust setup-sunshine enable`, and that recipe is the right SOURCE OF TRUTH — but it cannot be
+# called from a play: it uses confirm() and press_any_key(), which block forever with no tty.
+# Wrapping it would produce a play that hangs headless and works only when a human is watching.
+#
+# So this runs the same four operations the recipe performs, read out of
+# /usr/share/ublue-os/just/82-bazzite-sunshine.just so they stay faithful to it:
+#
+#   flatpak install --system -y dev.lizardbyte.app.Sunshine
+#   flatpak run --command=additional-install.sh dev.lizardbyte.app.Sunshine   <- caps + udev
+#   systemctl --user enable --now app-dev.lizardbyte.app.Sunshine
+#   loginctl enable-linger                                                    <- survive logout
+#
+# additional-install.sh is the VENDOR'S OWN privileged setup — it is what grants the KMS capture
+# capability and installs the input rules. Reimplementing it here would be a second source of
+# truth that drifts from the flatpak it belongs to, so it is invoked rather than copied.
+#
+# THE WEB UI IS NOT AUTOMATED HERE. Sunshine's first-run flow sets an admin username and password
+# at https://<host>:47990, and that credential is a secret this play deliberately does not invent:
+# it belongs in your secret store, not generated inline. The report links there
+# and stops.
+
+- name: Apply role defaults
+  ansible.builtin.include_tasks: setup_vars.yml
+
+- name: Look for the Sunshine binary
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      command -v sunshine 2>/dev/null || true
+      ls /usr/bin/sunshine /var/lib/flatpak/exports/bin/dev.lizardbyte.app.Sunshine 2>/dev/null || true
+  register: _bz_sun_bin
+  changed_when: false
+
+- name: Look for a Sunshine flatpak
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      flatpak list --columns=application 2>/dev/null | grep -i sunshine || true
+  register: _bz_sun_flatpak
+  changed_when: false
+
+- name: Find any Sunshine systemd unit, user or system
+  # Both scopes: Bazzite ships a USER unit, but a hand-rolled setup often lands a system one, and
+  # the two behave very differently at logout.
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      echo "--user--"
+      systemctl --user list-unit-files 2>/dev/null | grep -i sunshine || echo "(none)"
+      echo "--system--"
+      systemctl list-unit-files 2>/dev/null | grep -i sunshine || echo "(none)"
+      echo "--active--"
+      systemctl --user is-active sunshine.service 2>/dev/null || true
+  register: _bz_sun_units
+  changed_when: false
+
+- name: Check whether lingering is enabled for this user
+  # Without lingering the user manager stops at logout and takes Sunshine with it — the box
+  # answers Moonlight only while somebody is sitting in front of it, which defeats the point.
+  ansible.builtin.command:
+    cmd: loginctl show-user {{ ansible_user_id }} --property=Linger
+  register: _bz_sun_linger
+  changed_when: false
+  failed_when: false
+
+- name: Check uinput availability and permissions
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      ls -l /dev/uinput 2>/dev/null || echo "(no /dev/uinput)"
+      ls /etc/udev/rules.d/ /usr/lib/udev/rules.d/ 2>/dev/null | grep -i -E "sunshine|uinput" || echo "(no uinput/sunshine udev rule)"
+  register: _bz_sun_uinput
+  changed_when: false
+
+- name: Check the capabilities set on the Sunshine binary
+  # CAP_SYS_ADMIN is what lets it capture the screen under Wayland/KMS. Without it Sunshine runs,
+  # accepts a connection, and streams a BLACK SCREEN — a failure that looks like a client problem.
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      b=$(command -v sunshine 2>/dev/null)
+      [ -n "$b" ] && getcap "$(readlink -f "$b")" 2>/dev/null || echo "(binary not found or no caps)"
+  register: _bz_sun_caps
+  changed_when: false
+
+- name: Check which ports are listening
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      ss -tulnp 2>/dev/null | grep -E ":(47984|47989|47990|48010|4799[89]|48000)" || echo "(nothing listening on Sunshine ports)"
+  register: _bz_sun_ports
+  changed_when: false
+
+- name: Count the running Sunshine instances
+  # A second instance cannot bind port 48010, logs "Address already in use" and then runs on in a
+  # half-initialised state with no virtual gamepad — video works, the controller does not. Counted
+  # up front so the restart below can clear it before anything judges the service healthy.
+  ansible.builtin.command:
+    cmd: pgrep -xc sunshine
+  register: _bz_sun_count
+  changed_when: false
+  failed_when: false
+
+- name: Store what the survey found
+  # Hoisted out of the report's `vars:` because the apply tasks below need them too, and a var
+  # scoped to one task is not visible to the next.
+  ansible.builtin.set_fact:
+    _installed_now: "{{ (_bz_sun_bin.stdout | trim | length) > 0 or (_bz_sun_flatpak.stdout | trim | length) > 0 }}"
+    _lingering_now: "{{ 'Linger=yes' in (_bz_sun_linger.stdout | default('')) }}"
+    # pgrep -c prints 0 and exits 1 when nothing matches, hence the default.
+    _bz_sun_running_count: "{{ (_bz_sun_count.stdout | default('0') | trim) | int }}"
+
+- name: Report
+  ansible.builtin.debug:
+    msg: "{{ _report.splitlines() }}"
+  vars:
+    _installed: "{{ _installed_now }}"
+    _lingering: "{{ _lingering_now }}"
+    _listening: "{{ 'nothing listening' not in (_bz_sun_ports.stdout | default('')) }}"
+    _report: |
+      ===== IS SUNSHINE INSTALLED? =====
+      binary  : {{ (_bz_sun_bin.stdout_lines | join(', ')) | default('NOT FOUND', true) }}
+      flatpak : {{ (_bz_sun_flatpak.stdout_lines | join(', ')) | default('(none)', true) }}
+
+      ===== SERVICE =====
+      {{ _bz_sun_units.stdout }}
+      lingering: {{ _bz_sun_linger.stdout | default('unknown') | trim }}
+      {{ 'Lingering ON — the service survives logout, so the box streams headless.'
+         if _lingering
+         else 'LINGERING OFF — the user service stops at logout, so Sunshine only runs while
+      someone is logged in at the machine. Enable with: loginctl enable-linger' }}
+
+      ===== CAPTURE AND INPUT =====
+      capabilities: {{ _bz_sun_caps.stdout | default('(unknown)', true) | trim }}
+      {{ _bz_sun_uinput.stdout }}
+
+      ===== PORTS =====
+      {{ _bz_sun_ports.stdout }}
+
+      ===== VERDICT =====
+      {{ 'Sunshine is INSTALLED.' if _installed else 'Sunshine is NOT INSTALLED on this machine.' }}
+      {{ 'It is LISTENING — a Moonlight client on the same network should find it.'
+         if _listening
+         else 'It is NOT listening, so no client can connect yet.' }}
+
+      NEXT: pair a client by opening https://{{ ansible_host | default(inventory_hostname) }}:47990
+      in a browser, setting the admin credential there (store it in your secret
+      store, do not invent one inline), then entering the PIN Moonlight shows.
+
+# ------------------------------------------------------------------------------------------
+# DISABLED. bazzite_sunshine_enabled: false converges to "installed but not running": no
+# autostart entry, no process, nothing listening. The flatpak, its config and its pairings are
+# KEPT, so turning it back on is a flag flip rather than a re-pair.
+#
+# Why this exists: on a Game Mode box Sunshine cannot capture at all (see the HDR notes below),
+# so running it buys nothing — and without this switch the only declared state would be
+# "running", so any converge of this entrypoint (even a preview) would start it.
+#
+# The compositor-HDR tasks further down are NOT gated on this: they govern the session, not the
+# streaming host, and must keep converging whether or not Sunshine runs.
+# ------------------------------------------------------------------------------------------
+
+- name: Decide whether the streaming host itself is converged
+  ansible.builtin.set_fact:
+    _bz_sun_run: "{{ (bazzite_apply | bool) and (bazzite_sunshine_enabled | bool) }}"
+
+- name: Remove the Sunshine autostart entry
+  ansible.builtin.file:
+    path: "{{ ansible_env.HOME }}/.config/autostart/dev.lizardbyte.app.Sunshine.desktop"
+    state: absent
+  when:
+    - bazzite_apply | bool
+    - not (bazzite_sunshine_enabled | bool)
+
+- name: Stop every running Sunshine instance
+  # Same two-step as the restart below: the systemd-run wrapper unit AND the flatpak's own
+  # transient scope, because `flatpak run` hands the real process to that scope and stopping only
+  # the wrapper leaves Sunshine running.
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      export XDG_RUNTIME_DIR=/run/user/$(id -u)
+      export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus
+      _stopped=0
+      if [ "$(systemctl --user is-active sunshine-iaac 2>/dev/null)" = active ]; then
+        systemctl --user stop sunshine-iaac && _stopped=1
+      fi
+      for s in $(systemctl --user list-units --type=scope --no-legend --plain 2>/dev/null \
+                 | awk '/app-flatpak-dev\.lizardbyte\.app\.Sunshine.*\.scope/ {print $1}'); do
+        systemctl --user stop "$s" && _stopped=1
+      done
+      [ "$_stopped" = 1 ] && echo stopped || echo already-stopped
+  register: _bz_sun_stop
+  changed_when: "'stopped' == (_bz_sun_stop.stdout | trim)"
+  when:
+    - bazzite_apply | bool
+    - not (bazzite_sunshine_enabled | bool)
+
+- name: Read back that nothing Sunshine is left running or listening
+  # Asserted on the PROCESS TABLE and the PORT, not on the stop's exit codes: a unit can stop
+  # while a stray instance started some other way keeps the port. `pgrep -x` on the process
+  # name, never `-f` on a path: this shell's own command line contains any -f pattern.
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      _ss=$(ss -tuln 2>/dev/null || true)
+      printf 'procs=%s port=%s\n' \
+        "$(pgrep -xc sunshine || true)" \
+        "$(printf '%s' "$_ss" | grep -cE ':47990\b' || true)"
+  register: _bz_sun_off
+  changed_when: false
+  when:
+    - bazzite_apply | bool
+    - not (bazzite_sunshine_enabled | bool)
+
+- name: Assert Sunshine is stopped
+  ansible.builtin.assert:
+    that:
+      - "(_bz_sun_off.stdout | trim) == 'procs=0 port=0'"
+    fail_msg: "Sunshine is still running after the stop: {{ _bz_sun_off.stdout }}"
+    success_msg: "Sunshine is stopped and not listening ({{ _bz_sun_stop.stdout | trim }})."
+  when:
+    - bazzite_apply | bool
+    - not (bazzite_sunshine_enabled | bool)
+
+# ------------------------------------------------------------------------------------------
+# APPLY. Everything below requires bazzite_apply=true, and the Sunshine-specific tasks also
+# require bazzite_sunshine_enabled (via _bz_sun_run).
+# ------------------------------------------------------------------------------------------
+
+- name: Install the Sunshine flatpak
+  # --system, matching the ujust recipe: a user install would not be visible to the system-scoped
+  # udev and capability setup that additional-install.sh performs.
+  #
+  # become: true is REQUIRED and not incidental. A --system install is a privileged operation
+  # authorised through polkit, and polkit has no way to prompt a non-interactive SSH session — it
+  # refuses with "Flatpak system operation Deploy not allowed for user" AFTER downloading every
+  # runtime, so the failure arrives ~900MB in and looks like a network or repo problem. The ujust
+  # recipe avoids this only because a human is sitting at the desktop to approve the prompt.
+  ansible.builtin.command:
+    argv: [flatpak, install, --system, -y, dev.lizardbyte.app.Sunshine]
+  become: true
+  register: _bz_sun_install
+  changed_when: "'Installing' in (_bz_sun_install.stdout | default(''))"
+  when:
+    - _bz_sun_run | bool
+    - not _installed_now
+
+- name: Run the vendor's privileged setup
+  # Grants the KMS capture capability and installs the input udev rules. Without it Sunshine
+  # starts, accepts a client, and streams a BLACK SCREEN — which reads as a client-side problem.
+  ansible.builtin.command:
+    argv:
+      [
+        flatpak,
+        run,
+        --command=additional-install.sh,
+        dev.lizardbyte.app.Sunshine,
+      ]
+  register: _bz_sun_addl
+  changed_when: true
+  # Privileged for the same reason as the install: it sets file capabilities and writes udev
+  # rules, neither of which an unprivileged user may do.
+  #
+  # Always reports `changed`. The vendor script gives no indication of whether it altered
+  # anything, and re-running it is harmless and idempotent in effect — so claiming `ok` would be
+  # a guess, and claiming changed is at least honest about what is known.
+  become: true
+  when: _bz_sun_run | bool
+
+- name: Enable lingering so the service survives logout
+  # A USER service: without lingering the user manager exits at logout and Sunshine goes with it,
+  # so the box would stream only while somebody is physically logged in.
+  ansible.builtin.command:
+    argv: [loginctl, enable-linger, "{{ ansible_user_id }}"]
+  register: _bz_sun_linger_set
+  changed_when: true
+  become: true
+  when:
+    - _bz_sun_run | bool
+    - not _lingering_now
+
+- name: Autostart Sunshine with the graphical session
+  # WHY NOT `systemctl --user enable app-dev.lizardbyte.app.Sunshine`, which is what the ujust
+  # recipe does: that unit does not exist as a file anywhere. It is GENERATED by
+  # systemd-xdg-autostart-generator from an autostart .desktop entry, and the generator only runs
+  # inside a graphical session — so over SSH the unit is simply "not found", and enabling it is
+  # what would have created the autostart link in the first place.
+  #
+  # Creating the autostart entry directly is both the thing that actually makes it start and the
+  # declarative version of it: the generator picks it up at next login and the unit appears.
+  ansible.builtin.copy:
+    dest: "{{ ansible_env.HOME }}/.config/autostart/dev.lizardbyte.app.Sunshine.desktop"
+    src: /var/lib/flatpak/exports/share/applications/dev.lizardbyte.app.Sunshine.desktop
+    remote_src: true
+    mode: "0644"
+  when: _bz_sun_run | bool
+
+- name: Start Sunshine now, without waiting for a re-login
+  # The autostart entry above takes effect at the NEXT login. Launching it here too means the
+  # service is usable immediately, which is the difference between "configured" and "working".
+  # Backgrounded via systemd-run so it outlives this SSH session — a bare `flatpak run &` is
+  # killed when the connection closes, which reads as Sunshine crashing on startup.
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      export XDG_RUNTIME_DIR=/run/user/$(id -u)
+      export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus
+      # grep -c on captured output, not `| grep -q`: under pipefail a large listener table
+      # makes grep -q close the pipe, ss takes SIGPIPE and the test inverts (PIPEQ-01).
+      _ss=$(ss -tuln 2>/dev/null || true)
+      if [ "$(printf '%s' "$_ss" | grep -cE ':47990')" -gt 0 ]; then
+        echo "already-running"
+      else
+        systemd-run --user --unit=sunshine-iaac --collect \
+          flatpak run dev.lizardbyte.app.Sunshine >/dev/null 2>&1 && echo "started"
+      fi
+  register: _bz_sun_start
+  changed_when: "'started' in (_bz_sun_start.stdout | default(''))"
+  when: _bz_sun_run | bool
+
+- name: Wait for Sunshine to listen on its web port
+  # A real readiness check rather than a sleep: the service reports active well before the web
+  # listener is up, and pairing against a port that is not open yet fails confusingly.
+  ansible.builtin.wait_for:
+    port: 47990
+    host: 127.0.0.1
+    timeout: 60
+  when: _bz_sun_run | bool
+
+# ---------------------------------------------------------------------------------------------
+# THE COMPOSITOR HALF OF HDR.
+#
+# Sunshine advertising a 10-bit profile is necessary and NOT sufficient: on Linux it cannot put
+# the display into HDR itself. The dd_hdr_option settings that do so are Windows-only, so with
+# the compositor in SDR the stream carries an SDR image inside an HDR container — washed out,
+# and worse than leaving HDR off entirely.
+#
+# WHICH COMPOSITOR depends on how the machine logs in, and they do not share a setting:
+#
+#   Game Mode (gamescope)  ENABLE_GAMESCOPE_HDR=1 in the session environment, which makes
+#                          gamescope-session-plus add --hdr-enabled --hdr-itm-enable.
+#   Desktop (KWin)         "highDynamicRange": true in kwinoutputconfig.json, per display.
+#
+# Both are written when HDR is requested, because the machine can be booted either way and a
+# setting that only applies to the session that happened to be running is a trap.
+# ---------------------------------------------------------------------------------------------
+
+- name: Ensure the session environment directory exists
+  # ~/.config/environment.d/*.conf is sourced by gamescope-session-plus (and by systemd's user
+  # manager), so this is the supported way in — no edit to a file under /usr, which an image
+  # update would revert anyway.
+  ansible.builtin.file:
+    path: "{{ ansible_env.HOME }}/.config/environment.d"
+    state: directory
+    mode: "0755"
+  when: bazzite_apply | bool
+
+- name: Set Game Mode's HDR environment
+  # ENABLE_GAMESCOPE_WSI is already 1 from the session script's own defaults, but it is written
+  # here too: the HDR branch tests BOTH, so relying on the default would make this depend on a
+  # value in a file under /usr that we do not control.
+  #
+  # --hdr-itm-enable (inverse tone mapping) comes with --hdr-enabled in that same branch, which
+  # is what makes SDR content look right on an HDR output rather than dull.
+  #
+  # A TEMPLATE rather than `copy: content:` — `ansible_managed` is injected by the template
+  # action and is undefined in a copy's content, which fails the task outright.
+  ansible.builtin.template:
+    src: gamescope-hdr.conf.j2
+    dest: "{{ ansible_env.HOME }}/.config/environment.d/50-iaac-hdr.conf"
+    mode: "0644"
+  when:
+    - bazzite_apply | bool
+    - bazzite_sunshine_hdr | bool
+
+- name: Remove Game Mode's HDR environment when HDR is not requested
+  # DO LESS. With HDR off, writing ENABLE_GAMESCOPE_HDR=0 restates the image: gamescope-session-plus
+  # adds --hdr-enabled --hdr-itm-enable only when the variable == "1", and exports
+  # ENABLE_GAMESCOPE_WSI=1 itself. So with HDR off the file is removed rather than written.
+  # (Steam's own HDR toggle is separate: it drives gamescope at runtime, not via this file.)
+  ansible.builtin.file:
+    path: "{{ ansible_env.HOME }}/.config/environment.d/50-iaac-hdr.conf"
+    state: absent
+  when:
+    - bazzite_apply | bool
+    - not (bazzite_sunshine_hdr | bool)
+
+# ---------------------------------------------------------------------------------------------
+# WHY THERE IS NO PORTAL-ROUTING TASK HERE.
+#
+# In a Game Mode (gamescope) session Sunshine cannot capture at all: the only backend on this
+# image providing org.freedesktop.impl.portal.ScreenCast is xdg-desktop-portal-kde, and
+# kde.portal is marked `UseIn=KDE`, so xdg-desktop-portal never loads it and the interface is
+# absent from the bus.
+#
+# The obvious fix — a ~/.config/xdg-desktop-portal/gamescope-portals.conf with
+# `org.freedesktop.impl.portal.ScreenCast=kde` — DOES NOT WORK. The routing
+# is accepted and the backend still cannot start: it is a Qt application that needs a display
+# connection, and under D-Bus activation outside Plasma it aborts:
+#
+#     xdg-desktop-portal-kde[<pid>]: could not connect to display
+#     plasma-xdg-desktop-portal-kde.service: Main process exited, code=dumped, status=6/ABRT
+#
+# So the preference points at a backend that cannot run, and capture fails exactly as before —
+# a config that reads as a fix and changes nothing. Recorded rather than left in place, because
+# the next person to hit this will reach for the same file.
+#
+# REAL OPTIONS, none of which belong in this entrypoint:
+#   * run the machine in the KDE desktop session, where capture works today
+#     (bazzite_login_mode: desktop) — Sunshine can still launch Steam Big Picture;
+#   * install a portal backend that works headlessly under wlroots-style compositors
+#     (xdg-desktop-portal-wlr), which is NOT in this image and would be rpm-ostree layering —
+#     and gamescope's screencopy support would need verifying before that is worth doing.
+#
+# Reported by the capture assertion after the restart below, which fails the play rather than
+# letting a stream-time 503 be the first sign.
+# ---------------------------------------------------------------------------------------------
+
+- name: Check whether the RUNNING session actually has HDR
+  # WRITING THE ENV FILE IS NOT THE SAME AS IT TAKING EFFECT. environment.d is read when the
+  # session STARTS, so a gamescope launched before this play keeps running without
+  # --hdr-enabled — the file is correct, the compositor is not, and nothing reports a
+  # difference. Exactly the shape of the sunshine.conf bug this role already carries a fix for,
+  # and of the Plasma 6 power bug before that.
+  #
+  # Asks the process, not the file: the flags on the running gamescope are the only evidence.
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      if ! pgrep -f '^/usr/bin/gamescope ' >/dev/null 2>&1; then
+        echo 'session=none'
+        exit 0
+      fi
+      # See PIPEQ-01: ps output is long, so `| grep -q` under pipefail can invert this.
+      _psargs=$(ps -eo args || true)
+      if [ "$(printf '%s' "$_psargs" | grep -c -- '^/usr/bin/gamescope .*--hdr-enabled')" -gt 0 ]; then
+        echo 'session=gamescope hdr=enabled'
+      else
+        echo 'session=gamescope hdr=disabled'
+      fi
+  register: _bz_gamescope_hdr
+  changed_when: false
+
+- name: Warn when Game Mode needs restarting to pick HDR up
+  # A WARNING, not a failure: everything this play was asked to write HAS been written, and
+  # failing here would make a correct run look broken. But saying nothing would let "HDR is
+  # configured" stand while the compositor streams SDR.
+  ansible.builtin.debug:
+    msg: >-
+      GAME MODE IS RUNNING WITHOUT HDR. The environment file is written, but
+      gamescope-session-plus reads it at SESSION START and this session began before that —
+      so the running compositor has no --hdr-enabled and the stream will be SDR whatever
+      Sunshine advertises. Reboot, or restart the session, then confirm with
+      bazzite_action=display_report.
+  when:
+    - bazzite_sunshine_hdr | bool
+    - "'hdr=disabled' in (_bz_gamescope_hdr.stdout | default(''))"
+
+- name: Set KWin's HDR state for every HDR-capable display
+  # KEYED BY edidHash, NOT by index. kwinoutputconfig.json accumulates an entry per display the
+  # machine has ever seen — often several on the same connector — so an index is whichever
+  # monitor was plugged in first, and writing to [0] would configure a display that is not here.
+  #
+  # Only displays whose EDID actually declares HDR are touched: forcing the flag on a panel that
+  # cannot do it makes KWin either ignore it or produce a visibly wrong picture.
+  ansible.builtin.script:
+    cmd:
+      kwin_hdr.py --config {{ ansible_env.HOME }}/.config/kwinoutputconfig.json --hdr {{ 'true' if bazzite_sunshine_hdr else 'false' }} {{ '--apply' if
+      bazzite_apply | bool else '' }}
+    executable: "{{ bazzite_python }}"
+  register: _bz_kwin_hdr_set
+  # `applied`, NOT `changed`. `changed` means "differs from what is declared", which is true on
+  # a report run too — reporting that as a change makes a read-only play claim it modified the
+  # machine, and makes `changed=0` useless as a signal that nothing happened.
+  changed_when: (_bz_kwin_hdr_set.stdout[_bz_kwin_hdr_set.stdout.find('{') :] | from_json).applied | bool
+
+- name: Report the compositor HDR state
+  ansible.builtin.debug:
+    msg: "{{ _r.messages }}"
+  vars:
+    _r: "{{ _bz_kwin_hdr_set.stdout[_bz_kwin_hdr_set.stdout.find('{') :] | from_json }}"
+
+- name: Ensure the Sunshine config directory exists
+  # The FLATPAK path, not ~/.config/sunshine — the sandbox redirects it, and a file written to
+  # the unsandboxed location is never read. Verified against the running process's open files.
+  ansible.builtin.file:
+    path: "{{ ansible_env.HOME }}/.var/app/dev.lizardbyte.app.Sunshine/config/sunshine"
+    state: directory
+    mode: "0700"
+  when: _bz_sun_run | bool
+
+- name: Template the Sunshine configuration
+  # WHOLE-FILE, not lineinfile. Sunshine rewrites this file when settings change in its web UI,
+  # so key-by-key management means the repo and the browser fight over it and whoever wrote last
+  # wins. Templating makes the repo authoritative — and makes the settings reviewable, which a
+  # file built up by clicking never is.
+  #
+  # Origins are NAMES, not the current IP: an earlier version derived one from
+  # ansible_default_ipv4 and baked in the DHCP lease of the moment. When the lease moves, the
+  # entry is dead while looking perfectly valid.
+  ansible.builtin.template:
+    src: sunshine.conf.j2
+    dest: "{{ ansible_env.HOME }}/.var/app/dev.lizardbyte.app.Sunshine/config/sunshine/sunshine.conf"
+    mode: "0600"
+    backup: true
+  vars:
+    _bz_sun_origins: >-
+      {{ ([
+           'https://' ~ inventory_hostname ~ ':47990',
+           'https://' ~ (ansible_host | default(inventory_hostname)) ~ ':47990',
+           'https://localhost:47990',
+           'https://127.0.0.1:47990',
+         ] + (bazzite_sunshine_extra_origins | default([]))) | unique | list }}
+  register: _bz_sun_csrf
+  when:
+    - _bz_sun_run | bool
+    - bazzite_sunshine_manage_config | bool
+
+# COVER ART. Sourced from Steam's OWN library cache rather than downloaded: Steam already
+# stores box art for every installed game, so this needs no network call, no third-party image
+# host and nothing to rate-limit — and the art matches what the Steam client shows.
+#
+# Portrait (library_600x900) is preferred because Sunshine's grid is portrait; a header image
+# gets letterboxed into an ugly strip. A game with neither cached is reported rather than
+# silently left blank.
+- name: Install the cover-art resolver
+  ansible.builtin.copy:
+    src: sunshine_covers.py
+    dest: "{{ bazzite_sunshine_covers_helper }}"
+    mode: "0755"
+  when:
+    - _bz_sun_run | bool
+    - bazzite_sunshine_manage_config | bool
+
+- name: Resolve cover art for apps with a Steam appid
+  ansible.builtin.command:
+    argv:
+      - "{{ bazzite_python }}"
+      - "{{ bazzite_sunshine_covers_helper }}"
+      - --covers-dir
+      - "{{ ansible_env.HOME }}/.var/app/dev.lizardbyte.app.Sunshine/config/sunshine/covers"
+      - --apps
+      - "{{ _bz_cover_apps | to_json }}"
+      - --apply
+  vars:
+    _bz_cover_apps: >-
+      {{ bazzite_sunshine_apps | selectattr('appid', 'defined')
+         | map('dict2items') | map('items2dict') | list }}
+  register: _bz_covers
+  changed_when: (_bz_covers.stdout[_bz_covers.stdout.find('{') :] | from_json).changed | int > 0
+  when:
+    - _bz_sun_run | bool
+    - bazzite_sunshine_manage_config | bool
+    - (bazzite_sunshine_apps | selectattr('appid', 'defined') | list | length) > 0
+
+- name: Report the cover art
+  ansible.builtin.debug:
+    msg: >-
+      {{ (_bz_covers.stdout[_bz_covers.stdout.find('{') :] | from_json).covers
+         | map(attribute='name') | zip((_bz_covers.stdout[_bz_covers.stdout.find('{') :] | from_json).covers
+         | map(attribute='status')) | map('join', ': ') | list }}
+  when:
+    - _bz_sun_run | bool
+    - _bz_covers.stdout is defined
+
+- name: List the cover files that exist
+  # The resolver names a cover after the appid but keeps the SOURCE extension (.jpg or .png
+  # depending on what Steam cached), so the template cannot guess the filename — it has to be
+  # looked up.
+  ansible.builtin.find:
+    paths: "{{ bazzite_sunshine_covers_dir }}"
+    patterns: "*.png,*.jpg"
+  register: _bz_cover_files_found
+  when:
+    - _bz_sun_run | bool
+    - bazzite_sunshine_manage_config | bool
+
+- name: Template the app list
+  # Written via a temp file and validated as JSON before replacing the real one: Sunshine reads
+  # apps.json at startup and a malformed file leaves it with NO apps, which presents as a client
+  # connecting to an empty host rather than as a config error.
+  ansible.builtin.template:
+    src: sunshine-apps.json.j2
+    dest: "{{ ansible_env.HOME }}/.var/app/dev.lizardbyte.app.Sunshine/config/sunshine/apps.json"
+    mode: "0644"
+    backup: true
+    validate: '{{ bazzite_python }} -c "import json,sys; json.load(open(sys.argv[1]))" %s'
+  vars:
+    _bz_cover_files: "{{ _bz_cover_files_found.files | default([]) | map(attribute='path') | map('basename') | list }}"
+  register: _bz_sun_apps
+  when:
+    - _bz_sun_run | bool
+    - bazzite_sunshine_manage_config | bool
+
+- name: Restart Sunshine to load the new configuration
+  # Sunshine reads its config at startup only. Without this the file is correct on disk and the
+  # running process still refuses the origin — the same class of bug as the Plasma 6 power
+  # settings, where a correct file and an unchanged daemon looked identical to success.
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      export XDG_RUNTIME_DIR=/run/user/$(id -u)
+      export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus
+      # STOPPING THE WRAPPER UNIT IS NOT ENOUGH. `flatpak run` hands the real process off to its
+      # own transient scope (app-flatpak-dev.lizardbyte.app.Sunshine-<n>.scope), so
+      # `systemctl --user stop sunshine-iaac` kills the launcher and leaves Sunshine running.
+      # Each restart then stacks another instance, and the second one logs
+      #   Fatal: Couldn't bind RTSP server to port [48010], Address already in use
+      # then runs on in a half-initialised state with NO virtual gamepad — video works and the
+      # controller does not. Stop every scope, then confirm the process is really gone.
+      systemctl --user stop sunshine-iaac 2>/dev/null || true
+      for u in $(systemctl --user list-units --no-legend --plain 2>/dev/null \
+                 | awk '/app-flatpak-dev\.lizardbyte\.app\.Sunshine.*\.scope/ {print $1}'); do
+        systemctl --user stop "$u" 2>/dev/null || true
+      done
+      pkill -x sunshine 2>/dev/null || true
+      for i in $(seq 1 30); do pgrep -x sunshine >/dev/null || break; sleep 0.5; done
+      # SIGKILL only if it refused to exit: a half-dead instance still holding 48010 is exactly
+      # what produced the broken state above.
+      pgrep -x sunshine >/dev/null && pkill -9 -x sunshine 2>/dev/null || true
+      for i in $(seq 1 10); do pgrep -x sunshine >/dev/null || break; sleep 0.5; done
+      if pgrep -x sunshine >/dev/null; then echo "STILL-RUNNING"; exit 1; fi
+      # INHERIT THE GRAPHICAL SESSION'S ENVIRONMENT, not this SSH connection's.
+      #
+      # Sunshine captures the screen through the XDG desktop portal ("Screencasting with XDG
+      # portal" in its log), which needs to reach the session's D-Bus and know which display to
+      # capture. Started from SSH without them it comes up, listens, accepts a client, and then
+      # fails at stream time with:
+      #     Error: Failed to gain CAP_SYS_ADMIN
+      #     Fatal: Unable to find display or encoder during startup
+      # which the client reports as "failed to initialize video capture/encoding. is a display
+      # connected and turned on? Error 503" — a message that points at the monitor rather than
+      # at the environment the daemon was launched in.
+      #
+      # systemctl --user show-environment is the session's OWN record of these, kept by the
+      # user manager, so it stays correct across session restarts and display-server changes
+      # rather than hardcoding a socket name. A broken instance shows
+      # DBUS_SESSION_BUS_ADDRESS=/run/flatpak/bus and no WAYLAND_DISPLAY at all, while the
+      # session manager reports /run/user/1000/bus.
+      SESSION_ENV=""
+      for var in WAYLAND_DISPLAY DISPLAY DBUS_SESSION_BUS_ADDRESS XDG_SESSION_TYPE XDG_CURRENT_DESKTOP; do
+        val=$(systemctl --user show-environment 2>/dev/null | sed -n "s/^${var}=//p" | head -1)
+        [ -n "$val" ] && SESSION_ENV="$SESSION_ENV --setenv=${var}=${val}"
+      done
+      # shellcheck disable=SC2086
+      systemd-run --user --unit=sunshine-iaac --collect $SESSION_ENV \
+        flatpak run dev.lizardbyte.app.Sunshine >/dev/null 2>&1
+      echo restarted
+  register: _bz_sun_restart
+  changed_when: "'restarted' in (_bz_sun_restart.stdout | default(''))"
+  when:
+    - _bz_sun_run | bool
+    # RESTART WHEN THE CONFIG ACTUALLY CHANGED, on request, or when the current state is already
+    # broken (more than one instance — the condition that leaves a working video stream with no
+    # virtual gamepad).
+    #
+    # Without the config condition this is a false success: Sunshine reads its
+    # config only at startup, so templating a new sunshine.conf without restarting left the file
+    # correct on disk and the running process on the old values — the file says hevc_mode = 3
+    # while the process logs `config: 'hevc_mode' = 2`, configured everywhere except the one
+    # place that matters.
+    #
+    # Both templates are checked. `| default(...)` because on a first pass where bazzite_apply
+    # is false neither task ran, and a bare reference would fail the play.
+    - >-
+      (bazzite_sunshine_restart | bool)
+      or ((_bz_sun_running_count | int) > 1)
+      or (_bz_sun_csrf.changed | default(false) | bool)
+      or (_bz_sun_apps.changed | default(false) | bool)
+
+- name: Assert Sunshine can actually capture the screen
+  # LISTENING IS NOT WORKING. Sunshine binds its ports and serves its web UI perfectly well
+  # with no access to a display — the failure only surfaces when a client tries to stream, as
+  #     "failed to initialize video capture/encoding. is a display connected and turned on?
+  #      Error 503"
+  # which reads as a monitor problem and is really a daemon started without the session's
+  # environment.
+  #
+  # So the port check below is necessary and NOT sufficient. This reads what the daemon itself
+  # logged at startup: it announces its capture backend ("Screencasting with XDG portal") when
+  # it found one, and logs CAP_SYS_ADMIN failures followed by "Unable to find display or
+  # encoder" when it did not.
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      L="{{ ansible_env.HOME }}/.var/app/dev.lizardbyte.app.Sunshine/config/sunshine/sunshine.log"
+      # Only THIS start's lines: the log accumulates across restarts, and an older successful
+      # start would otherwise vouch for a broken current one.
+      START=$(grep -n 'Sunshine version' "$L" 2>/dev/null | tail -1 | cut -d: -f1)
+      [ -n "$START" ] || { echo 'capture=unknown'; exit 0; }
+      TAIL=$(tail -n "+$START" "$L")
+      # MATCH ON SUCCESS, NOT ON A LIST OF FAILURES. Grepping only for "Unable to find display or
+      # encoder" misses a broken start that logs "Unable to initialize capture method" instead,
+      # and passes a daemon that cannot capture. Sunshine has several distinct ways to fail here
+      # and enumerating them is a losing game; it has exactly one way to say it succeeded.
+      #
+      # NOTE "Failed to gain CAP_SYS_ADMIN" is NORMAL and must not be treated as failure: it
+      # appears in known-good startups immediately before "drop_elevated_privileges succeeded",
+      # because Sunshine tries for KMS capture, cannot get it in a flatpak, and falls back to
+      # the portal. Reading that as an error points at file capabilities for a problem that has
+      # nothing to do with them.
+      if [ "$(printf '%s' "$TAIL" | grep -cE 'Screencasting with|Found monitor|Found stream for display')" -gt 0 ]; then
+        echo 'capture=ok'
+      elif [ "$(printf '%s' "$TAIL" | grep -cE 'Unable to (find display or encoder|initialize capture method)|Could not create ScreenCast session')" -gt 0 ]; then
+        echo 'capture=FAILED'
+      else
+        echo 'capture=unknown'
+      fi
+  register: _bz_sun_capture
+  changed_when: false
+  when:
+    - _bz_sun_run | bool
+    - _bz_sun_restart.changed | default(false) | bool
+
+- name: Fail when Sunshine came up unable to capture
+  # A HARD FAILURE. The alternative: the play reports success, every config file is correct, and
+  # the next stream attempt fails with an error pointing at the display. A restart that leaves the daemon unable to capture has not succeeded.
+  ansible.builtin.assert:
+    that:
+      - "'capture=FAILED' not in (_bz_sun_capture.stdout | default(''))"
+    fail_msg: >-
+      Sunshine restarted but CANNOT CAPTURE THE SCREEN. It is listening and its web UI works;
+      a client will get "failed to initialize video capture/encoding. is a display connected
+      and turned on? Error 503".
+
+      MOST LIKELY: no XDG portal backend is providing ScreenCast for this session. The KDE
+      backend is marked UseIn=KDE, so in a Game Mode (gamescope) session xdg-desktop-portal
+      does not load it and org.freedesktop.portal.ScreenCast does not exist — capture works in
+      the KDE desktop session and fails in Game Mode on the same machine. Check with
+      `busctl --user introspect org.freedesktop.portal.Desktop /org/freedesktop/portal/desktop`
+      and re-run bazzite_action=sunshine without bazzite_apply for its report.
+
+      LESS LIKELY: the daemon inherited a non-graphical environment and cannot reach the
+      session bus at all.
+    quiet: true
+  when:
+    - _bz_sun_run | bool
+    - _bz_sun_restart.changed | default(false) | bool
+
+- name: Wait for Sunshine to come back
+  ansible.builtin.wait_for:
+    port: 47990
+    host: 127.0.0.1
+    timeout: 60
+  when:
+    - _bz_sun_run | bool
+    - (_bz_sun_csrf.changed | default(false)) or (_bz_sun_apps.changed | default(false)) or (bazzite_sunshine_restart | default(false) | bool)
+
+- name: Confirm which encoder was selected
+  # Sunshine probes encoders ONCE at startup, so this is only meaningful after a restart — and
+  # the encoder= setting is silently ignored if the probe fails, falling back to the generic
+  # Vulkan path with no error. Reported rather than asserted: a machine without VAAPI is
+  # working correctly on the fallback, just less efficiently.
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      grep -iE 'Found (H.264|HEVC|AV1) encoder' \
+        "$HOME/.var/app/dev.lizardbyte.app.Sunshine/config/sunshine/sunshine.log" 2>/dev/null \
+        | tail -3 | sed 's/.*Info: //' || echo "(no encoder lines in the log yet)"
+  register: _bz_sun_encoder
+  changed_when: false
+  when: _bz_sun_run | bool
+
+- name: Report the encoder in use
+  ansible.builtin.debug:
+    msg:
+      - "{{ _bz_sun_encoder.stdout_lines | default([]) }}"
+      - >-
+        {{ 'Using the GPU''s dedicated encode hardware.'
+           if (_bz_sun_encoder.stdout | default('')) is search('vaapi')
+           else 'NOT on VAAPI — this is the generic Vulkan compute fallback, which costs GPU
+        time a game would rather have. Check that encoder=' ~ 'vaapi is in sunshine.conf and
+        that the adapter path names the discrete card.' }}
+  when: _bz_sun_run | bool
+
+- name: Read back the running state
+  # The evidence, not the enable call's own return: `systemctl enable` succeeding says nothing
+  # about whether the process stayed up, and a crash-loop reports enabled quite happily.
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      printf 'ports=%s\n'     "$(ss -tuln 2>/dev/null | grep -cE ':(47984|47989|47990|48010)')"
+      # Instance count: a SECOND copy binds nothing, logs "Address already in use" for 48010 and
+      # then runs without a virtual gamepad — a state where video works and input does not.
+      printf 'instances=%s\n' "$(pgrep -xc sunshine 2>/dev/null || echo 0)"
+      printf 'rtsp_fatal=%s\n' "$(tail -200 "$HOME/.var/app/dev.lizardbyte.app.Sunshine/config/sunshine/sunshine.log" 2>/dev/null | grep -c 'Couldn.t bind RTSP')"
+      # -x on the process NAME: -f would match this shell's own command line, which names
+      # sunshine, so proc=0 could never be reported.
+      printf 'proc=%s\n'      "$(pgrep -xc sunshine 2>/dev/null || echo 0)"
+      printf 'linger=%s\n'    "$(loginctl show-user "$USER" --property=Linger 2>/dev/null)"
+      printf 'autostart=%s\n' "$([ -f "$HOME/.config/autostart/dev.lizardbyte.app.Sunshine.desktop" ] && echo yes || echo no)"
+      printf 'web=%s\n'       "$(curl -sk -o /dev/null -w '%{http_code}' https://127.0.0.1:47990/ 2>/dev/null)"
+  register: _bz_sun_final
+  changed_when: false
+  when: _bz_sun_run | bool
+
+- name: Assert Sunshine is actually serving
+  # Gated on OBSERVABLE BEHAVIOUR — ports open and the web UI answering — not on a systemd unit
+  # name. The generated unit `app-dev.lizardbyte.app.Sunshine` reports `not-found` over SSH even
+  # while Sunshine is running perfectly, because the xdg-autostart generator only runs inside a
+  # graphical session, so asserting on that name would fail a working install.
+  ansible.builtin.assert:
+    that:
+      - "'ports=0' not in _bz_sun_final.stdout"
+      - "'proc=0' not in _bz_sun_final.stdout"
+      # Exactly one. Two instances is the failure that presents as a working stream with a dead
+      # controller, and nothing else in this play would catch it.
+      - "'instances=1' in _bz_sun_final.stdout"
+      - "'rtsp_fatal=0' in _bz_sun_final.stdout"
+      - "'Linger=yes' in _bz_sun_final.stdout"
+      - "'autostart=yes' in _bz_sun_final.stdout"
+      # Any 2xx/3xx/401 proves the UI is SERVING, which is all this needs to establish. A
+      # first-run Sunshine answers 307, redirecting to its welcome/setup page; 401 means auth is
+      # configured and nobody is logged in. Enumerating the healthy codes rather than requiring
+      # 200 avoids failing a working install for answering a redirect.
+      - _bz_sun_final.stdout is search('web=(2[0-9][0-9]|30[0-8]|401)')
+    fail_msg: >-
+      Sunshine is not serving: {{ _bz_sun_final.stdout_lines | join(' ') }}.
+      ports/proc show whether it is running at all; autostart=no means it will not survive a
+      reboot; web= is the UI's HTTP status.
+    quiet: true
+  when: _bz_sun_run | bool
+
+- name: Report how to pair
+  ansible.builtin.debug:
+    msg:
+      - "{{ _bz_sun_final.stdout_lines }}"
+      - >-
+        Sunshine is up. Open https://{{ ansible_host | default(inventory_hostname) }}:47990 and
+        set the admin username/password on first visit — the browser will warn about the
+        self-signed certificate, which is expected for a LAN service.
+      - >-
+        Store that credential in your secret store rather than anywhere in a
+        repository. It is deliberately not generated here.
+      - >-
+        Then on the client: Moonlight will discover this host on the LAN, show a PIN, and you
+        enter that PIN in the Sunshine web UI under PIN.
+  when: _bz_sun_run | bool
+
+# ------------------------------------------------------------------------------------------
+# CONFIGURATION. Sunshine's own settings file, distinct from the service plumbing above.
+# ------------------------------------------------------------------------------------------
+#
+# CSRF ORIGINS. Sunshine's web UI rejects requests whose Origin header is not localhost, with
+# "The request was blocked by CSRF protection". That is correct default behaviour — the UI can
+# change stream settings and pair new clients, so it should not be reachable cross-origin — but
+# it means reaching it by DNS NAME rather than 127.0.0.1 is refused until the name is declared.
+#
+# Every name the UI will legitimately be opened under has to be listed: the DNS name, the IP, and
+# localhost. A name that is missing fails at the CSRF check with a message that reads like a
+# security problem rather than a missing config line.
+#
+# The values are derived from the inventory rather than hardcoded, so a host reached by a
+# different name gets the right origins without editing the role.
+
+- name: Verify the origin is actually accepted
+  # The real test: a request carrying the DNS name as its Origin. Checking only that the config
+  # line exists would pass while the daemon still ran with the old config — which is exactly the
+  # failure this restart exists to prevent, so the proof has to come from the server's response.
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      curl -sk -o /dev/null -w '%{http_code}' \
+        -H 'Origin: https://{{ ansible_host | default(inventory_hostname) }}:47990' \
+        'https://127.0.0.1:47990/'
+  register: _bz_sun_csrf_test
+  changed_when: false
+  when: _bz_sun_run | bool
+
+- name: Assert the web UI accepts the configured origin
+  ansible.builtin.assert:
+    that:
+      # Compared as an exact token rather than an anchored regex over raw stdout: '$' without
+      # (?m) anchors the end of the WHOLE string, so a second line of output would silently
+      # fail to match (ANCHOR-01).
+      - (_bz_sun_csrf_test.stdout | trim) in _bz_ok_codes
+    fail_msg: >-
+      Sunshine still rejects the origin
+      https://{{ ansible_host | default(inventory_hostname) }}:47990 — HTTP
+      {{ _bz_sun_csrf_test.stdout | default('(no response)') | trim }}.
+      A 403 here means the CSRF list did not take; check the config file and that the process
+      actually restarted.
+    quiet: true
+  vars:
+    # 2xx/3xx/401 all prove the UI is SERVING and not refusing the origin; 401 simply means auth
+    # is configured and this request is unauthenticated.
+    _bz_ok_codes: ["200", "204", "301", "302", "303", "307", "308", "401"]
+  when: _bz_sun_run | bool
+
+- name: Report the configured origins
+  ansible.builtin.debug:
+    msg:
+      - "csrf_allowed_origins now set; web UI answers {{ _bz_sun_csrf_test.stdout | trim }} for the DNS origin."
+      - "Open https://{{ ansible_host | default(inventory_hostname) }}:47990 and set the admin credential."
+  when: _bz_sun_run | bool
+
+# ------------------------------------------------------------------------------------------
+# VIRTUAL GAMEPAD. Separate from the capture path, and fails separately.
+# ------------------------------------------------------------------------------------------
+#
+# Sunshine synthesises input on the host: keyboard, mouse and touch go through /dev/uinput, but
+# the GAMEPAD goes through /dev/uhid. They are different devices with different permissions, so
+# input can be half-working — mouse and keyboard fine, controller dead — which reads as a client
+# or game problem rather than a permissions one.
+#
+# The symptom: video streams correctly and the controller does nothing. The log says
+# "Gamepad 0 will be Sunshine (libvirtualhid) X-Box Series Controller" and then no gamepad
+# appears in /proc/bus/input/devices, with NO error logged, while /dev/uinput carries an ACL (+)
+# and /dev/uhid is crw------- root root.
+#
+# The udev rule granting access (60-sunshine-ublue.rules: KERNEL=="uhid", TAG+="uaccess") can be
+# installed and correct and still never APPLIED to the existing node: udev rules run when a device
+# is created, and /dev/uhid is created at boot — before rules added later. A reboot fixes it;
+# `udevadm trigger` fixes it now, and is idempotent.
+
+- name: Check whether the virtual-input devices are accessible
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      printf 'uinput=%s\n' "$(test -w /dev/uinput && echo yes || echo no)"
+      # WRITABILITY IS NOT THE TEST. After `rmmod uhid` the node KEEPS its ACL, so `test -w`
+      # still returns true while the driver behind it is gone and the device is unusable —
+      # a guard on permissions alone reports healthy on a broken system. The sysfs path is the
+      # honest signal: it exists only when the module is actually loaded.
+      printf 'uhid_writable=%s\n' "$(test -w /dev/uhid && echo yes || echo no)"
+      printf 'uhid=%s\n' "$(udevadm info -q path -n /dev/uhid >/dev/null 2>&1 && test -w /dev/uhid && echo yes || echo no)"
+      _lsmod=$(lsmod || true)
+      printf 'uhid_loaded=%s\n' "$([ "$(printf '%s' "$_lsmod" | grep -cE '^uhid ')" -gt 0 ] && echo yes || echo no)"
+  register: _bz_sun_input
+  changed_when: false
+
+- name: Load the uhid kernel module
+  # THE ACTUAL FIX, and not the one it first appears to be. /dev/uhid can exist as
+  # crw------- root root with no ACL, which looks like a udev permissions problem — so the
+  # obvious move is `udevadm trigger`. That fails with "Failed to open the device '/dev/uhid':
+  # No such device", because the node is a STATIC NODE created by systemd from the module's
+  # declared static-node list, and the uhid MODULE IS NOT LOADED. There is no device for udev
+  # to process, hence no rule evaluation and no ACL.
+  #
+  # Loading the module creates the real device, udev then applies
+  # 60-sunshine-ublue.rules (KERNEL=="uhid", TAG+="uaccess") on its own, and the node becomes
+  # crw-rw----+ — the '+' being the ACL, matching /dev/uinput.
+  community.general.modprobe:
+    name: uhid
+    state: present
+    persistent: present
+  become: true
+  when:
+    - _bz_sun_run | bool
+    - "'uhid=no' in (_bz_sun_input.stdout | default(''))"
+
+- name: Settle udev so the rule is applied before re-reading
+  ansible.builtin.command:
+    argv: [udevadm, settle, --timeout=10]
+  become: true
+  changed_when: false
+  when:
+    - _bz_sun_run | bool
+    - "'uhid=no' in (_bz_sun_input.stdout | default(''))"
+
+- name: Confirm the gamepad device is now writable
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      printf 'uhid=%s\n' "$(test -w /dev/uhid && echo yes || echo no)"
+      printf 'perms=%s\n' "$(ls -l /dev/uhid | awk '{print $1}')"
+      printf 'sysfs=%s\n' "$(udevadm info -q path -n /dev/uhid 2>/dev/null || echo none)"
+  register: _bz_sun_input_after
+  changed_when: false
+  when:
+    - _bz_sun_run | bool
+    - "'uhid=no' in (_bz_sun_input.stdout | default(''))"
+
+- name: Assert the gamepad device is accessible
+  # Gated on WRITABILITY and on the node having a real sysfs path. The permission bits alone are
+  # not enough: a static node with no backing driver can look present and still be unusable,
+  # which is precisely the state this task exists to escape.
+  ansible.builtin.assert:
+    that:
+      - "'uhid=yes' in (_bz_sun_input_after.stdout | default(''))"
+      - "'sysfs=none' not in (_bz_sun_input_after.stdout | default(''))"
+    fail_msg: >-
+      /dev/uhid is still not usable ({{ _bz_sun_input_after.stdout_lines | default([]) | join(' ') }}).
+      Without it Sunshine creates a keyboard and mouse but NO gamepad, and the controller appears
+      dead while everything else works.
+    quiet: true
+  when:
+    - _bz_sun_run | bool
+    - "'uhid=no' in (_bz_sun_input.stdout | default(''))"
+
+- name: Note that Sunshine must be restarted for the gamepad to appear
+  # Sunshine opens /dev/uhid at startup. A running instance that failed to open it does not retry,
+  # so the permission fix alone changes nothing until the process restarts.
+  ansible.builtin.debug:
+    msg: >-
+      /dev/uhid is now accessible, but Sunshine holds its device handles from startup — restart
+      it (re-run this entrypoint, or reconnect) before the controller will work.
+  when:
+    - _bz_sun_run | bool
+    - "'uhid=no' in (_bz_sun_input.stdout | default(''))"

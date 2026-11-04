@@ -1,0 +1,26 @@
+{
+    "//": "{{ ansible_managed }}",
+    "//apps": "Managed by roles/bazzite_workstation. Sunshine REWRITES this file when apps are added through the web UI, so edits made there are lost on the next run — declare apps in bazzite_sunshine_apps instead.",
+    "env": {
+        "PATH": "$(PATH):$(HOME)/.local/bin"
+    },
+    "apps": [
+{% for app in bazzite_sunshine_apps %}
+        {
+            "name": {{ app.name | to_json }}{% if app.cmd is defined %},
+            "cmd": {{ app.cmd | to_json }},
+            "auto-detach": {{ (app.auto_detach | default(true)) | to_json }},
+            "wait-all": {{ (app.wait_all | default(true)) | to_json }},
+            "exit-timeout": {{ app.exit_timeout | default(5) }},
+            "elevated": {{ (app.elevated | default(false)) | to_json }},
+            "exclude-global-prep-cmd": {{ (app.exclude_global_prep | default(false)) | to_json }},
+            "output": {{ (app.output | default('')) | to_json }}{% endif %}{% if app.image is defined %},
+            "image-path": {{ app.image | to_json }}
+{%- elif app.appid is defined %},
+            "image-path": {{ (bazzite_sunshine_covers_dir ~ '/' ~ (_bz_cover_files | select('match', app.appid | string ~ '\\.') | first | default(''))) | to_json }}
+{%- endif %}
+
+        }{{ "," if not loop.last else "" }}
+{% endfor %}
+    ]
+}

@@ -1,0 +1,124 @@
+---
+# ENTRYPOINT: report firmware versions and any updates fwupd knows about.
+#
+# READ-ONLY, DELIBERATELY AND PERMANENTLY. This reports; it never applies.
+#
+# WHY NOT APPLY. A firmware update is the one change on this machine that can leave it unable to
+# POST — there is no `rpm-ostree rollback` for a bricked BIOS, and no SSH to fix it from. That
+# makes it categorically different from every other write this role does: an image rebase stages
+# and can be rolled back, a dotfile can be rewritten, a bad firmware flash needs a CMOS reset and
+# physical access at best. Applying one unattended, from a play that might be running while
+# nobody is at the machine, is not a trade worth making for a gaming box.
+#
+# So the value here is ANSWERING THE QUESTION, which is currently unanswerable without an ad-hoc
+# SSH read: what firmware is this machine on, and is anything behind? `fwupdmgr get-updates`
+# returns 2 when there is nothing to do, which is a normal outcome and not an error.
+#
+# Applying remains a deliberate, human, at-the-machine act:
+#     fwupdmgr update          # and be present for the reboot
+#
+# Related: the asus_tuf_b850m_bios role (one board's vendor tooling) for the BIOS itself.
+
+- name: Apply role defaults
+  ansible.builtin.include_tasks: setup_vars.yml
+
+- name: Check fwupd is present
+  ansible.builtin.command:
+    cmd: command -v fwupdmgr
+  register: _bz_fwupd
+  changed_when: false
+  failed_when: false
+
+- name: Report and stop if fwupd is unavailable
+  ansible.builtin.debug:
+    msg: >-
+      fwupdmgr is not installed, so firmware cannot be reported from here. On an image-based
+      system it ships with the image; its absence means a non-standard image rather than
+      something to install.
+  when: (_bz_fwupd.rc | default(1) | int) != 0
+
+- name: Read the firmware inventory
+  when: (_bz_fwupd.rc | default(1) | int) == 0
+  block:
+    - name: List devices fwupd can see
+      # --no-unreported-check and --no-metadata-check: both otherwise prompt or reach out to the
+      # LVFS, and a report entrypoint must not block on either. The device list itself is local.
+      ansible.builtin.command:
+        argv:
+          - fwupdmgr
+          - get-devices
+          - --no-unreported-check
+          - --no-metadata-check
+          - --json
+      register: _bz_fw_devices
+      changed_when: false
+      failed_when: false
+
+    - name: Ask what updates are available
+      # EXIT CODE 2 MEANS "NOTHING TO DO", not failure — fwupdmgr uses it for "no updates
+      # available", so failing on non-zero would report a fully up-to-date machine as broken.
+      # Anything else is genuinely unknown and is surfaced as such rather than as "no updates".
+      ansible.builtin.command:
+        argv:
+          - fwupdmgr
+          - get-updates
+          - --no-unreported-check
+          - --no-metadata-check
+          - --json
+      register: _bz_fw_updates
+      changed_when: false
+      failed_when: false
+
+    - name: Parse the device inventory
+      # Defensively: --json still emits nothing useful if the daemon is not running, and from_json
+      # raises on empty input rather than returning a default.
+      ansible.builtin.set_fact:
+        _bz_fw: >-
+          {{ (_bz_fw_devices.stdout | from_json).Devices | default([])
+             if (_bz_fw_devices.stdout | default('') | trim) | length > 0 else [] }}
+        _bz_fw_upd: >-
+          {{ (_bz_fw_updates.stdout | from_json).Devices | default([])
+             if (_bz_fw_updates.stdout | default('') | trim) | length > 0 else [] }}
+
+    - name: Report the firmware state
+      ansible.builtin.debug:
+        msg: "{{ _report.splitlines() | select('string') | list }}"
+      vars:
+        # Only devices that actually declare a version: fwupd lists logical parents and hubs with
+        # no firmware of their own, and listing those as "unknown" is noise, not information.
+        _versioned: "{{ _bz_fw | selectattr('Version', 'defined') | list }}"
+        _updatable: "{{ _bz_fw_upd | selectattr('Name', 'defined') | list }}"
+        _conclusive: "{{ (_bz_fw_updates.rc | default(1) | int) in [0, 2] }}"
+        _report: |
+          ===== FIRMWARE ({{ _versioned | length }} device(s) reporting a version) =====
+          {% for d in _versioned %}
+          {{ '%-42s' | format(d.Name | default('?') | truncate(42, true, '')) }} {{ d.Version | default('?') }}
+          {% endfor %}
+
+          ===== UPDATES =====
+          {% if not _conclusive %}
+          UNKNOWN — `fwupdmgr get-updates` returned rc={{ _bz_fw_updates.rc | default('?') }}, which is
+          neither 0 (updates found) nor 2 (nothing to do). Treat as "could not check", NOT as
+          "up to date": {{ _bz_fw_updates.stderr | default('') | trim | truncate(160) }}
+          {% elif (_updatable | length) == 0 %}
+          None available. (fwupd only sees what the LVFS publishes for this hardware; a vendor
+          that does not ship to LVFS will always look up to date here — many boards ship the BIOS
+          itself only as a vendor download, e.g. the asus_tuf_b850m_bios role.)
+          {% else %}
+          {% for d in _updatable %}
+          {{ d.Name | default('?') }}: {{ d.Version | default('?') }} -> {{ (d.Releases | default([{}]))[0].Version | default('?') }}
+          {% endfor %}
+
+          APPLYING IS A DELIBERATE, IN-PERSON ACT — this entrypoint will not do it. A failed
+          firmware flash has no rollback and no remote recovery. Run `fwupdmgr update` at the
+          machine, and be there for the reboot.
+          {% endif %}
+
+    - name: Note when the check could not be made
+      # A separate task rather than only a line in the report: an inconclusive check should be
+      # visible in the play recap, not buried in a debug block someone scrolls past.
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: firmware update check was inconclusive (rc={{ _bz_fw_updates.rc | default('?') }}).
+          This is NOT the same as "no updates available".
+      when: (_bz_fw_updates.rc | default(1) | int) not in [0, 2]

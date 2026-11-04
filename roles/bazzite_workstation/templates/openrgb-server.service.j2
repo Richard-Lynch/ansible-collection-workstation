@@ -1,0 +1,29 @@
+# {{ ansible_managed }}
+# OpenRGB SDK server — the thing that HOLDS device state.
+#
+# Without a persistent process the one-shot CLI cannot make a colour stick: it sets a mode,
+# returns rc 0, and the device reverts as soon as the process exits. This unit is therefore not
+# an optimisation; it is what makes lighting control work at all.
+[Unit]
+Description=OpenRGB SDK server
+# DEFAULT.TARGET, NOT graphical-session.target. OpenRGB talks to the hardware over i2c/USB and
+# needs no compositor, so binding it to the graphical session bought nothing and cost
+# reliability: a gamescope session brings this up but leaves the reactive daemon behind, because PartOf= only propagates stop/restart and does not pull a unit
+# in. Bound to default.target both units start with the user manager, session or no session —
+# which is also what a headless streaming host wants.
+After=default.target
+
+[Service]
+Type=simple
+# --server only: no GUI. --noautoconnect stops it trying to reach ANOTHER server at startup,
+# which is what this process itself is.
+# --profile loads the saved zone SIZES at startup. OpenRGB does not persist zone sizes in
+# its main config — only inside a profile — so without this every restart reverts an
+# addressable header to 0 LEDs, and a zero-LED zone is silently skipped by every write. Fans
+# then keep reverting to the BIOS effect.
+ExecStart=/usr/bin/flatpak run org.openrgb.OpenRGB --server --server-host {{ bazzite_rgb_server_host }} --server-port {{ bazzite_rgb_server_port }} --noautoconnect{{ (" --profile " ~ bazzite_rgb_profile) if bazzite_rgb_profile else "" }}
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=default.target

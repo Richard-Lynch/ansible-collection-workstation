@@ -1,0 +1,335 @@
+---
+# ENTRYPOINT: RGB lighting — report devices, and run a daemon that drives them from system state.
+#
+# READ-ONLY BY DEFAULT. Reports every device with its zones, LEDs and supported modes. Installing
+# and starting the daemon requires bazzite_apply=true.
+#
+# WHY A DAEMON RATHER THAN `OpenRGB --mode ... --color ...`.
+#
+# The one-shot CLI CANNOT make a setting stick. Verified: a colour set
+# that way returns rc 0, prints no error, and a read-back immediately afterwards — even inside the
+# SAME process — still reports the previous mode. Devices revert the moment the process exits. An
+# Ansible task wrapping it reports `changed` every run and changes nothing, which is the worst
+# kind of green.
+#
+# A persistent connection to the OpenRGB SDK server is what holds device state. That also makes
+# reactive lighting possible, so the same component solves both problems:
+#
+#   openrgb-server.service   the SDK server; owns the hardware, holds state
+#   iaac-rgb.service         our daemon; reads sensors, pushes colours over the SDK
+#
+# Both are USER units under graphical-session.target, because OpenRGB needs the session's device
+# access (the udev uaccess ACLs are granted to the logged-in user, not to a system service).
+#
+# MODES (bazzite_rgb_daemon_mode):
+#   static   one fixed colour
+#   cpu      colour follows CPU temperature
+#   gpu      colour follows GPU temperature
+#   load     colour follows load average
+#   auto     whichever of cpu/gpu is proportionally hotter (default)
+
+- name: Apply role defaults
+  ansible.builtin.include_tasks: setup_vars.yml
+
+- name: Validate the colour
+  ansible.builtin.assert:
+    that:
+      - bazzite_rgb_color is match('^[0-9A-Fa-f]{6}$')
+    fail_msg: >-
+      bazzite_rgb_color must be six hex digits with no leading '#'
+      (got '{{ bazzite_rgb_color }}').
+    quiet: true
+
+- name: Check OpenRGB is installed
+  ansible.builtin.command:
+    cmd: flatpak info org.openrgb.OpenRGB
+  register: _bz_rgb_installed
+  changed_when: false
+  failed_when: false
+
+- name: Assert OpenRGB is present
+  ansible.builtin.assert:
+    that:
+      - (_bz_rgb_installed.rc | int) == 0
+    fail_msg: >-
+      OpenRGB is not installed. Run bazzite_action=flatpaks bazzite_apply=true first — that
+      installs it AND the udev rules it needs for hardware access.
+    quiet: true
+
+- name: Ensure the local bin directory exists
+  # ~/.local/bin is not present on a fresh Bazzite install, and `copy` does not create parent
+  # directories — it fails with "Destination directory does not exist".
+  ansible.builtin.file:
+    path: "{{ bazzite_rgb_daemon_path | dirname }}"
+    state: directory
+    mode: "0755"
+  when: bazzite_apply | bool
+
+- name: Install the RGB daemon
+  ansible.builtin.copy:
+    src: openrgb_daemon.py
+    dest: "{{ bazzite_rgb_daemon_path }}"
+    mode: "0755"
+  register: _bz_rgb_script
+  when: bazzite_apply | bool
+
+- name: Create the user unit directory
+  ansible.builtin.file:
+    path: "{{ ansible_env.HOME }}/.config/systemd/user"
+    state: directory
+    mode: "0755"
+  when: bazzite_apply | bool
+
+- name: Install the SDK server unit
+  ansible.builtin.template:
+    src: openrgb-server.service.j2
+    dest: "{{ ansible_env.HOME }}/.config/systemd/user/{{ bazzite_rgb_server_unit }}"
+    mode: "0644"
+  register: _bz_rgb_server_unit
+  when: bazzite_apply | bool
+
+- name: Install the daemon unit
+  ansible.builtin.template:
+    src: openrgb-daemon.service.j2
+    dest: "{{ ansible_env.HOME }}/.config/systemd/user/{{ bazzite_rgb_daemon_unit }}"
+    mode: "0644"
+  register: _bz_rgb_daemon_unit
+  when: bazzite_apply | bool
+
+- name: Drop enable symlinks under a target these units no longer use
+  # `enabled: true` creates the symlink for the unit's CURRENT [Install] target; it does not
+  # remove one left behind under a previous target, so both would persist and the old one would
+  # keep pulling the unit into the graphical session.
+  #
+  # These units are bound to default.target, not graphical-session.target: under a gamescope
+  # session the server starts but the reactive daemon stays enabled and inactive with no log
+  # entries at all — PartOf= propagates stop/restart, it does not pull a
+  # unit in. Removing the stale link is what makes the move complete rather than additive.
+  ansible.builtin.file:
+    path: "{{ ansible_env.HOME }}/.config/systemd/user/graphical-session.target.wants/{{ _unit }}"
+    state: absent
+  loop:
+    - "{{ bazzite_rgb_server_unit }}"
+    - "{{ bazzite_rgb_daemon_unit }}"
+  loop_control:
+    loop_var: _unit
+  register: _bz_rgb_stale_links
+  when: bazzite_apply | bool
+
+- name: Reload the user manager
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+    scope: user
+  when:
+    - bazzite_apply | bool
+    - (_bz_rgb_server_unit.changed | default(false)) or (_bz_rgb_daemon_unit.changed | default(false)) or (_bz_rgb_stale_links.changed | default(false))
+
+- name: Enable and start the SDK server
+  ansible.builtin.systemd_service:
+    name: "{{ bazzite_rgb_server_unit }}"
+    scope: user
+    enabled: true
+    state: "{{ 'restarted' if (_bz_rgb_server_unit.changed | default(false)) else 'started' }}"
+  when: bazzite_apply | bool
+
+- name: Wait for the SDK server to accept connections
+  # A real readiness check, not a sleep: the unit reports active well before the socket is
+  # listening, and the daemon would then fail its first connect and back off pointlessly.
+  ansible.builtin.wait_for:
+    host: "{{ bazzite_rgb_server_host }}"
+    port: "{{ bazzite_rgb_server_port | int }}"
+    timeout: 60
+  when: bazzite_apply | bool
+
+- name: Enable and start the RGB daemon
+  ansible.builtin.systemd_service:
+    name: "{{ bazzite_rgb_daemon_unit }}"
+    scope: user
+    enabled: true
+    state: "{{ 'restarted' if ((_bz_rgb_daemon_unit.changed | default(false)) or (_bz_rgb_script.changed | default(false))) else 'started' }}"
+  when: bazzite_apply | bool
+
+# ADDRESSABLE-HEADER SIZING. Done here with OpenRGB's own CLI rather than from the daemon.
+#
+# A motherboard ARGB header reports leds_count = 0 because strips and fans cannot report their
+# own length, and a zero-LED zone is silently skipped by every write — so the case fans keep
+# running their BIOS effect while every other device obeys the daemon, with nothing appearing to
+# fail anywhere.
+#
+# The SDK RESIZEZONE packet is sent and does NOT take effect on some boards; the CLI's combined
+# form (--size WITH --mode and --color) does, and is what runs below. Sizes are declared in
+# inventory because only a human can see what is plugged into which header.
+#
+# Idempotent by construction: setting a zone to the size it already has is a no-op, and the
+# daemon overwrites the colour on its next cycle anyway.
+
+- name: Resolve the device index for each declared zone group
+  # The daemon's --report already enumerates devices in the server's own order, so the index is
+  # taken from there rather than hardcoded — a device appearing or disappearing renumbers them.
+  ansible.builtin.command:
+    cmd: "{{ bazzite_python }} {{ bazzite_rgb_daemon_path }} --report --port {{ bazzite_rgb_server_port }}"
+  register: _bz_rgb_pre_report
+  changed_when: false
+  when:
+    - bazzite_apply | bool
+    - bazzite_rgb_zone_sizes | length > 0
+
+- name: Size the addressable RGB headers
+  # One call per zone. The device index and the per-zone sizes both come from inventory-declared
+  # names resolved against the live device list above.
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      {{ bazzite_python }} - <<'PYEOF'
+      import json, subprocess, sys
+
+      spec = """{{ bazzite_rgb_zone_sizes }}"""
+      report = json.loads(subprocess.run(
+          ["{{ bazzite_python }}", "{{ bazzite_rgb_daemon_path }}",
+           "--report", "--port", "{{ bazzite_rgb_server_port }}"],
+          capture_output=True, text=True, check=True).stdout)
+
+      changed = 0
+      for entry in filter(None, (e.strip() for e in spec.split(";"))):
+          match, _, counts = entry.partition("=")
+          sizes = [int(c) for c in counts.split(",") if c.strip()]
+          for dev in report["devices"]:
+              if match.strip().lower() not in dev["name"].lower():
+                  continue
+              for zone_index, size in enumerate(sizes):
+                  if dev["zones"][zone_index] == size:
+                      continue
+                  # --size ALONE is accepted and does nothing; the resize only applies when a
+                  # mode and colour accompany it. Three bare --size calls left the headers at 0.
+                  subprocess.run([
+                      "flatpak", "run", "org.openrgb.OpenRGB",
+                      "--client", "{{ bazzite_rgb_server_host }}:{{ bazzite_rgb_server_port }}",
+                      "--device", str(dev["index"]),
+                      "--zone", str(zone_index),
+                      "--size", str(size),
+                      "--mode", "Direct",
+                      "--color", "{{ bazzite_rgb_color }}",
+                  ], capture_output=True, text=True)
+                  print(f"resized device {dev['index']} zone {zone_index} "
+                        f"{dev['zones'][zone_index]} -> {size}")
+                  changed += 1
+      print(f"CHANGED={changed}")
+      PYEOF
+  register: _bz_rgb_resize
+  changed_when: "'CHANGED=0' not in (_bz_rgb_resize.stdout | default(''))"
+  when:
+    - bazzite_apply | bool
+    - bazzite_rgb_zone_sizes | length > 0
+
+- name: Save the zone sizes to the OpenRGB profile
+  # Sizes are otherwise lost on the next server restart: OpenRGB keeps them ONLY in a profile,
+  # not in its main config. The server unit loads this profile with --profile at startup.
+  ansible.builtin.command:
+    argv:
+      - flatpak
+      - run
+      - org.openrgb.OpenRGB
+      - --client
+      - "{{ bazzite_rgb_server_host }}:{{ bazzite_rgb_server_port }}"
+      - --save-profile
+      - "{{ bazzite_rgb_profile }}"
+  changed_when: true
+  when:
+    - bazzite_apply | bool
+    - bazzite_rgb_profile | length > 0
+    - _bz_rgb_resize.changed | default(false)
+
+- name: Restart the daemon so its cached zone sizes are refreshed
+  # The daemon caches zone LED counts from its startup walk, so writes made after a resize are
+  # still sized against the OLD counts until it re-enumerates.
+  ansible.builtin.systemd_service:
+    name: "{{ bazzite_rgb_daemon_unit }}"
+    scope: user
+    state: restarted
+  when:
+    - bazzite_apply | bool
+    - _bz_rgb_resize.changed | default(false)
+
+- name: Report the devices and the current target colour
+  # Runs the daemon's own --report against the live server, so the report reflects exactly what
+  # the daemon sees rather than a second implementation that could disagree with it.
+  ansible.builtin.command:
+    cmd: "{{ bazzite_python }} {{ bazzite_rgb_daemon_path }} --report --port {{ bazzite_rgb_server_port }}"
+  register: _bz_rgb_report
+  changed_when: false
+  failed_when: false
+  when: bazzite_apply | bool
+
+- name: Wait for both units to settle
+  # `systemctl is-active` reports "activating" for a short window after start, and a flatpak-
+  # wrapped service spends longer there than a plain binary. Polling for the settled state is
+  # what makes the assert below meaningful rather than a race — checked immediately, the server
+  # reads "activating" on a perfectly healthy start.
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      for i in $(seq 1 30); do
+        s=$(systemctl --user is-active {{ bazzite_rgb_server_unit }} 2>/dev/null)
+        d=$(systemctl --user is-active {{ bazzite_rgb_daemon_unit }} 2>/dev/null)
+        [ "$s" = "active" ] && [ "$d" = "active" ] && break
+        case "$s$d" in *failed*) break;; esac
+        sleep 1
+      done
+      echo "settled server=$s daemon=$d"
+  register: _bz_rgb_settle
+  changed_when: false
+  when: bazzite_apply | bool
+
+- name: Read back the running state
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      printf 'server=%s\n' "$(systemctl --user is-active {{ bazzite_rgb_server_unit }} 2>/dev/null)"
+      printf 'daemon=%s\n' "$(systemctl --user is-active {{ bazzite_rgb_daemon_unit }} 2>/dev/null)"
+      printf 'listening=%s\n' "$(ss -tuln 2>/dev/null | grep -c ':{{ bazzite_rgb_server_port }}')"
+      printf 'applied=%s\n' "$(journalctl --user -u {{ bazzite_rgb_daemon_unit }} -n 40 --no-pager 2>/dev/null | grep -c '^.*#[0-9a-f]\{6\}')"
+  register: _bz_rgb_state
+  changed_when: false
+  when: bazzite_apply | bool
+
+- name: Assert the daemon is running and has driven the lights
+  # `applied` counts the daemon's own "#rrggbb (reason)" log lines, which it emits only after a
+  # successful push to the hardware. Asserting on unit state alone would pass for a daemon that
+  # starts, fails every connection, and retries forever.
+  ansible.builtin.assert:
+    that:
+      - "'server=active' in _bz_rgb_state.stdout"
+      - "'daemon=active' in _bz_rgb_state.stdout"
+      - "'listening=0' not in _bz_rgb_state.stdout"
+      - "'applied=0' not in _bz_rgb_state.stdout"
+    fail_msg: >-
+      The RGB stack is not healthy: {{ _bz_rgb_state.stdout_lines | default([]) | join(' ') }}.
+      applied=0 means the daemon started but never pushed a colour — check
+      `journalctl --user -u {{ bazzite_rgb_daemon_unit }}`.
+    quiet: true
+  when: bazzite_apply | bool
+
+- name: Report
+  ansible.builtin.debug:
+    msg:
+      - "{{ _bz_rgb_state.stdout_lines | default([]) }}"
+      - >-
+        Mode '{{ bazzite_rgb_daemon_mode }}'.
+        {{ 'Colour follows temperature: blue when idle through green and yellow to red under
+        load.' if bazzite_rgb_daemon_mode != 'static'
+        else 'Holding a fixed ' ~ bazzite_rgb_color ~ '.' }}
+      - >-
+        The colour persists because the daemon holds the SDK connection open — stopping
+        {{ bazzite_rgb_daemon_unit }} lets the devices revert.
+      - "{{ (_bz_rgb_report.stdout | default('') | from_json).target | default('(report unavailable)') }}"
+  when: bazzite_apply | bool
+
+- name: Report devices (read-only run)
+  ansible.builtin.debug:
+    msg: >-
+      REPORT ONLY — re-run with bazzite_apply=true to install and start the RGB daemon
+      (mode '{{ bazzite_rgb_daemon_mode }}'). Nothing has been changed.
+  when: not (bazzite_apply | bool)

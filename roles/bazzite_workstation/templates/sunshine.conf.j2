@@ -1,0 +1,104 @@
+# {{ ansible_managed }}
+#
+# Sunshine stream configuration, managed by roles/bazzite_workstation (sunshine entrypoint).
+#
+# WHY THIS FILE IS TEMPLATED WHOLE rather than edited key-by-key: Sunshine rewrites it when
+# settings change in the web UI, so the two would fight. Managing it here makes the repo the
+# single source of truth — change a value here, not in the browser.
+#
+# Anything NOT set below stays at Sunshine's own default. Only settings with a reason to differ
+# are declared, so the file reads as a list of decisions rather than a dump of defaults.
+
+# ---------------------------------------------------------------------------------------------
+# WEB UI ACCESS
+# ---------------------------------------------------------------------------------------------
+# Sunshine refuses a request whose Origin is not localhost, with "blocked by CSRF protection".
+# Correct default — the UI pairs clients and changes stream settings — but it means every name
+# the UI is legitimately opened under has to be declared.
+#
+# NOTE these are NAMES, not the current IP. An entry derived from ansible_default_ipv4 at run time
+# bakes in whatever the DHCP lease happens to be, and goes dead the moment the lease moves. DNS
+# tracks the host, a lease does not.
+csrf_allowed_origins = {{ _bz_sun_origins | join(',') }}
+
+# ---------------------------------------------------------------------------------------------
+# ENCODER
+# ---------------------------------------------------------------------------------------------
+# VAAPI, not the generic Vulkan encoder Sunshine picks by default. A discrete RDNA card has
+# dedicated encode hardware (vainfo lists H.264, HEVC Main/Main10 and AV1 entrypoints); hevc_vulkan is a
+# compute-shader fallback that costs GPU time a game would rather have and gives worse quality
+# per bit. Without it the log reads "Creating encoder [hevc_vulkan]".
+encoder = vaapi
+
+# The DISCRETE card. With an integrated Radeon present there are two render nodes — encoding on
+# the iGPU would work and be markedly slower, and the numbering is not guaranteed, so this is verified from mem_info_vram_total rather than assumed.
+{% if bazzite_sunshine_adapter %}
+adapter_name = {{ bazzite_sunshine_adapter }}
+{% endif %}
+
+# HEVC over H.264: roughly 30-40% better quality per bit, and every remotely modern client
+# decodes it in hardware. AV1 is better still but decode support is thinner — the Steam Deck's
+# RDNA2 has no AV1 decoder, so enabling it here would silently fall back anyway.
+#
+# THE MODE NUMBER IS WHAT DECIDES HDR, and 2 is not it. Sunshine's scale:
+#   0 = do not advertise   1 = advertise, do not prefer
+#   2 = Main (8-bit) only  3 = Main AND Main10 — the 10-bit profile HDR requires
+# So a host left at 2 advertises no HDR-capable profile at all, and a client asking for HDR
+# negotiates down to SDR silently, even with HDR enabled on the client.
+{% if bazzite_sunshine_hevc %}
+hevc_mode = {{ 3 if bazzite_sunshine_hdr else 2 }}
+{% else %}
+hevc_mode = 0
+{% endif %}
+av1_mode = {{ (3 if bazzite_sunshine_hdr else 2) if bazzite_sunshine_av1 else 0 }}
+
+# ---------------------------------------------------------------------------------------------
+# CAPTURE AND RESOLUTION
+# ---------------------------------------------------------------------------------------------
+# A 3840x2160 desktop streaming to a 1280x800 handheld encodes 8.1x the pixels every frame for a
+# client that cannot show them. Sunshine can change the host's
+# resolution to match the client for the duration of a stream and restore it afterwards.
+#
+# This needs the display to support the requested mode; where it does not, Sunshine keeps the
+# native resolution and scales, which is the current behaviour rather than a failure.
+{% if bazzite_sunshine_resolution_match %}
+resolutions = [
+{% for r in bazzite_sunshine_resolutions %}
+  {{ r }}{{ "," if not loop.last else "" }}
+{% endfor %}
+]
+fps = [{{ bazzite_sunshine_fps | join(', ') }}]
+{% endif %}
+
+# ---------------------------------------------------------------------------------------------
+# QUALITY
+# ---------------------------------------------------------------------------------------------
+# The CLIENT requests a bitrate; this caps it. Left generous because a streaming host is usually wired
+# gigabit — the constraint is the client's WiFi, and a Deck negotiates its own figure.
+{% if bazzite_sunshine_max_bitrate %}
+max_bitrate = {{ bazzite_sunshine_max_bitrate }}
+{% endif %}
+
+# Quality preset. Sunshine maps this onto the encoder's own preset scale: higher = better image
+# for more encode time. A dedicated hardware encoder has the headroom.
+qp = {{ bazzite_sunshine_qp }}
+
+# ---------------------------------------------------------------------------------------------
+# INPUT
+# ---------------------------------------------------------------------------------------------
+# The virtual gamepad Sunshine creates needs /dev/uhid, whose module the role loads. Xbox 360
+# rather than DS4/Switch: it is the type every Proton title and Steam Input handles without a
+# per-game mapping.
+gamepad = {{ bazzite_sunshine_gamepad }}
+
+# Pass keyboard and mouse through as well, so the Desktop app is actually usable remotely and
+# not just watchable.
+keyboard = enabled
+mouse = enabled
+
+# ---------------------------------------------------------------------------------------------
+# LOGGING
+# ---------------------------------------------------------------------------------------------
+# 2 = info. Enough to diagnose a failed stream without the log growing without bound, as it
+# does at the default.
+min_log_level = {{ bazzite_sunshine_log_level }}

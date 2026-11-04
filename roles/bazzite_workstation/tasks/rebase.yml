@@ -1,0 +1,279 @@
+---
+# ENTRYPOINT: converge the base image VARIANT declared in inventory.
+#
+# WHAT THIS IS FOR. `image` keeps the machine current along whatever refspec it is already on;
+# uupd cannot change variant, by design. This is the other half: making the deployed refspec match
+# what inventory declares. bazzite_image_variant lives in inventory (which OS variant a machine
+# runs is a fact about the machine, not a role default), and this makes
+# reality match it.
+#
+# It is a NO-OP once converged, which is why image.yml and `all` can call it unconditionally.
+# That also means a hand-rebase at the console shows up here as drift rather than diverging
+# silently forever.
+#
+# TWO FLAGS, NOT ONE. bazzite_apply is the role's universal write flag — "write dotfiles, install
+# flatpaks". Replacing the operating system is a different category of act, so it additionally
+# requires bazzite_rebase_confirm. The reason is not ceremony: a staged deployment activates on
+# the NEXT REBOOT FROM ANY CAUSE, a power cut included, so an unintended rebase surprises you
+# later with no play running. On the deck variant it would also swap the display manager.
+#
+# MEASURED CONSTRAINTS:
+#
+#   * SIGNING. /etc/containers/policy.json maps ghcr.io/ublue-os to sigstoreSigned, so the refspec
+#     must keep the `ostree-image-signed:docker://` prefix. It is hardcoded in setup_vars.yml's
+#     derivation rather than being a variable, because a bare `docker://` ref rebases SUCCESSFULLY
+#     with verification silently dropped.
+#
+#   * NO --bypass-driver. On Bazzite `rpm-ostree status -v` reports
+#     "AutomaticUpdates: disabled" and no updates driver is registered — uupd is a systemd timer
+#     that CALLS rpm-ostree, it does not register as a driver. If a rebase ever refuses with
+#     "updates driver registered", add the flag deliberately THEN. Passing it preemptively would
+#     convert a loud, self-explanatory refusal into an uncoordinated rebase under a driver's feet.
+#
+#   * THE SYSROOT LOCK. uupd.timer is enabled and active and holds the lock while it runs; a
+#     concurrent transaction is NORMAL, not an error. `uupd wait` is the purpose-built wait.
+#
+# THIS DOES NOT REBOOT. It stages. `bazzite_action=reboot bazzite_apply=true` activates the staged
+# deployment and VERIFIES that it is the one that actually booted.
+#
+#   bazzite_action=rebase                                                  (report)
+#   bazzite_action=rebase bazzite_apply=true bazzite_rebase_confirm=true   (rebase)
+
+- name: Apply role defaults
+  ansible.builtin.include_tasks: setup_vars.yml
+
+- name: Wait for the ostree sysroot lock
+  ansible.builtin.command:
+    cmd: uupd wait
+  changed_when: false
+  failed_when: false
+  become: true
+
+- name: Read the current deployments
+  ansible.builtin.command:
+    cmd: rpm-ostree status --json
+  register: _bz_rb_status
+  changed_when: false
+
+- name: Identify the booted and staged deployments
+  # rpm-ostree marks both itself. Using its own flags rather than inferring from list position or
+  # comparing version strings: deployments[0] is whatever boots next (not necessarily what is
+  # running), and a same-version re-pull would make a version-string proxy report "nothing
+  # staged" while a staged deployment sat there waiting to be discarded.
+  ansible.builtin.set_fact:
+    _bz_booted: >-
+      {{ (_deps | selectattr('booted', 'defined') | selectattr('booted')
+          | list | first | default({})) }}
+    _bz_staged: >-
+      {{ (_deps | selectattr('staged', 'defined') | selectattr('staged')
+          | list | first | default({})) }}
+  vars:
+    _deps: "{{ (_bz_rb_status.stdout | from_json).deployments | default([]) }}"
+
+- name: Classify the convergence state
+  # EXACT string comparison against the full refspec, never a substring test on the variant name:
+  # 'bazzite' is a substring of 'bazzite-deck', so `'bazzite' in ref` is TRUE on a converged deck
+  # machine and would demand a rebase forever. Same family as '192.0.2.2' in stdout also matching
+  # '192.0.2.255'.
+  ansible.builtin.set_fact:
+    _bz_on_declared: >-
+      {{ (_bz_booted['container-image-reference'] | default('')) == bazzite_image_refspec }}
+    _bz_staged_declared: >-
+      {{ (_bz_staged['container-image-reference'] | default('')) == bazzite_image_refspec }}
+
+- name: Decide whether to pull
+  # THREE states, not two. Without the middle one, a re-run between staging and rebooting reports
+  # "REBASE NEEDED" and, with the flags set, re-runs the entire multi-GB pull against a machine
+  # that has already staged exactly the right thing.
+  ansible.builtin.set_fact:
+    _bz_rebase_needed: "{{ not (_bz_on_declared | bool) and not (_bz_staged_declared | bool) }}"
+    _bz_awaiting_reboot: "{{ not (_bz_on_declared | bool) and (_bz_staged_declared | bool) }}"
+    # A staged deployment on the OLD refspec is discarded by the rebase. Surfaced because it
+    # otherwise never appears in any log as having happened, and the box later looks inexplicably
+    # behind with nothing to explain why.
+    _bz_discards_staged: >-
+      {{ (_bz_staged | length) > 0
+         and (_bz_staged['container-image-reference'] | default('')) != bazzite_image_refspec }}
+
+- name: Check free space under /sysroot
+  # /sysroot/ostree/repo is where the pull lands, so /sysroot is the filesystem that must have
+  # room. (On a default install /sysroot and /var are subvolumes of one btrfs pool, so AVAIL reads the same
+  # either way — /sysroot stays correct on a machine where they differ.)
+  ansible.builtin.command:
+    cmd: findmnt --target /sysroot --output AVAIL --bytes --noheadings
+  register: _bz_rb_space
+  changed_when: false
+
+- name: Report the plan
+  ansible.builtin.debug:
+    msg: "{{ _report.splitlines() | select('string') | list }}"
+  vars:
+    _free_gb: "{{ ((_bz_rb_space.stdout | trim | int) / 1073741824) | round(1) }}"
+    _confirmed: "{{ (bazzite_apply | bool) and (bazzite_rebase_confirm | bool) }}"
+    _verdict: >-
+      {{ 'converged — nothing to do' if _bz_on_declared | bool
+         else ('CONVERGED, AWAITING REBOOT — the declared image is staged. Run
+                bazzite_action=reboot bazzite_apply=true' if _bz_awaiting_reboot | bool
+               else ('VARIANT DRIFT — rebasing' if _confirmed | bool
+                     else 'VARIANT DRIFT — re-run with bazzite_apply=true bazzite_rebase_confirm=true')) }}
+    _report: |
+      declared refspec : {{ bazzite_image_refspec }}
+      booted           : {{ _bz_booted['container-image-reference'] | default('(unreadable)', true) }}
+                         {{ _bz_booted.version | default('?') }}
+      staged           : {{ _bz_staged['container-image-reference'] | default('(none)', true) }}
+                         {{ _bz_staged.version | default('') }}
+      layered packages : {{ _bz_booted['requested-packages'] | default([]) | join(', ') | default('none', true) }}
+      free on /sysroot : {{ _free_gb }} GB (need {{ bazzite_rebase_min_free_gb }})
+
+      -> {{ _verdict }}
+
+- name: Warn that a staged update will be discarded
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: {{ _bz_staged.version | default('?') }} is staged on the OLD refspec
+      ({{ _bz_staged['container-image-reference'] | default('?') }}) and will be DISCARDED by the
+      rebase — it will never appear in any log as having happened. To keep it, reboot into it
+      first (bazzite_action=reboot bazzite_apply=true), then rebase.
+  when:
+    - _bz_rebase_needed | bool
+    - _bz_discards_staged | bool
+
+- name: Warn that this variant changes the display manager and the session
+  # THE FINDING THAT MOST NEEDS SAYING OUT LOUD. bazzite-deck REMOVES plasma-login-manager and
+  # installs SDDM, and ships bazzite-autologin.service, which rewrites autologin every boot and
+  # defaults the session to OpenGamepadUI rather than plain Steam Big Picture.
+  ansible.builtin.debug:
+    msg: >-
+      NOTE: this variant swaps the display manager (plasmalogin -> SDDM) and brings its own
+      autologin machinery. The box WILL autologin uid 1000 without role action, but into
+      gamescope-session-ogui-steam unless the session is pinned. Run
+      `bazzite_action=autologin bazzite_apply=true` after the reboot.
+  when:
+    - _bz_rebase_needed | bool
+    - "'deck' in bazzite_image_variant"
+
+- name: Assert there is room for the pull
+  ansible.builtin.assert:
+    that:
+      - (_bz_rb_space.stdout | trim | int) > (bazzite_rebase_min_free_gb | int) * 1073741824
+    fail_msg: >-
+      Only {{ ((_bz_rb_space.stdout | trim | int) / 1073741824) | round(1) }} GB free on /sysroot;
+      a variant rebase pulls a full image and needs at least {{ bazzite_rebase_min_free_gb }} GB.
+      Free space with `rpm-ostree cleanup -bm` and re-run.
+    quiet: true
+  when: _bz_rebase_needed | bool
+
+- name: Report layered packages that must be re-resolved
+  # Layering survives a rebase by being RE-RESOLVED against the new image, and can fail there.
+  # Usually empty, which is why the rebase is low-risk — but the role must not assume that
+  # stays true, and a failed re-resolution is a bad way to find out.
+  ansible.builtin.debug:
+    msg: >-
+      {{ _bz_booted['requested-packages'] | default([]) | length }} layered package(s) will be
+      re-resolved against {{ bazzite_image_variant }}:
+      {{ _bz_booted['requested-packages'] | default([]) | join(', ') }}. A package absent from the
+      new image FAILS the rebase; rpm-ostree leaves the running deployment untouched if it does.
+  when:
+    - _bz_rebase_needed | bool
+    - (_bz_booted['requested-packages'] | default([]) | length) > 0
+
+- name: Confirm the declared image exists in the registry
+  # BEFORE touching the machine: a typo'd variant otherwise presents as a multi-minute pull that
+  # fails at the end with an error that does not obviously say "you misspelled the variant".
+  # NOTE this only catches a NONEXISTENT image — bazzite-gnome and bazzite-nvidia-open are all
+  # real, which is exactly why the write is gated on an explicit confirm rather than on this check.
+  ansible.builtin.command:
+    cmd: "skopeo inspect docker://{{ bazzite_image_ref }}"
+  register: _bz_rb_remote
+  changed_when: false
+  failed_when: false
+  when: _bz_rebase_needed | bool
+
+- name: Assert the declared image is real
+  ansible.builtin.assert:
+    that:
+      - (_bz_rb_remote.rc | default(1) | int) == 0
+    fail_msg: >-
+      Cannot inspect {{ bazzite_image_ref }} — bazzite_image_variant
+      '{{ bazzite_image_variant }}' may not exist, or the registry is unreachable.
+      {{ _bz_rb_remote.stderr | default('') | trim | truncate(200) }}
+    quiet: true
+  when: _bz_rebase_needed | bool
+
+- name: Rebase to the declared image
+  # No --bypass-driver: no updates driver is registered (see the header).
+  # NOT --reboot: rebooting out from under whoever ran the play is not this role's decision;
+  # `bazzite_action=reboot` does that and verifies the result.
+  # Async because Ansible buffers task output until the task ends, so a synchronous multi-GB pull
+  # sits silent with no way to distinguish progress from a hang.
+  ansible.builtin.command:
+    cmd: "rpm-ostree rebase {{ bazzite_image_refspec }}"
+  register: _bz_rb_async
+  changed_when: true
+  become: true
+  async: "{{ bazzite_rebase_timeout | int }}"
+  poll: 0
+  when: &rebase_gate
+    - bazzite_apply | bool
+    - bazzite_rebase_confirm | bool
+    - _bz_rebase_needed | bool
+
+- name: Wait for the rebase to finish
+  ansible.builtin.async_status:
+    jid: "{{ _bz_rb_async.ansible_job_id }}"
+  register: _bz_rb_done
+  until: _bz_rb_done.finished
+  # Quiet: each unfinished poll otherwise prints "FAILED - RETRYING", which reads as an error
+  # while a multi-GB pull proceeds normally.
+  changed_when: false
+  retries: "{{ ((bazzite_rebase_timeout | int) / 15) | round(0, 'ceil') | int }}"
+  delay: 15
+  become: true
+  when: *rebase_gate
+
+- name: Assert the rebase completed
+  # The explicit re-check an `until:` requires — an exhausted retry loop CONTINUES rather than
+  # failing, so a timed-out rebase would otherwise exit green.
+  ansible.builtin.assert:
+    that:
+      - _bz_rb_done.finished | default(false) | bool
+      - (_bz_rb_done.rc | default(1) | int) == 0
+    fail_msg: >-
+      rpm-ostree rebase did not complete. finished={{ _bz_rb_done.finished | default(false) }}
+      rc={{ _bz_rb_done.rc | default('?') }} {{ _bz_rb_done.stderr | default('') | truncate(400) }}
+      The running deployment is untouched — rpm-ostree stages, it does not modify in place.
+    quiet: true
+  when: *rebase_gate
+
+- name: Read back the staged deployment
+  # A READ-BACK, not a trust of the exit code. This is what distinguishes "the command returned 0"
+  # from "the thing is true".
+  ansible.builtin.command:
+    cmd: rpm-ostree status --json
+  register: _bz_rb_after
+  changed_when: false
+  when: *rebase_gate
+
+- name: Assert the new deployment is staged on the declared refspec
+  # NOT quiet: an assert with quiet:true never prints its success_msg (ansible-core sets
+  # _ansible_verbose_always only when NOT quiet), and this success message carries the operator's
+  # only instruction on what to do next.
+  ansible.builtin.assert:
+    that:
+      - _staged_ref == bazzite_image_refspec
+    fail_msg: >-
+      rebase reported success but the staged deployment is on '{{ _staged_ref }}',
+      not '{{ bazzite_image_refspec }}'.
+    success_msg: >-
+      Staged {{ bazzite_image_variant }} {{ _staged_ver }}. REBOOT to activate
+      (bazzite_action=reboot bazzite_apply=true), THEN re-apply autologin
+      (bazzite_action=autologin bazzite_apply=true) — this variant changes the display manager.
+      `rpm-ostree rollback` returns to the previous deployment, which is kept.
+  vars:
+    _deps: "{{ (_bz_rb_after.stdout | from_json).deployments | default([]) }}"
+    _s: >-
+      {{ (_deps | selectattr('staged', 'defined') | selectattr('staged')
+          | list | first | default({})) }}
+    _staged_ref: "{{ _s['container-image-reference'] | default('') }}"
+    _staged_ver: "{{ _s.version | default('?') }}"
+  when: *rebase_gate

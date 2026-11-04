@@ -1,0 +1,78 @@
+#!/bin/sh
+# {{ ansible_managed }}
+# Program the fan curves declared in inventory into the Super-I/O chip.
+#
+# Run at boot by fan-curve-restore.service, and safe to run by hand at any time: writing a curve
+# point that already holds the wanted value is a no-op.
+#
+# READ-BACK ON EVERY WRITE. Super-I/O registers can silently clamp or reject, so a write that
+# "succeeded" is not evidence the value landed. A half-applied curve is worse than none — it
+# would look programmed while behaving unpredictably — so any mismatch is a non-zero exit and
+# systemd shows the unit as failed.
+set -u
+
+CHIP="{{ bazzite_fan_sweep_chip }}"
+
+# WAIT for the chip rather than failing on the first look. At boot, systemd-modules-load
+# completing means modprobe RETURNED, not that the hwmon device has finished registering --
+# the chip can appear many seconds later.
+# Polling turns that race into a short wait; a chip that is genuinely absent still fails.
+hwmon=""
+waited=0
+while [ "$waited" -lt "{{ bazzite_fan_curve_wait_seconds }}" ]; do
+    for d in /sys/class/hwmon/hwmon*; do
+        if [ "$(cat "$d/name" 2>/dev/null)" = "$CHIP" ]; then
+            hwmon="$d"
+            break
+        fi
+    done
+    [ -n "$hwmon" ] && break
+    # Nudge the module in case nothing else has: harmless if already loaded.
+    modprobe "{{ bazzite_sensor_modules | first }}" 2>/dev/null || true
+    sleep 1
+    waited=$((waited + 1))
+done
+
+if [ -z "$hwmon" ]; then
+    echo "fan-curve-restore: no hwmon chip named '$CHIP' after ${waited}s (is the sensor module available?)" >&2
+    exit 1
+fi
+[ "$waited" -gt 0 ] && echo "fan-curve-restore: chip appeared after ${waited}s"
+
+rc=0
+program() {
+    # program <header> <point> <millidegrees> <duty>
+    h="$1"; pt="$2"; want_t="$3"; want_p="$4"
+    ft="$hwmon/pwm${h}_auto_point${pt}_temp"
+    fp="$hwmon/pwm${h}_auto_point${pt}_pwm"
+    [ -w "$ft" ] && [ -w "$fp" ] || {
+        echo "fan-curve-restore: hdr$h point$pt not writable" >&2; rc=1; return
+    }
+    echo "$want_t" > "$ft" 2>/dev/null
+    echo "$want_p" > "$fp" 2>/dev/null
+    got_t="$(cat "$ft" 2>/dev/null || echo na)"
+    got_p="$(cat "$fp" 2>/dev/null || echo na)"
+    if [ "$got_t" = "$want_t" ] && [ "$got_p" = "$want_p" ]; then
+        echo "fan-curve-restore: hdr$h point$pt = ${got_t}/${got_p}"
+    else
+        echo "fan-curve-restore: hdr$h point$pt MISMATCH wanted ${want_t}/${want_p} got ${got_t}/${got_p}" >&2
+        rc=1
+    fi
+}
+
+{% for c in bazzite_fan_curves %}
+# {{ c.note | default('header ' ~ c.header) }}
+{% for p in c.points %}
+program {{ c.header }} {{ loop.index }} {{ (p.temp | int) * 1000 }} {{ p.pwm }}
+{% endfor %}
+{% endfor %}
+
+# Put each header on its curve. A programmed curve does nothing on a header left in MANUAL mode
+# by an interrupted sweep, and at boot that state can survive from before a crash.
+{% for c in bazzite_fan_curves %}
+echo 5 > "$hwmon/pwm{{ c.header }}_enable" 2>/dev/null || true
+mode="$(cat "$hwmon/pwm{{ c.header }}_enable" 2>/dev/null || echo na)"
+[ "$mode" = "5" ] || { echo "fan-curve-restore: hdr{{ c.header }} mode=$mode, not automatic" >&2; rc=1; }
+{% endfor %}
+
+exit $rc

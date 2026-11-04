@@ -1,0 +1,274 @@
+---
+# ENTRYPOINT: display blanking, screen locking and sleep behaviour.
+#
+# WHY THE DEFAULTS ARE WRONG FOR THIS MACHINE. KDE ships desktop-sensible timeouts — screen off
+# after a few minutes, lock shortly after. On a gaming/media box that is actively hostile: the
+# display blanks during a cut-scene, mid-film, or while watching a download, because none of those
+# generate input events. Controller input in particular is often not seen as activity at all.
+#
+# ---------------------------------------------------------------------------------------------
+# PLASMA 6 CHANGED THE ENTIRE SCHEMA, AND THE OLD ONE FAILS SILENTLY.
+#
+# Writing the Plasma 5 layout on Plasma 6, a machine can suspend mid-playbook and
+# go unreachable, despite the config file on disk reading exactly as intended:
+#
+#     [AC][DPMSControl]                 <- Plasma 5 group
+#     idleTime=3600
+#     [AC][SuspendSession]
+#     idleTime=0
+#     [Migration]
+#     MigratedProfilesToPlasma6=powerdevilrc     <- and there is the problem
+#
+# powerdevil 6.x migrates to ~/.config/powerdevilrc and never reads the old file again. The write
+# succeeded, the file was correct, and the setting had NO EFFECT — the worst shape of green run.
+# Verified against the powerdevil v6.7.4 source (PowerDevilProfileSettings.kcfg and
+# daemon/powerdevilmigrateconfig.cpp, which maps the old keys to the new ones explicitly):
+#
+#   [AC][DPMSControl]  idleTime      ->  [AC][Display]             TurnOffDisplayIdleTimeoutSec
+#   [AC][SuspendSession] idleTime    ->  [AC][SuspendAndShutdown]  AutoSuspendIdleTimeoutSec
+#   [AC][SuspendSession] suspendType ->  [AC][SuspendAndShutdown]  AutoSuspendAction
+#
+# THREE TRAPS in that migration, each of which produces a silently ineffective config:
+#
+#   1. `idleTime=0` DOES NOT DISABLE SUSPEND any more. The disable is AutoSuspendAction=0
+#      (NoAction) — suspendsession.cpp returns early on that value BEFORE registering the idle
+#      timeout, so a timeout of 0 with the action still set leaves suspend armed.
+#   2. Units are SECONDS throughout in Plasma 6; several Plasma 5 keys were milliseconds (the
+#      migration divides by 1000). DPMS idleTime was the one exception and was already seconds.
+#   3. The enable-flags are mandatory when hand-writing. TurnOffDisplayWhenIdle and
+#      DimDisplayWhenIdle both DEFAULT TO TRUE, and KConfig omits keys that match their default —
+#      so an ABSENT key means enabled, not disabled.
+#
+# Screen locking is not in powerdevil at all: it lives in kscreenlockerrc [Daemon], and its
+# Timeout is in MINUTES while everything in powerdevilrc is in seconds.
+#
+# The [Migration] marker in the old file is deliberately LEFT IN PLACE. Removing it re-triggers
+# migration, which would regenerate powerdevilrc from the stale Plasma 5 values and overwrite
+# everything written here.
+# ---------------------------------------------------------------------------------------------
+#
+# WHERE THIS PERSISTS. ~/.config is user-owned and untouched by rpm-ostree, so these survive image
+# updates and rebases with no layering. Written through kwriteconfig6 rather than as a whole file,
+# because Plasma rewrites these files and a hand-written copy is lost the next time anything
+# changes a power setting through the GUI.
+
+- name: Apply role defaults
+  ansible.builtin.include_tasks: setup_vars.yml
+
+- name: Report the plan
+  ansible.builtin.debug:
+    msg: >-
+      {{ 'Setting' if (bazzite_apply | bool) else 'WOULD set' }}
+      display blank after {{ bazzite_power_display_minutes }} min,
+      lock {{ 'after ' ~ bazzite_power_lock_minutes ~ ' min' if (bazzite_power_lock_minutes | int) > 0 else 'DISABLED' }},
+      suspend {{ 'after ' ~ bazzite_power_suspend_minutes ~ ' min' if (bazzite_power_suspend_minutes | int) > 0 else 'DISABLED' }}.
+      {{ '' if (bazzite_apply | bool) else 'Re-run with bazzite_apply=true.' }}
+
+- name: Confirm powerdevil is the stack that actually governs this machine
+  # THE PRECONDITION THE ENTRYPOINT USED TO ASSUME. Everything below writes powerdevilrc, which is
+  # meaningful only if powerdevil is running. On the Game Mode image (bazzite-deck) the session is
+  # gamescope: no plasmashell, no powerdevil, and these writes govern NOTHING while still passing
+  # their own read-back assert — a green run that changes nothing, which is the exact failure this
+  # file's header was written about, one layer up.
+  #
+  # The failure this catches: AutoSuspendAction=0 in powerdevilrc, no powerdevil process, and
+  # real suspends anyway.
+  #
+  # `pgrep -c` and a COUNT comparison rather than `grep -q` in a pipe: a q-grep closes the pipe
+  # early and, under pipefail, can invert the test it guards (PIPEQ-01).
+  ansible.builtin.command:
+    cmd: pgrep -c -x org_kde_powerdevil
+  register: _bz_powerdevil_running
+  changed_when: false
+  failed_when: false
+
+- name: Note that the KDE power stack is not live on this image
+  # WITHIN `all`, this is a SKIP rather than a failure. `all` is "converge this machine", and on
+  # the Game Mode image the KDE power settings are simply not applicable — failing the whole
+  # convergence over an inapplicable entrypoint would make `all` unusable on exactly the machine
+  # this role exists for. The suspend concern is not dropped: `all` also runs sleep_inhibit, which
+  # is the entrypoint that genuinely governs it here.
+  ansible.builtin.debug:
+    msg: >-
+      SKIPPED: powerdevil is not running, so powerdevilrc governs nothing on this image. Display
+      blanking and lock are owned by gamescope/Steam here and are not settable from a config file.
+      Suspend IS governed — by bazzite_action=sleep_inhibit, which `all` runs next.
+  when:
+    - bazzite_action | default('power') == 'all'
+    - (_bz_powerdevil_running.stdout | default('0') | trim | int) == 0
+
+- name: Refuse to write a config nothing reads
+  # A hard stop when this entrypoint was asked for DIRECTLY. A skip would read as "nothing needed
+  # doing"; the caller asked to change when this machine sleeps, and on this image that request
+  # cannot be satisfied here. Saying so is the only honest outcome.
+  ansible.builtin.assert:
+    that:
+      - (_bz_powerdevil_running.stdout | default('0') | trim | int) > 0
+    fail_msg: >-
+      powerdevil is NOT running on this machine, so writing powerdevilrc would have no effect —
+      the settings would read back exactly as intended and change nothing about when it sleeps.
+      This is the Game Mode image (bazzite-deck), where the suspend owners are Steam's own
+      cloud-synced Game Mode idle setting and HDMI-CEC, neither of which is reachable from a
+      config file. To stop this machine suspending, use bazzite_action=sleep_inhibit with
+      bazzite_sleep_inhibit=true in inventory, which masks the systemd sleep targets and therefore
+      catches every requester. Diagnose with bazzite_action=power_report.
+    quiet: true
+  when: bazzite_action | default('power') != 'all'
+
+- name: Decide whether this entrypoint has anything to govern
+  # One fact, used to gate every remaining task. NOT meta: end_host / end_play — either would
+  # abandon the rest of `all` (sleep_inhibit, flatpaks, gaming) on the machine that needs them
+  # most. A plain `when:` on the real work is the mechanism that stops HERE without stopping the
+  # play.
+  ansible.builtin.set_fact:
+    _bz_power_applicable: "{{ (_bz_powerdevil_running.stdout | default('0') | trim | int) > 0 }}"
+
+- name: Confirm which profile schema this machine uses
+  # Not assumed from the Plasma version: the marker in the OLD file is what powerdevil itself
+  # keys off, so it is the authoritative signal for which file is live.
+  ansible.builtin.command:
+    cmd: grep -q MigratedProfilesToPlasma6 {{ ansible_env.HOME }}/.config/powermanagementprofilesrc
+  register: _bz_pm_migrated
+  changed_when: false
+  failed_when: false
+  when: _bz_power_applicable | bool
+
+- name: Assert this is the Plasma 6 layout
+  # A hard stop rather than a silent fallback to the Plasma 5 keys. If a future image moves this
+  # again, the right outcome is a loud failure here — not another set of writes into a dead file,
+  # which is precisely the bug this rewrite exists to fix.
+  ansible.builtin.assert:
+    that:
+      - (_bz_pm_migrated.rc | int) == 0
+    fail_msg: >-
+      No MigratedProfilesToPlasma6 marker in ~/.config/powermanagementprofilesrc, so this machine
+      is NOT on the Plasma 6 profile schema this entrypoint writes. Writing powerdevilrc here
+      would have no effect. Check `plasmashell --version` and the powerdevil config layout before
+      changing these keys.
+    quiet: true
+  when: _bz_power_applicable | bool
+
+- name: Set the display and dim behaviour
+  # SECONDS. The enable-flag is written explicitly alongside the timeout because its default is
+  # true and KConfig omits default-valued keys — so relying on absence to mean "off" is wrong.
+  ansible.builtin.command:
+    argv:
+      - kwriteconfig6
+      - --file
+      - powerdevilrc
+      - --group
+      - AC
+      - --group
+      - Display
+      - --key
+      - "{{ item.key }}"
+      - "{{ item.value }}"
+  loop:
+    - { key: "TurnOffDisplayWhenIdle", value: "{{ 'true' if (bazzite_power_display_minutes | int) > 0 else 'false' }}" }
+    - { key: "TurnOffDisplayIdleTimeoutSec", value: "{{ (bazzite_power_display_minutes | int) * 60 }}" }
+    # Dimming before blanking is its own annoyance on a media box, and its default is ON.
+    - { key: "DimDisplayWhenIdle", value: "false" }
+    - { key: "LockBeforeTurnOffDisplay", value: "{{ 'true' if (bazzite_power_lock_minutes | int) > 0 else 'false' }}" }
+  loop_control:
+    label: "{{ item.key }}={{ item.value }}"
+  changed_when: true
+  when:
+    - bazzite_apply | bool
+    - _bz_power_applicable | bool
+
+- name: Set the suspend behaviour
+  # AutoSuspendAction is the load-bearing key: 0 = NoAction, which is what actually disables
+  # suspend. 1 = suspend to RAM. Setting only the timeout leaves the action armed.
+  ansible.builtin.command:
+    argv:
+      - kwriteconfig6
+      - --file
+      - powerdevilrc
+      - --group
+      - AC
+      - --group
+      - SuspendAndShutdown
+      - --key
+      - "{{ item.key }}"
+      - "{{ item.value }}"
+  loop:
+    - { key: "AutoSuspendAction", value: "{{ 1 if (bazzite_power_suspend_minutes | int) > 0 else 0 }}" }
+    - { key: "AutoSuspendIdleTimeoutSec", value: "{{ (bazzite_power_suspend_minutes | int) * 60 }}" }
+  loop_control:
+    label: "{{ item.key }}={{ item.value }}"
+  changed_when: true
+  when:
+    - bazzite_apply | bool
+    - _bz_power_applicable | bool
+
+- name: Set the screen lock
+  # A different file and a different unit: kscreenlockerrc Timeout is in MINUTES, while every
+  # powerdevilrc timeout above is in seconds.
+  ansible.builtin.command:
+    argv:
+      - kwriteconfig6
+      - --file
+      - kscreenlockerrc
+      - --group
+      - Daemon
+      - --key
+      - "{{ item.key }}"
+      - "{{ item.value }}"
+  loop:
+    - { key: "Autolock", value: "{{ 'true' if (bazzite_power_lock_minutes | int) > 0 else 'false' }}" }
+    - { key: "Timeout", value: "{{ bazzite_power_lock_minutes | int }}" }
+  loop_control:
+    label: "{{ item.key }}={{ item.value }}"
+  changed_when: true
+  when:
+    - bazzite_apply | bool
+    - _bz_power_applicable | bool
+
+- name: Read the settings back
+  # kreadconfig6 against the live files — not a re-parse of what was written. This is what
+  # powerdevil will load, and it catches a key written into the wrong nested group, which is the
+  # easiest mistake with kwriteconfig's --group syntax and fails silently.
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      printf 'display=%s\n'   "$(kreadconfig6 --file powerdevilrc --group AC --group Display --key TurnOffDisplayIdleTimeoutSec)"
+      printf 'displayon=%s\n' "$(kreadconfig6 --file powerdevilrc --group AC --group Display --key TurnOffDisplayWhenIdle)"
+      printf 'suspendact=%s\n' "$(kreadconfig6 --file powerdevilrc --group AC --group SuspendAndShutdown --key AutoSuspendAction)"
+      printf 'suspendsec=%s\n' "$(kreadconfig6 --file powerdevilrc --group AC --group SuspendAndShutdown --key AutoSuspendIdleTimeoutSec)"
+      printf 'autolock=%s\n'  "$(kreadconfig6 --file kscreenlockerrc --group Daemon --key Autolock)"
+  register: _bz_power_after
+  changed_when: false
+  when:
+    - bazzite_apply | bool
+    - _bz_power_applicable | bool
+
+- name: Assert the settings landed in the file powerdevil actually reads
+  # Gates on the SUSPEND ACTION specifically, because that is the key whose absence caused the
+  # original outage — a timeout alone reads as configured while leaving suspend armed.
+  ansible.builtin.assert:
+    that:
+      - "('display=' ~ ((bazzite_power_display_minutes | int) * 60)) in _bz_power_after.stdout"
+      - "('suspendact=' ~ (1 if (bazzite_power_suspend_minutes | int) > 0 else 0)) in _bz_power_after.stdout"
+    fail_msg: >-
+      Power settings did not land. Read back: {{ _bz_power_after.stdout_lines | join(' ') }}
+      — expected display={{ (bazzite_power_display_minutes | int) * 60 }}
+      and suspendact={{ 1 if (bazzite_power_suspend_minutes | int) > 0 else 0 }}.
+      A value written into the wrong nested group is the usual cause.
+    quiet: true
+  when:
+    - bazzite_apply | bool
+    - _bz_power_applicable | bool
+
+- name: Report the result
+  ansible.builtin.debug:
+    msg:
+      - "{{ _bz_power_after.stdout_lines }}"
+      - >-
+        Written to ~/.config/powerdevilrc, so these survive image updates. powerdevil reads this
+        file at startup: they apply to NEW sessions, so log out and back in (or reboot) for them
+        to take effect in the running one. Confirm with bazzite_action=power_report, which
+        reports real suspend events rather than configuration.
+  when:
+    - bazzite_apply | bool
+    - _bz_power_applicable | bool

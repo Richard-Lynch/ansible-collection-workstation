@@ -1,0 +1,107 @@
+---
+# ENTRYPOINT: layer packages into the base image with rpm-ostree. THE LAST RESORT.
+#
+# WHY THIS CARRIES WARNINGS THE OTHER ENTRYPOINTS DO NOT. On an image-based system every layered
+# package is a permanent tax:
+#
+#   * `rpm-ostree upgrade` must re-resolve it against each new base image, so updates get slower
+#     with every package added;
+#   * a layered package that conflicts with a newer base image BLOCKS the update entirely, and
+#     the failure surfaces weeks later as "my system stopped updating";
+#   * an image rebase (Bazzite -> Bazzite-Nvidia, or a major version) re-resolves the whole set;
+#   * it needs a REBOOT to take effect, unlike everything else this role does.
+#
+# So the order of preference is: flatpak (GUI apps) -> distrobox (CLI tools) -> layering, and
+# only for things that must exist in the base image: kernel modules, drivers, system services,
+# anything loaded before a user session exists.
+#
+# bazzite_layer_packages is EMPTY by default. That is the correct default, not an oversight.
+
+- name: Apply role defaults
+  ansible.builtin.include_tasks: setup_vars.yml
+
+- name: Nothing to do when no packages are requested
+  ansible.builtin.debug:
+    msg: >-
+      No packages requested for layering, which is the recommended state. Prefer flatpak for GUI
+      applications and distrobox for CLI tools; layer only what must live in the base image.
+  when: bazzite_layer_packages | length == 0
+
+- name: Read the currently layered set
+  ansible.builtin.command:
+    cmd: rpm-ostree status --json
+  register: _bz_status
+  changed_when: false
+  when: bazzite_layer_packages | length > 0
+
+- name: Work out what is not yet layered
+  ansible.builtin.set_fact:
+    _bz_to_layer: >-
+      {{ bazzite_layer_packages
+         | reject('in', (_bz_status.stdout | from_json).deployments[0]['requested-packages'] | default([]))
+         | list }}
+  when: bazzite_layer_packages | length > 0
+
+- name: Report the layering plan and its cost
+  ansible.builtin.debug:
+    msg: >-
+      {{ (_bz_to_layer | length) }} package(s) to layer: {{ _bz_to_layer | join(', ') | default('none', true) }}.
+      Layering slows every future rpm-ostree upgrade and REQUIRES A REBOOT to take effect.
+      {{ 'Re-run with bazzite_apply=true to proceed.' if not (bazzite_apply | bool) else '' }}
+  when: bazzite_layer_packages | length > 0
+
+- name: Layer the packages
+  # One rpm-ostree call for the whole set, unlike the flatpak path: rpm-ostree resolves the
+  # entire dependency graph as a transaction, so per-package calls would each create a separate
+  # deployment and multiply the reboots.
+  ansible.builtin.command:
+    argv: "{{ ['rpm-ostree', 'install', '--idempotent', '--apply-live'] + _bz_to_layer }}"
+  register: _bz_layered
+  changed_when: true
+  become: true
+  when:
+    - bazzite_apply | bool
+    - bazzite_layer_packages | length > 0
+    - _bz_to_layer | length > 0
+
+- name: Confirm the packages are now in the pending deployment
+  # A read-back against rpm-ostree's own state, not the command's exit code. --apply-live can
+  # partially succeed: the package lands in the pending deployment while the live apply fails,
+  # which looks like success and behaves like nothing happened until a reboot.
+  ansible.builtin.command:
+    cmd: rpm-ostree status --json
+  register: _bz_poststatus
+  changed_when: false
+  when:
+    - bazzite_apply | bool
+    - _bz_to_layer | default([]) | length > 0
+
+- name: Assert every requested package is layered
+  ansible.builtin.assert:
+    that:
+      - _still | length == 0
+    fail_msg: >-
+      These packages are not in the deployment after layering: {{ _still | join(', ') }}.
+      Check the names against `rpm-ostree search`, and read the command output — a dependency
+      conflict here is what would later block an image upgrade.
+    quiet: true
+  vars:
+    _deployments: "{{ (_bz_poststatus.stdout | from_json).deployments }}"
+    # Checks EVERY deployment, not just the booted one: --apply-live leaves the package in the
+    # pending deployment, so looking only at deployments[0] can miss a successful layering.
+    _all_requested: >-
+      {{ _deployments | map(attribute='requested-packages') | select('defined') | sum(start=[]) | unique | list }}
+    _still: "{{ bazzite_layer_packages | reject('in', _all_requested) | list }}"
+  when:
+    - bazzite_apply | bool
+    - _bz_to_layer | default([]) | length > 0
+
+- name: Note that a reboot is required
+  ansible.builtin.debug:
+    msg: >-
+      Layered {{ _bz_to_layer | join(', ') }}. A REBOOT is required for these to be fully active
+      — --apply-live covers the running system where it can, but the deployment only becomes the
+      booted one after a restart.
+  when:
+    - bazzite_apply | bool
+    - _bz_to_layer | default([]) | length > 0

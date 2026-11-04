@@ -1,0 +1,339 @@
+---
+# ENTRYPOINT: what this machine can do with the display and the TV over HDMI — CEC in particular.
+#
+# Writes nothing.
+#
+# WHY CEC IS WORTH CHECKING BEFORE PLANNING ANYTHING. HDMI-CEC lets the PC turn the TV on and
+# switch it to the right input. The catch is that it needs the GPU to expose a CEC adapter, and
+# most discrete cards DO NOT — AMD's display stack has no CEC support on consumer Radeon, so on
+# many builds the only route is a Pulse-Eight USB-CEC adapter, i.e. hardware, not a package.
+#
+# So this answers the feasibility question directly (does /dev/cec* exist, and from what) rather
+# than reporting that a package is missing and implying installing it would help.
+#
+# It also reports the connected outputs, because "the box will not boot headless" and "the TV is
+# asleep" produce identical symptoms from the far end of an SSH session, and a disconnected HDMI
+# cable looks like either.
+
+- name: Apply role defaults
+  ansible.builtin.include_tasks: setup_vars.yml
+
+- name: Look for CEC device nodes
+  # The authoritative test. A CEC adapter — whether from the GPU or a USB dongle — appears as
+  # /dev/cec0. Its ABSENCE is the answer, not a missing driver to go and install.
+  ansible.builtin.find:
+    paths: /dev
+    patterns: "cec*"
+    file_type: any
+  register: _bz_cec_nodes
+
+- name: Check for a CEC kernel module
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      lsmod 2>/dev/null | grep -E "^cec|dw_hdmi_cec|drm_display_helper" || true
+  register: _bz_cec_mods
+  changed_when: false
+
+- name: Check whether a USB-CEC adapter is attached
+  # Pulse-Eight is the common one (vendor 2548). Reported separately from the device node so the
+  # advice can distinguish "no hardware" from "hardware present but no driver bound".
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      lsusb 2>/dev/null | grep -iE "2548:|pulse-eight|cec" || true
+  register: _bz_cec_usb
+  changed_when: false
+
+- name: Check for cec-utils
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      command -v cec-ctl cec-client 2>/dev/null || true
+  register: _bz_cec_tools
+  changed_when: false
+
+- name: Read the connected display outputs
+  # From DRM sysfs rather than a compositor query: this works over SSH with no session, which is
+  # exactly when you need it.
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      for c in /sys/class/drm/card*-*/status; do
+        [ -f "$c" ] || continue
+        printf '%s %s\n' "$(basename "$(dirname "$c")")" "$(cat "$c")"
+      done | sort
+  register: _bz_drm
+  changed_when: false
+
+- name: Read each connected display's HDR capability from its EDID
+  # FROM THE EDID, not from a compositor query — this has to work over SSH with no session.
+  #
+  # A CTA-861 extension block carries data blocks tagged in the top 3 bits of their first byte;
+  # tag 7 is "use extended tag", and extended tag 6 is the HDR Static Metadata Data Block. Its
+  # presence means the display declares HDR transfer functions, and the byte after the extended
+  # tag is the EOTF bitmap: bit0 traditional SDR, bit1 traditional HDR, bit2 SMPTE ST2084 (HDR10),
+  # bit3 HLG.
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      python3 - <<'PY'
+      import glob, os
+      for path in sorted(glob.glob('/sys/class/drm/card*-*/edid')):
+          conn = os.path.basename(os.path.dirname(path))
+          try:
+              data = open(path, 'rb').read()
+          except OSError:
+              continue
+          if not data:
+              continue
+          eotf = None
+          for base in range(128, len(data), 128):
+              block = data[base:base + 128]
+              # 0x02 = CTA-861 extension. byte 2 is the offset at which the DTDs start, so the
+              # data block collection is everything between byte 4 and there.
+              if len(block) < 4 or block[0] != 0x02:
+                  continue
+              end, i = block[2], 4
+              while i < end and i < len(block):
+                  tag, length = (block[i] >> 5) & 0x07, block[i] & 0x1f
+                  if tag == 7 and length >= 2 and block[i + 1] == 0x06:
+                      eotf = block[i + 2]
+                  i += length + 1
+          print('%s hdr=%s eotf=%s' % (conn, 'yes' if eotf is not None else 'no',
+                                       hex(eotf) if eotf is not None else '-'))
+      PY
+  register: _bz_edid_hdr
+  changed_when: false
+  failed_when: false
+
+- name: Read the compositor's own HDR state
+  # SEPARATE FROM THE EDID ON PURPOSE: a display CAN do HDR and the compositor can still be in
+  # SDR, and that combination is the one that matters. Sunshine on Linux cannot switch the
+  # display into HDR for a stream — the dd_hdr_option settings that do so are Windows-only — so
+  # advertising HDR (bazzite_sunshine_hdr) while the compositor sits in SDR sends an SDR image
+  # inside an HDR container, which looks washed out. Worse than leaving HDR off.
+  #
+  # Read from kwinoutputconfig.json rather than kscreen-doctor, which needs a live Wayland
+  # session and fails over SSH.
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      f="{{ ansible_env.HOME }}/.config/kwinoutputconfig.json"
+      [ -f "$f" ] || { echo 'no-config'; exit 0; }
+      python3 - "$f" <<'PY'
+      import glob, hashlib, json, os, sys
+      try:
+          doc = json.load(open(sys.argv[1]))
+      except (OSError, ValueError):
+          print('unreadable'); raise SystemExit(0)
+
+      # THE SETTINGS ARE TWO LEVELS DOWN, not at the top. The file is a list of GROUPS, each
+      # with a `data` array holding one entry per display. Iterating the top level for
+      # highDynamicRange finds it on no group and prints 'no-hdr-keys' — reporting a machine with
+      # HDR correctly enabled as off.
+      #
+      # And only the CONNECTED display counts: the file accumulates an entry per display ever
+      # seen (often several on one connector), so reporting all of them says nothing about the
+      # screen actually attached. Matched by EDID hash, the same key KWin itself uses.
+      live = set()
+      for path in glob.glob('/sys/class/drm/card*-*/edid'):
+          status = os.path.join(os.path.dirname(path), 'status')
+          try:
+              if open(status).read().strip() != 'connected':
+                  continue
+              data = open(path, 'rb').read()
+          except OSError:
+              continue
+          if data:
+              live.add(hashlib.md5(data).hexdigest())
+
+      found = False
+      for group in (doc if isinstance(doc, list) else [doc]):
+          if not isinstance(group, dict):
+              continue
+          for entry in group.get('data', []):
+              if not isinstance(entry, dict) or entry.get('edidHash') not in live:
+                  continue
+              if 'highDynamicRange' in entry:
+                  found = True
+                  print('%s hdr=%s wcg=%s' % (entry.get('connectorName'),
+                                              entry.get('highDynamicRange'),
+                                              entry.get('wideColorGamut')))
+      if not found:
+          print('no-hdr-keys')
+      PY
+  register: _bz_kwin_hdr
+  changed_when: false
+  failed_when: false
+
+- name: Read the DPMS power state of each connected connector
+  # THE BLACK-SCREEN READ. A connector reporting `connected` says a panel is ATTACHED and the link
+  # is up; it says nothing about whether the output is being driven. `dpms` is the difference
+  # between "no signal" and "signal, screen blanked" — the two causes of a dark TV that look
+  # identical from the sofa and have completely different fixes.
+  #
+  # Reported per connector rather than as a single verdict because a machine can have two amdgpu
+  # devices with only one connector driving the TV; a machine-wide "display is on" would be true of the
+  # wrong card. Also reads `enabled`, which is the CRTC-level question (is a mode set at all)
+  # and is the one that goes 'disabled' when a compositor has released the output.
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      for s in /sys/class/drm/card*-*/status; do
+        [ -f "$s" ] || continue
+        d="$(dirname "$s")"
+        [ "$(cat "$s" 2>/dev/null)" = "connected" ] || continue
+        printf '%s status=%s dpms=%s enabled=%s\n' \
+          "$(basename "$d")" \
+          "$(cat "$s" 2>/dev/null || echo '?')" \
+          "$(cat "$d/dpms" 2>/dev/null || echo 'n/a')" \
+          "$(cat "$d/enabled" 2>/dev/null || echo 'n/a')"
+      done
+  register: _bz_dpms
+  changed_when: false
+  failed_when: false
+
+- name: Read the graphical session from logind
+  # NOT $XDG_SESSION_TYPE. That variable describes the SSH session doing the asking — it reads
+  # `tty` over SSH on a machine sitting in Game Mode, so anything deriving the box's session state
+  # from the environment reports the reporter rather than the machine. A `session=tty`
+  # line from the environment means nothing about the console.
+  #
+  # loginctl is the authoritative source: it lists every session with its seat, type and class, so
+  # a graphical session on seat0 is visible regardless of who is asking or from where. The
+  # gamescope process check is the corroborating half — a session that exists but whose compositor
+  # has died is the failure this is looking for.
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      echo "--- sessions ---"
+      loginctl list-sessions --no-legend 2>/dev/null || echo '(loginctl unavailable)'
+      echo "--- seat0 graphical ---"
+      # A COUNT, not `grep -q` in a pipe: a q-grep closes the pipe early and, under pipefail,
+      # inverts the very test it guards (PIPEQ-01).
+      loginctl list-sessions --no-legend 2>/dev/null \
+        | awk '{print $1}' \
+        | while read -r id; do
+            [ -n "$id" ] || continue
+            printf '%s type=%s class=%s active=%s\n' "$id" \
+              "$(loginctl show-session "$id" -p Type --value 2>/dev/null)" \
+              "$(loginctl show-session "$id" -p Class --value 2>/dev/null)" \
+              "$(loginctl show-session "$id" -p Active --value 2>/dev/null)"
+          done
+      echo "--- compositor ---"
+      printf 'gamescope=%s\n' "$(pgrep -c -f gamescope-session 2>/dev/null || echo 0)"
+      printf 'steam=%s\n'     "$(pgrep -c -x steam 2>/dev/null || echo 0)"
+  register: _bz_session
+  changed_when: false
+  failed_when: false
+
+- name: Report
+  ansible.builtin.debug:
+    msg: "{{ _report.splitlines() }}"
+  vars:
+    _has_node: "{{ (_bz_cec_nodes.files | default([]) | length) > 0 }}"
+    _has_usb: "{{ (_bz_cec_usb.stdout | default('') | trim | length) > 0 }}"
+    _connected: "{{ _bz_drm.stdout_lines | default([]) | select('search', ' connected$') | list }}"
+    # A display that declares HDR in its EDID, on a connector that is actually connected.
+    _hdr_display: "{{ (_bz_edid_hdr.stdout_lines | default([]) | select('search', 'hdr=yes') | list | length) > 0 }}"
+    # The compositor's stored state. `hdr=True` is the only value that means HDR is on; anything
+    # else — False, no-config, no-hdr-keys, unreadable — means it is not, and each of those is a
+    # different reason worth showing rather than flattening to "off".
+    _hdr_compositor: "{{ 'hdr=True' in (_bz_kwin_hdr.stdout | default('')) }}"
+    _hdr_verdict: >-
+      {{ 'HDR END TO END: the display declares it and the compositor is in HDR mode. Sunshine
+      can advertise the 10-bit profiles (bazzite_sunshine_hdr=true) and a client asking for HDR
+      will get it.'
+         if (_hdr_display | bool) and (_hdr_compositor | bool)
+         else ('DISPLAY YES, COMPOSITOR NO. The panel declares HDR but KWin is in SDR. Sunshine
+      on Linux CANNOT switch it — the dd_hdr_option settings that do are Windows-only — so
+      advertising HDR here sends an SDR image inside an HDR container, which looks washed out.
+      Turn it on in System Settings -> Display -> High Dynamic Range first, or leave
+      bazzite_sunshine_hdr=false.'
+         if (_hdr_display | bool)
+         else 'NO HDR. No connected display declares HDR support in its EDID, so
+      bazzite_sunshine_hdr should stay false — advertising a profile nothing can show only
+      changes how negotiation fails.') }}
+    # BLANK-SCREEN EVIDENCE. `dpms=On` means the output is being DRIVEN; a connected connector
+    # reporting Off/Standby/Suspend is a blanked screen, which is a different fault from "no
+    # signal" and has a different fix. Kept separate from _connected for exactly that reason.
+    _dpms_lines: "{{ _bz_dpms.stdout_lines | default([]) }}"
+    _dpms_off: "{{ _dpms_lines | reject('search', 'dpms=On') | list }}"
+    # A real graphical session ON A SEAT, from logind rather than from this SSH session's own
+    # environment. `probe.yml` derives its `session=` line from $XDG_SESSION_TYPE, which over SSH
+    # describes the CONNECTION and reads `tty` on a machine sitting in Game Mode — so it reports
+    # the asker, not the machine. This is the authoritative read.
+    _sess_lines: "{{ _bz_session.stdout_lines | default([]) }}"
+    _has_graphical: "{{ (_sess_lines | select('search', 'type=(wayland|x11)') | list | length) > 0 }}"
+    _gamescope_up: "{{ (_sess_lines | select('search', '^gamescope=[1-9]') | list | length) > 0 }}"
+    _report: |
+      ===== HDR =====
+      {% for line in (_bz_edid_hdr.stdout_lines | default([])) %}
+      display  : {{ line }}
+      {% endfor %}
+      compositor: {{ (_bz_kwin_hdr.stdout | default('') | trim) | default('(unknown)', true) }}
+
+      {{ _hdr_verdict }}
+
+      ===== CEC FEASIBILITY =====
+      /dev/cec* nodes : {{ (_bz_cec_nodes.files | map(attribute='path') | list | join(', ')) | default('NONE', true) }}
+      cec kernel mods : {{ (_bz_cec_mods.stdout_lines | join(', ')) | default('(none loaded)', true) }}
+      USB-CEC adapter : {{ (_bz_cec_usb.stdout | trim) | default('(none detected)', true) }}
+      cec-utils       : {{ (_bz_cec_tools.stdout_lines | join(', ')) | default('(not installed)', true) }}
+
+      VERDICT: {{
+        'CEC IS AVAILABLE — a device node exists, so the TV can be woken and switched from this
+      box. Install cec-utils (cec-ctl) if absent and drive it from a play.'
+        if _has_node
+        else ('A USB-CEC adapter is attached but exposes NO /dev/cec node — the driver is not
+      bound. That is a driver problem, and worth solving, because the hardware is already here.'
+        if _has_usb
+        else 'CEC IS NOT AVAILABLE. No device node and no USB adapter. AMD consumer Radeon does
+      not expose CEC over HDMI, so no package will add this — it needs a Pulse-Eight USB-CEC
+      adapter (~GBP 40) plugged into the PC and the TV. Until then the TV cannot be woken by
+      the PC. Wake-on-LAN wakes the PC; it does not wake the TV.') }}
+
+      ===== DISPLAY OUTPUTS =====
+      {{ (_bz_drm.stdout_lines | join('
+      ')) | default('(none readable)', true) }}
+
+      connected: {{ (_connected | length) }}
+      {{ 'A connected output is present, so the box has a display attached.'
+         if (_connected | length) > 0
+         else 'NOTHING CONNECTED — no output reports a display. Some machines fail to come up
+      with HDMI unplugged, so this is worth knowing before a reboot.' }}
+
+      ===== IS THE OUTPUT BEING DRIVEN? (the blank-screen read) =====
+      {{ (_dpms_lines | join('
+      ')) | default('(no connected connector readable)', true) }}
+
+      ===== GRAPHICAL SESSION (from logind, NOT $XDG_SESSION_TYPE) =====
+      {{ (_sess_lines | join('
+      ')) | default('(unreadable)', true) }}
+
+      {{ 'NO CONNECTED OUTPUT — nothing is attached, so there is nothing to blank.'
+         if (_connected | length) == 0
+         else ('OUTPUT IS BLANKED: a connected connector reports dpms Off/Standby/Suspend. The
+      link is up and the panel is attached, but the output is not being driven — screen blanking,
+      NOT a suspend and NOT a cable fault. On the bazzite-deck/Game Mode image powerdevil does not
+      run, so powerdevilrc TurnOffDisplayWhenIdle is inert and the blanking owner is
+      gamescope/Steam.'
+         if (_dpms_off | length) > 0
+         else ('SIGNAL IS DRIVEN (dpms=On) and a graphical session is active on a seat. If the
+      screen is dark anyway, the compositor is compositing but an APPLICATION layer is not
+      presenting — run `bazzite_action=session_report`, which is written for exactly that fault.
+      Note a desktop Radeon has no CEC adapter, so it cannot switch the TV input for you.'
+         if (_has_graphical | bool)
+         else 'SIGNAL IS DRIVEN but NO GRAPHICAL SESSION is registered on a seat. gamescope is '
+      ~ ('running' if (_gamescope_up | bool) else 'NOT running')
+      ~ ' — a compositor that has died leaves the connector lit and the screen empty, so restart
+      the session rather than looking at power settings.')) }}

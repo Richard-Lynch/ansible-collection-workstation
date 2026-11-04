@@ -1,0 +1,123 @@
+---
+# ENTRYPOINT: work out which physical fans are on which addressable RGB header.
+#
+# WHY THIS CANNOT BE ANSWERED IN SOFTWARE ALONE. An ARGB header has no way to report what is
+# plugged into it — not the device, not the LED count, not even whether anything is there. The
+# only mapping from "header 1" to "the three fans on the radiator" runs through a human looking
+# at the case. This entrypoint makes that lookup quick and unambiguous instead of a guess.
+#
+# IT WRITES TO EVERY DUPLICATE OF THE BOARD. OpenRGB enumerates the same controller twice — once
+# via I2C and once via HID — and only ONE of those indices actually drives the hardware. A test
+# that picks the wrong one lights nothing, which reads as "there is nothing on that header" and
+# is an easy false conclusion: writing a header on the wrong device index while the live board is
+# another makes wired fans look unwired.
+#
+# TWO PHASES:
+#
+#   bazzite_rgb_identify_phase=solid   each header a distinct colour, held  (start here)
+#   bazzite_rgb_identify_phase=chase   one lit LED walks each chain, slowly, so you can count
+#                                      LEDs per fan and see where one fan ends and the next
+#                                      begins — this is what reveals whether the AIO block sits
+#                                      on the end of a chain
+#   bazzite_rgb_identify_phase=restore put everything back to one colour
+#
+# The daemon is STOPPED for the duration: it rewrites every device every couple of seconds and
+# would overwrite the test pattern mid-look.
+
+- name: Apply role defaults
+  ansible.builtin.include_tasks: setup_vars.yml
+
+- name: HARD GATE — the RGB controller to drive is declared
+  ansible.builtin.assert:
+    that:
+      - bazzite_rgb_identify_match is defined
+      - bazzite_rgb_identify_match | string | length > 0
+    fail_msg: >-
+      bazzite_rgb_identify_match is not set. Which controller to light is a fact about the
+      machine; declare a device-name substring in the host's inventory entry.
+    quiet: true
+
+- name: Install the RGB daemon
+  # The identify helper IMPORTS its protocol client from the daemon rather than carrying a second
+  # copy, so the daemon file has to be present and current even when only identifying.
+  ansible.builtin.copy:
+    src: openrgb_daemon.py
+    dest: "{{ bazzite_rgb_daemon_path }}"
+    mode: "0755"
+
+- name: Install the identification helper
+  ansible.builtin.copy:
+    src: openrgb_identify.py
+    dest: "{{ bazzite_rgb_identify_path }}"
+    mode: "0755"
+
+- name: Stop the RGB daemon so it does not overwrite the test pattern
+  ansible.builtin.systemd_service:
+    name: "{{ bazzite_rgb_daemon_unit }}"
+    scope: user
+    state: stopped
+  when: bazzite_rgb_identify_phase != 'restore'
+
+- name: Make sure the SDK server is up
+  ansible.builtin.systemd_service:
+    name: "{{ bazzite_rgb_server_unit }}"
+    scope: user
+    state: started
+    enabled: true
+
+- name: Wait for the SDK server
+  ansible.builtin.wait_for:
+    host: "{{ bazzite_rgb_server_host }}"
+    port: "{{ bazzite_rgb_server_port | int }}"
+    timeout: 60
+
+- name: Run the identification pattern
+  # Bounded by the task-level `timeout:` (bazzite_rgb_identify_timeout): a long chase, or
+  # bazzite_rgb_identify_loops: 0 (forever), is stopped there rather than hanging the play.
+  ansible.builtin.command:
+    argv:
+      - "{{ bazzite_python }}"
+      - "{{ bazzite_rgb_identify_path }}"
+      - --host
+      - "{{ bazzite_rgb_server_host }}"
+      - --port
+      - "{{ bazzite_rgb_server_port }}"
+      - --match
+      - "{{ bazzite_rgb_identify_match }}"
+      - --phase
+      - "{{ bazzite_rgb_identify_phase }}"
+      - --zone
+      - "{{ bazzite_rgb_identify_zone }}"
+      - --step
+      - "{{ bazzite_rgb_identify_step }}"
+      - --loops
+      - "{{ bazzite_rgb_identify_loops }}"
+      - --restore-color
+      - "{{ bazzite_rgb_color }}"
+  environment:
+    # The helper imports its protocol client from the installed daemon; name it explicitly so
+    # an inventory override of bazzite_rgb_daemon_path is honoured.
+    IAAC_RGB_DAEMON: "{{ bazzite_rgb_daemon_path }}"
+  register: _bz_ident
+  changed_when: true
+  # NOT async. A target shell that emits terminal escape sequences (OSC colour queries) on every
+  # non-interactive command makes the async wrapper fail to parse its own JSON result out of
+  # them: "Module result deserialization failed: No start of json char found". The task-level
+  # timeout bounds it instead.
+  timeout: "{{ bazzite_rgb_identify_timeout | int }}"
+
+- name: Show what was done
+  ansible.builtin.debug:
+    msg: "{{ _bz_ident.stdout_lines | default([]) }}"
+
+- name: Explain the next step
+  ansible.builtin.debug:
+    msg: >-
+      {{ 'Look at the case now and report which group of fans shows which colour. Then run the
+      chase phase to count LEDs per chain.'
+      if bazzite_rgb_identify_phase == 'solid'
+      else ('The chase has finished; the headers are left dark. Re-run with
+      bazzite_rgb_identify_phase=restore, or just re-run the lighting entrypoint to bring the
+      daemon back.'
+      if bazzite_rgb_identify_phase == 'chase'
+      else 'Restored. Re-run bazzite_action=lighting bazzite_apply=true to restart the daemon.') }}

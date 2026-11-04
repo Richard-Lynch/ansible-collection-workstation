@@ -1,0 +1,36 @@
+---
+# Resolve the role's REAL variables, so verify.yml asserts against the role's own derivation
+# rather than a copy of it.
+- name: Converge
+  hosts: localhost
+  # FACTS ON. Several of the role's defaults derive paths from `ansible_env.HOME` — deriving from
+  # facts rather than hardcoding a home directory keeps the role portable — so a
+  # fact-free scenario fails resolving them with "'ansible_env' is undefined", which reads as a
+  # broken role and is actually a scenario that does not run the role the way a play does.
+  gather_facts: true
+
+  vars:
+    # The three required options. A scenario that used `tasks_from:` would BYPASS argspec
+    # validation (argument_specs.yml declares only the `main` entrypoint), so these must be set
+    # deliberately here — otherwise they fail as bare undefined and the failure reads as a broken
+    # role rather than a stale test.
+    bazzite_hostname: molecule-host
+    bazzite_sudo_user: molecule
+    bazzite_image_variant: bazzite-deck
+
+  tasks:
+    - name: Resolve the role's defaults and derive the image references
+      # The ROLE'S OWN file, not a re-derivation. This is the whole point: if the derivation in
+      # setup_vars.yml changes, this scenario must see the change.
+      ansible.builtin.include_role:
+        name: bazzite_workstation
+        tasks_from: setup_vars
+
+    - name: Record the derived references for the verifier
+      ansible.builtin.set_fact:
+        molecule_image_ref: "{{ bazzite_image_ref }}"
+        molecule_image_refspec: "{{ bazzite_image_refspec }}"
+        molecule_rebase_confirm: "{{ bazzite_rebase_confirm }}"
+        molecule_login_mode: "{{ bazzite_login_mode }}"
+        molecule_hw_units: "{{ bazzite_deck_hw_units }}"
+        molecule_generic_units: "{{ bazzite_deck_generic_units }}"

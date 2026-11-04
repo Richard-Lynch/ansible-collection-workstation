@@ -1,0 +1,141 @@
+---
+# ENTRYPOINT: hold ONE header at ONE duty and report what it does. Then stop.
+#
+# THIS IS THE CONVERSATIONAL SWEEP. Rather than one process stepping through duties on a timer,
+# each step is a separate play run: set a duty, measure, report, return. The operator is asked
+# between runs — in conversation, from the controller — and the next run sets the next duty.
+# Nothing needs a TTY on the target, which is what made the in-process `--rate` mode unusable
+# from Ansible.
+#
+# THE DEADMAN IS NOT OPTIONAL HERE, and this is the important difference from the batch sweep.
+# Between two steps NO PROCESS OF OURS IS ALIVE holding the header: it sits in manual mode with
+# only the detached systemd timer to put it back. If the session is abandoned — the operator
+# walks away, the conversation ends, the controller dies — that timer is the ONLY thing that
+# will ever restore automatic control. So `bazzite_fan_hold_deadman` is generous (minutes, not
+# seconds: it must outlast a human thinking) and every step RE-ARMS it, so the deadline always
+# runs from the most recent step rather than from the first.
+#
+# ALWAYS FINISH WITH `bazzite_fan_hold_release=true`, which hands the header back and disarms
+# the timer. Forgetting is survivable by design — the deadman fires — but it is loud and slow
+# compared with releasing properly.
+#
+#   bazzite_action=fan_hold bazzite_fan_hold_apply=true
+#
+# The header and duty come from inventory/the play, not the command line; only
+# the apply and release gates are passed per run.
+
+- name: Apply role defaults
+  ansible.builtin.include_tasks: setup_vars.yml
+
+- name: HARD GATE — the Super-I/O chip is declared
+  ansible.builtin.assert:
+    that:
+      - bazzite_fan_sweep_chip is defined
+      - bazzite_fan_sweep_chip | string | length > 0
+    fail_msg: >-
+      bazzite_fan_sweep_chip is not set. Which hwmon chip carries the fan headers is a fact about
+      the board; declare it (e.g. nct6799) in the host's inventory entry.
+    quiet: true
+
+- name: Refuse to hold a header that drives a pump
+  # Same reasoning as the batch sweep: a pump stepped down to find where it stops is a pump at
+  # risk of cavitation, and its RPM says nothing about whether coolant is moving.
+  ansible.builtin.assert:
+    that:
+      - "(bazzite_fan_hold_header | int) not in (bazzite_fan_sweep_pump_headers | map('int') | list)"
+    fail_msg: >-
+      Header {{ bazzite_fan_hold_header }} is declared as a PUMP header
+      (bazzite_fan_sweep_pump_headers={{ bazzite_fan_sweep_pump_headers }}). Holding it at a
+      reduced duty risks cavitation and loss of coolant flow.
+    quiet: true
+
+- name: Try to load the motherboard sensor module
+  ansible.builtin.command:
+    argv: [modprobe, "{{ item }}"]
+  become: true
+  register: _bz_hold_modprobe
+  changed_when: _bz_hold_modprobe.rc == 0
+  failed_when: false
+  loop: "{{ bazzite_sensor_modules }}"
+  when: bazzite_sensors_load_modules | bool
+
+- name: Install the sweep helper
+  ansible.builtin.copy:
+    src: fan_sweep.py
+    dest: "{{ bazzite_fan_sweep_path }}"
+    mode: "0755"
+  become: true
+
+- name: Report what this step would do
+  ansible.builtin.debug:
+    msg:
+      - "Would hold header {{ bazzite_fan_hold_header }} at {{ bazzite_fan_hold_percent }}% duty."
+      - "Deadman: {{ bazzite_fan_hold_deadman }}s from this step."
+      - "Set bazzite_fan_hold_apply=true to run it."
+  when: not (bazzite_fan_hold_apply | bool)
+
+- name: Release the header and disarm the deadman
+  ansible.builtin.command:
+    argv:
+      - "{{ bazzite_python }}"
+      - "{{ bazzite_fan_sweep_path }}"
+      - --chip={{ bazzite_fan_sweep_chip }}
+      - --header={{ bazzite_fan_hold_header }}
+      - --release
+      - --deadman={{ bazzite_fan_hold_deadman }}
+  become: true
+  register: _bz_hold_release
+  changed_when: true
+  when:
+    - bazzite_fan_hold_apply | bool
+    - bazzite_fan_hold_release | bool
+
+- name: Confirm the release actually landed
+  # Read-back, not exit code. The release is what ends the session safely, so it proves itself.
+  ansible.builtin.assert:
+    that:
+      - "'restored=yes' in (_bz_hold_release.stdout | default(''))"
+    fail_msg: >-
+      Header {{ bazzite_fan_hold_header }} was NOT confirmed back under automatic control:
+      {{ _bz_hold_release.stdout | default('(no output)') | trim }}. Re-run with
+      bazzite_action=fan_hold bazzite_fan_hold_release=true now.
+    success_msg: "Header {{ bazzite_fan_hold_header }} released to automatic control."
+    quiet: true
+  when:
+    - bazzite_fan_hold_apply | bool
+    - bazzite_fan_hold_release | bool
+
+- name: Hold the header at this duty and measure
+  ansible.builtin.command:
+    argv:
+      - "{{ bazzite_python }}"
+      - "{{ bazzite_fan_sweep_path }}"
+      - --chip={{ bazzite_fan_sweep_chip }}
+      - --header={{ bazzite_fan_hold_header }}
+      - --hold={{ bazzite_fan_hold_percent }}
+      - --settle={{ bazzite_fan_sweep_settle }}
+      - --samples={{ bazzite_fan_sweep_samples }}
+      - --deadman={{ bazzite_fan_hold_deadman }}
+  become: true
+  register: _bz_hold
+  changed_when: true
+  when:
+    - bazzite_fan_hold_apply | bool
+    - not (bazzite_fan_hold_release | bool)
+
+- name: Report the measurement
+  ansible.builtin.debug:
+    msg: "{{ _report.splitlines() | select('string') | list }}"
+  vars:
+    _m: "{{ _bz_hold.stdout | default('{}') | from_json }}"
+    _report: |
+      ===== HOLDING header {{ _m.header | default('?') }} at {{ _m.requested_pct | default('?') }}% =====
+      duty asked  : {{ _m.requested_pwm | default('?') }}/255
+      duty landed : {{ _m.landed_pwm | default('?') }}/255 ({{ _m.landed_pct | default('?') }}%){{ '  << CLAMPED by the chip' if (_m.clamped | default(false)) else '' }}
+      speed       : {{ _m.rpm | default('?') }} RPM (spread {{ _m.rpm_spread | default('?') }})
+      {{ '*** STALLED — the fan is not turning at this duty.' if (_m.stalled | default(false)) else '' }}
+      The header is HELD here until the next step or a release.
+      Deadman: automatic control returns by itself in {{ _m.deadman_seconds | default('?') }}s if nothing else happens.
+  when:
+    - bazzite_fan_hold_apply | bool
+    - not (bazzite_fan_hold_release | bool)

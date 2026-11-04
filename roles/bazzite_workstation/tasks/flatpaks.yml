@@ -1,0 +1,190 @@
+---
+# ENTRYPOINT: install the declared flatpak set.
+#
+# WHY FLATPAK IS THE DEFAULT PATH HERE. Bazzite is an image-based (rpm-ostree) system: the base
+# image is immutable, and `rpm-ostree install` LAYERS a package onto it — which works, but slows
+# every future update, has to be re-resolved on each image rebase, and can block an update
+# outright if a layered package conflicts. Flatpaks sit outside that entirely: installed and
+# updated independently, no reboot, no effect on the image.
+#
+# So the rule this role follows is: GUI application -> flatpak; CLI tool -> distrobox; only
+# things that genuinely must exist in the base image (drivers, kernel modules, system services)
+# get layered. See layer.yml for that path and its warnings.
+#
+# GENERATE-DON'T-APPLY: reports what it would install and stops unless bazzite_apply=true.
+
+- name: Apply role defaults
+  ansible.builtin.include_tasks: setup_vars.yml
+
+- name: Ensure Flathub is configured for the user
+  # --user, not system-wide: keeps the install in the user's own namespace, which needs no root
+  # and survives an image rebase untouched. Bazzite normally configures this already; the task
+  # is idempotent and exists so a fresh or reset profile is not a surprise.
+  ansible.builtin.command:
+    argv:
+      - flatpak
+      - remote-add
+      - --user
+      - --if-not-exists
+      - flathub
+      - https://dl.flathub.org/repo/flathub.flatpakrepo
+  register: _bz_flathub
+  changed_when: "'already exists' not in (_bz_flathub.stderr | default(''))"
+  when: bazzite_apply | bool
+
+- name: Read what is already installed
+  # The comparison basis for both the dry-run report and the idempotence of the install below.
+  ansible.builtin.command:
+    cmd: flatpak list --app --columns=application
+  register: _bz_installed
+  changed_when: false
+
+- name: Work out what is missing
+  ansible.builtin.set_fact:
+    _bz_missing: >-
+      {{ bazzite_flatpaks | reject('in', _bz_installed.stdout_lines | map('trim') | list) | list }}
+
+- name: Work out what is installed but NOT declared
+  # THE OTHER HALF OF DRIFT, which this entrypoint used to be blind to. It reported what was
+  # missing and never noticed the reverse: an app installed by hand, or one inventory used to
+  # declare and no longer does — a gap nothing else surfaces.
+  #
+  # REPORTED, NEVER REMOVED. A flatpak a user installed deliberately is not an error, and a
+  # role that uninstalls whatever it does not recognise would be actively hostile on a desktop.
+  # The point is to make the difference VISIBLE so the declaration can be corrected if it should
+  # have been there.
+  ansible.builtin.set_fact:
+    _bz_undeclared: >-
+      {{ _bz_installed.stdout_lines | map('trim') | reject('equalto', '')
+         | reject('in', bazzite_flatpaks) | list }}
+
+- name: Report the flatpak difference
+  ansible.builtin.debug:
+    msg: "{{ _report.splitlines() | select('string') | list }}"
+  vars:
+    _report: |
+      declared : {{ bazzite_flatpaks | length }}   installed: {{ _bz_installed.stdout_lines | map('trim') | reject('equalto', '') | list | length }}
+
+      MISSING — declared but not installed ({{ _bz_missing | length }}):
+        {{ _bz_missing | join(', ') | default('(none)', true) }}
+
+      UNDECLARED — installed but not in bazzite_flatpaks ({{ _bz_undeclared | length }}):
+        {{ _bz_undeclared | join(', ') | default('(none)', true) }}
+
+      {{ 'Undeclared apps are REPORTED, never removed — an app installed on purpose is not an
+          error. If any of these should be managed, add them to bazzite_flatpaks in
+          inventory; if not, this list is the record of what is deliberately hand-managed.'
+         if (_bz_undeclared | length) > 0 else '' }}
+      {{ 'Re-run with bazzite_apply=true to install the missing ones.'
+         if (not (bazzite_apply | bool)) and (_bz_missing | length) > 0 else '' }}
+
+- name: Install the missing flatpaks
+  # One task per app rather than a single batched command: a batch fails atomically, so one
+  # unavailable app blocks every other. Per-app, a single failure is visible and isolated.
+  ansible.builtin.command:
+    argv: [flatpak, install, --user, --noninteractive, --assumeyes, flathub, "{{ item }}"]
+  loop: "{{ _bz_missing }}"
+  register: _bz_install
+  changed_when: true
+  failed_when:
+    - _bz_install.rc != 0
+    - "'already installed' not in (_bz_install.stderr | default(''))"
+  when: bazzite_apply | bool
+
+- name: Install the OpenRGB udev rules
+  # WHY THE FLATPAK ALONE IS NOT ENOUGH. OpenRGB talks to RGB controllers over raw USB/HID and
+  # i2c, which needs udev rules granting the user access to those nodes. The Flatpak cannot
+  # install system rules from inside its sandbox, so it warns "The OpenRGB udev rules are not
+  # installed. Most devices will not be available unless running as root."
+  #
+  # Without them detection works (RAM, board, keyboard, mouse) but control silently fails on
+  # most devices. Detection succeeding while control does not is exactly
+  # the half-working state worth closing.
+  #
+  # WRITTEN INLINE rather than downloaded. The published rules file has moved between releases —
+  # both openrgb.org/releases/... and the GitLab raw path 404 today — and a URL that rots turns a
+  # working role into a failing one for no reason. These rules are simple and stable: grant the
+  # plugdev/wheel group access to HID and i2c, which is all OpenRGB needs.
+  #
+  # /etc/udev/rules.d IS writable on Bazzite (only /usr is read-only) and rpm-ostree merges it
+  # across image updates, so no layering is required.
+  ansible.builtin.copy:
+    dest: /etc/udev/rules.d/60-openrgb.rules
+    mode: "0644"
+    owner: root
+    group: root
+    content: |
+      # Managed by roles/bazzite_workstation — OpenRGB device access.
+      #
+      # SCOPED BY VENDOR AND USING uaccess, NOT world-writable. MODE="0666" on all hidraw, all
+      # USB and i2c-dev would hand every user on the machine read/write access to raw HID and the
+      # SMBus — far broader than OpenRGB needs, and broader than the project's own published
+      # rules. TAG+="uaccess" instead grants access to whoever is logged in at the seat, and drops
+      # back to nothing when they log out.
+      #
+      # Vendor IDs covered (bazzite_openrgb_udev_vendors; check yours with `OpenRGB --list-devices`):
+      {% for v in bazzite_openrgb_udev_vendors %}
+      #   {{ v.id }} {{ v.note | default('') }}
+      {% endfor %}
+      # Adding a new RGB device means adding its id to that list rather than opening everything.
+      {% for v in bazzite_openrgb_udev_vendors %}
+      SUBSYSTEM=="usb", ATTR{idVendor}=="{{ v.id }}", TAG+="uaccess"
+      {% endfor %}
+      {% for v in bazzite_openrgb_udev_vendors %}
+      KERNEL=="hidraw*", ATTRS{idVendor}=="{{ v.id }}", TAG+="uaccess"
+      {% endfor %}
+      # SMBus access, which is how the DDR5 modules and the board are reached. i2c has no vendor
+      # to scope on, so this is uaccess-gated rather than mode-opened.
+      SUBSYSTEM=="i2c-dev", TAG+="uaccess"
+  become: true
+  register: _bz_udev
+  when:
+    - bazzite_apply | bool
+    - bazzite_openrgb_udev | bool
+    - "'org.openrgb.OpenRGB' in bazzite_flatpaks"
+
+- name: Ensure the i2c module is loaded for motherboard and DIMM control
+  # i2c-dev is what exposes the SMBus to userspace. Without it the DDR5 and motherboard
+  # controllers are invisible to OpenRGB no matter what the udev rules say.
+  community.general.modprobe:
+    name: i2c-dev
+    state: present
+    persistent: present
+  become: true
+  failed_when: false
+  when:
+    - bazzite_apply | bool
+    - bazzite_openrgb_udev | bool
+
+- name: Reload udev and re-trigger device events
+  ansible.builtin.command:
+    argv: [udevadm, "{{ item }}"]
+  become: true
+  changed_when: true
+  loop: [trigger]
+  when:
+    - bazzite_apply | bool
+    - _bz_udev.changed | default(false)
+
+- name: Confirm every requested flatpak is now present
+  # A read-back rather than trusting the install's exit code. flatpak can report success for an
+  # app that resolved to nothing on this architecture, and "it said it worked" is not
+  # evidence.
+  ansible.builtin.command:
+    cmd: flatpak list --app --columns=application
+  register: _bz_verify
+  changed_when: false
+  when: bazzite_apply | bool
+
+- name: Assert the requested set is installed
+  ansible.builtin.assert:
+    that:
+      - _still_missing | length == 0
+    fail_msg: >-
+      These flatpaks are still absent after the install run: {{ _still_missing | join(', ') }}.
+      Check the application IDs against `flatpak search`, and that flathub is reachable.
+    quiet: true
+  vars:
+    _still_missing: >-
+      {{ bazzite_flatpaks | reject('in', _bz_verify.stdout_lines | default([]) | map('trim') | list) | list }}
+  when: bazzite_apply | bool

@@ -1,0 +1,136 @@
+---
+# ENTRYPOINT: WHY are the fans at this speed? Reports the control state behind the RPM.
+#
+# WHY THIS IS SEPARATE FROM `sensors`. The sensors entrypoint answers "how hot is it?" and reports
+# fan RPM as a supporting fact. That is the wrong tool for the complaint "the fans are loud",
+# because the interesting case is exactly the one where the temperatures are FINE and the fans are
+# loud anyway: every sensor idle and cold (CPU ~40C, GPU ~20C and idle) while chassis headers run
+# at 2000-3000 RPM.
+#
+# At that point the RPM is not the question. The question is what is COMMANDING it, and that lives
+# in the pwm channels, not the temperature ones:
+#
+#   pwmN         the duty cycle actually being applied, 0-255.
+#   pwmN_enable  the CONTROL MODE, and the whole answer usually sits here:
+#                  0 = full speed  — no control at all, the header is pinned at 100%
+#                  1 = manual      — software sets pwmN directly; the BIOS curve is NOT running
+#                  2 = thermal cruise / automatic — the BIOS or Super-I/O curve is in charge
+#                  3-5 = other automatic modes (smart fan III/IV variants)
+#                A header sitting at mode 0 or at mode 1 with a high fixed pwm is loud BY
+#                CONFIGURATION and will never respond to temperature, however cold the board is.
+#
+# Reading this is what separates "the curve is aggressive" (a BIOS tuning job) from "nothing is
+# running a curve at all" (fixable from Linux, or a BIOS mode that was never set).
+#
+# It also reports whether anything in userspace is driving the fans — fancontrol, asusctl, coolercontrol
+# — because a userspace daemon that has taken the headers to manual mode and then died leaves them
+# stuck at whatever it last wrote, which looks exactly like a BIOS fault and is not one.
+#
+# Writes nothing.
+
+- name: Apply role defaults
+  ansible.builtin.include_tasks: setup_vars.yml
+
+- name: Try to load the motherboard sensor module
+  # Same rationale as the sensors entrypoint: without nct6775 the board's fan headers and their
+  # pwm channels do not exist in sysfs at all, and this entrypoint would report an empty control
+  # surface — which reads as "no fan control available" when the truth is "the module is not
+  # loaded". Reversible with `modprobe -r`; registers nothing if the board is unsupported.
+  ansible.builtin.command:
+    argv: [modprobe, "{{ item }}"]
+  become: true
+  register: _bz_fan_modprobe
+  changed_when: _bz_fan_modprobe.rc == 0
+  failed_when: false
+  loop: "{{ bazzite_sensor_modules }}"
+  when: bazzite_sensors_load_modules | bool
+
+- name: Read the PWM control state of every board fan header
+  # Reported RAW, per header, with mode AND duty AND rpm together. Those three only mean anything
+  # side by side: 2089 RPM alone is ambiguous, but 2089 RPM at mode 1 with pwm 255 is a header
+  # someone pinned to full manually, and 2089 RPM at mode 2 is a curve doing its job badly.
+  #
+  # Header index is NOT the BIOS name. The ASUS BIOS labels these CPU_FAN / AIO_PUMP / CHA_FAN1-3;
+  # the kernel numbers them in Super-I/O order and knows none of those names. Guessing the mapping
+  # would be worse than omitting it — a wrong "the pump is fine" is precisely the reading someone
+  # would act on. The mapping is left to whoever can see what is plugged in.
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      for h in /sys/class/hwmon/hwmon*; do
+        n=$(cat "$h/name" 2>/dev/null)
+        case "$n" in
+          nct6*|it87*)
+            printf 'chip=%s\n' "$n"
+            for f in "$h"/pwm[0-9]; do
+              [ -r "$f" ] || continue
+              i=$(basename "$f" | tr -dc '0-9')
+              printf 'hdr%s pwm=%s mode=%s rpm=%s\n' "$i" \
+                "$(cat "$f" 2>/dev/null || echo na)" \
+                "$(cat "$h/pwm${i}_enable" 2>/dev/null || echo na)" \
+                "$(cat "$h/fan${i}_input" 2>/dev/null || echo na)"
+            done
+            ;;
+        esac
+      done
+  register: _bz_pwm
+  changed_when: false
+
+- name: Look for anything in userspace driving the fans
+  # A daemon holding the headers in manual mode and then dying leaves them stuck at its last
+  # write — indistinguishable from a BIOS fault by RPM alone, and fixed completely differently.
+  # `systemctl is-active` per unit rather than a process grep: a masked or dead unit is exactly
+  # the state that matters here, and a grep for a running process cannot see it.
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      for u in fancontrol coolercontrold asusd thermald; do
+        printf '%s=%s\n' "$u" "$(systemctl is-active "$u" 2>/dev/null || echo inactive)"
+      done
+      for t in fancontrol pwmconfig coolercontrol asusctl; do
+        printf 'bin_%s=%s\n' "$t" "$(command -v "$t" >/dev/null 2>&1 && echo present || echo absent)"
+      done
+  register: _bz_fanctl
+  changed_when: false
+
+- name: Parse the control state
+  ansible.builtin.set_fact:
+    _fanctl: >-
+      {{ dict(_bz_fanctl.stdout_lines | default([]) | select('search', '=')
+              | map('split', '=') | map('list')) }}
+
+- name: Report
+  ansible.builtin.debug:
+    msg: "{{ _report.splitlines() | select('string') | list }}"
+  vars:
+    _hdrs: "{{ _bz_pwm.stdout_lines | default([]) | select('match', '^hdr') | list }}"
+    # A header is "pinned" when it is under no thermal control: mode 0 is full-speed, mode 1 is
+    # manual. Either way the BIOS curve is not running on that header and temperature will never
+    # change its speed.
+    _pinned: "{{ _hdrs | select('search', 'mode=[01] ') | reject('search', 'rpm=0$') | list }}"
+    _auto: "{{ _hdrs | select('search', 'mode=[2-5] ') | reject('search', 'rpm=0$') | list }}"
+    _report: |
+      ===== FAN CONTROL MODE, PER BOARD HEADER =====
+      {{ _bz_pwm.stdout_lines | default(['(no Super-I/O chip visible — is nct6775 loaded?)']) | join('
+      ') }}
+
+      mode 0 = FULL SPEED (no control)   1 = MANUAL (software-set, no curve)
+      mode 2-5 = automatic (a BIOS / Super-I/O curve is in charge)
+      pwm is the duty cycle 0-255. rpm=0 on a header means an EMPTY header, not a stopped fan.
+      Header numbers are Super-I/O order, NOT the BIOS names (CPU_FAN / AIO_PUMP / CHA_FAN*).
+
+      ===== USERSPACE FAN DAEMONS =====
+      fancontrol     : {{ _fanctl.fancontrol | default('?') }}   (binary {{ _fanctl.bin_fancontrol | default('?') }})
+      coolercontrold : {{ _fanctl.coolercontrold | default('?') }}
+      asusd          : {{ _fanctl.asusd | default('?') }}   (binary {{ _fanctl.bin_asusctl | default('?') }})
+      thermald       : {{ _fanctl.thermald | default('?') }}
+
+      ===== VERDICT =====
+      {{ ('Headers under NO thermal control (' ~ (_pinned | length) ~ '): ' ~ (_pinned | join('; '))
+          ~ ' — these are loud BY CONFIGURATION and will not respond to temperature.')
+         if (_pinned | length) > 0
+         else 'Every spinning header is in an automatic mode — a curve IS running on all of them.' }}
+      {{ ('Headers on an automatic curve (' ~ (_auto | length) ~ '): ' ~ (_auto | join('; ')))
+         if (_auto | length) > 0 else '' }}

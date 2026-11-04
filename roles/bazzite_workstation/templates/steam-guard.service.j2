@@ -1,0 +1,17 @@
+# {{ ansible_managed }}
+# Steam guard — restarts the Game Mode Steam session when Steam is dead, and on request from an
+# allowlisted client (a Steam Deck tile). See the role's files/steam_guard.py.
+[Unit]
+Description=IaaC Steam guard (watchdog + restart endpoint)
+# NOT PartOf/BindsTo the session unit: restarting that session is this unit's whole job, and a
+# guard that is stopped by the restart it issues could never report the outcome.
+After=default.target
+
+[Service]
+Type=simple
+ExecStart={{ bazzite_python }} {{ bazzite_steam_guard_path }} --unit {{ bazzite_steam_guard_session_unit }} --port {{ bazzite_steam_guard_port }} --allow {{ bazzite_steam_guard_allow | join(',') }} --state-file {{ ansible_env.HOME }}/.local/state/iaac-steam-guard/state.json --mode {{ bazzite_steam_guard_mode }} --interval {{ bazzite_steam_guard_interval }} --unhealthy-for {{ bazzite_steam_guard_unhealthy_for }} --startup-grace {{ bazzite_steam_guard_startup_grace }} --max-restarts {{ bazzite_steam_guard_max_restarts }} --window {{ bazzite_steam_guard_window }}{{ ' --restart-on-stuck-suspend' if bazzite_steam_guard_restart_on_stuck_suspend | bool else '' }}
+Restart=always
+RestartSec=10s
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,223 @@
+---
+# ENTRYPOINT: why is the Game Mode screen blank while the Steam overlay still draws?
+#
+# Writes nothing.
+#
+# THE FAULT THIS IS FOR. The TV shows nothing after the machine sits idle with a game paused —
+# yet the controller works and the Steam menu appears over the top. That combination is
+# diagnostic: the OVERLAY layer is compositing while the APP layer has stopped presenting frames,
+# and everything the other read-only entrypoints check can be healthy at the same time —
+# `display_report` showing dpms=On on the live connector and a Wayland session on seat0,
+# `power_report` showing no suspend events.
+#
+# So the useful evidence is not "is there a session" but "what did the session DO" — which is in
+# the journal for the gamescope/Steam units and nowhere else, read here rather than by hand.
+#
+# WHAT IT DELIBERATELY DOES NOT DO. It does not restart the session or poke Steam. A blank app
+# layer recovers on input, so the only way to learn the cause is to read the state while it is
+# still broken; a repair action here would destroy the evidence it is collecting.
+
+- name: Apply role defaults
+  ansible.builtin.include_tasks: setup_vars.yml
+
+- name: Read the Game Mode session units
+  # The session runs as USER units, so `systemctl --user` is the right scope — a system-scope
+  # query reports them as not-found and reads as "Game Mode is not installed".
+  #
+  # XDG_RUNTIME_DIR is set explicitly: over SSH without a login session the user bus is not
+  # discoverable from the environment, and systemctl --user then fails with "Failed to connect to
+  # bus" — which looks like a broken session rather than a broken query.
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+      for u in gamescope-session-plus@steam gamescope-session-plus@ogui-steam gamescope-session@steam \
+               steam sdgyrodsu vpower; do
+        printf '%s active=%s sub=%s\n' "$u" \
+          "$(systemctl --user is-active "$u" 2>/dev/null || echo 'n/a')" \
+          "$(systemctl --user show "$u" -p SubState --value 2>/dev/null || echo 'n/a')"
+      done
+  register: _bz_sess_units
+  changed_when: false
+  failed_when: false
+
+- name: Read the compositor and Steam processes with their start times
+  # A restart is the thing to rule in or out first: if gamescope's start time is RECENT while
+  # uptime is long, the compositor died and came back, and the blank layer is the aftermath of a
+  # crash rather than an idle timeout. lstart gives the absolute time so it can be compared
+  # against when the screen actually went dark.
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      echo "--- uptime ---"
+      uptime -p
+      echo "--- processes (lstart = when it started) ---"
+      ps -eo pid,lstart,etimes,comm,args --sort=start_time 2>/dev/null \
+        | grep -E 'gamescope|steamwebhelper|[/ ]steam|reaper' \
+        | grep -v -E 'grep|ps -eo' \
+        | cut -c1-400
+  register: _bz_sess_procs
+  changed_when: false
+  failed_when: false
+
+- name: Read the compositor's launch arguments and HDR mode
+  # WHY THE ARGS MATTER HERE. gamescope's HDR inverse-tone-mapping (`--hdr-itm-enable`) is an
+  # extra processing stage between the app's swapchain and the display. It is the one option in
+  # this session's command line that can leave a layer un-presented while the compositor's own
+  # overlay — which does not go through it — keeps drawing. Reported in full because the line is
+  # long and the interesting flags sit at the end, past where a truncating `ps` cuts it off.
+  #
+  # `--prefer-output *,eDP-1` is reported for the same reason: eDP-1 is an INTERNAL panel, which
+  # a desktop does not have, so it is worth seeing whether output selection is falling through
+  # to the HDMI connector by luck rather than by intent.
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      echo "--- gamescope argv (NUL-separated, full) ---"
+      for p in $(pgrep -x gamescope-wl 2>/dev/null; pgrep -x gamescope 2>/dev/null); do
+        printf 'pid=%s %s\n' "$p" "$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null)"
+      done
+      echo "--- session env (HDR / present relevant) ---"
+      # `gamescope`, not `gamescope-wl`: the ps COMM column truncates to 15 characters, so the
+      # process shows as `gamescope-wl` there while its real name — and the only name pgrep -x
+      # matches — is `gamescope`. Matching the truncated form found nothing and printed an empty
+      # section that read as "no HDR variables set".
+      for p in $(pgrep -x gamescope 2>/dev/null); do
+        tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null \
+          | grep -E '^(DXVK|VKD3D|PROTON|MANGOHUD|ENABLE_HDR|DISPLAY|WAYLAND|GAMESCOPE|STEAM_|SDL_|__GL|AMD_|RADV)' \
+          | sort || true
+      done
+      echo "--- the Ansible-managed HDR env file ---"
+      f="$HOME/.config/environment.d/50-iaac-hdr.conf"
+      if [ -f "$f" ]; then
+        printf 'path=%s mtime=%s\n' "$f" "$(date -r "$f" '+%Y-%m-%d %H:%M:%S' 2>/dev/null)"
+        grep -E '^ENABLE_' "$f" 2>/dev/null || true
+      else
+        echo '(absent)'
+      fi
+      echo "--- connector HDR / colorspace ---"
+      # The connector is inventory config (bazzite_session_report_connector): card index and
+      # connector name differ between machines. Undeclared, every CONNECTED connector is read.
+      {% if bazzite_session_report_connector | length > 0 %}
+      _conns="/sys/class/drm/{{ bazzite_session_report_connector }}"
+      {% else %}
+      _conns=""
+      for c in /sys/class/drm/card*-*; do
+        [ "$(cat "$c/status" 2>/dev/null)" = connected ] && _conns="$_conns $c"
+      done
+      {% endif %}
+      for c in $_conns; do
+        for f in "$c/hdr_output_metadata" "$c/Colorspace" "$c/max_bpc"; do
+          [ -e "$f" ] && printf '%s=%s\n' "$(basename "$f")" "$(cat "$f" 2>/dev/null | head -c 120)"
+        done
+      done
+  register: _bz_sess_args
+  changed_when: false
+  failed_when: false
+
+- name: Read the session journal for blanking, idle and presentation faults
+  # THE LOAD-BEARING READ. Filtered to the terms that distinguish the candidate causes rather than
+  # dumping the journal: an idle/screensaver action, a GPU reset (amdgpu ring timeout — which blanks
+  # the app layer while the compositor survives), a compositor swapchain/present error, or a
+  # steamwebhelper crash.
+  #
+  # `grep -c`-free but count-safe: the pipeline ends in `tail`, never `grep -q`, so it cannot take
+  # SIGPIPE and invert its own exit status under pipefail (PIPEQ-01).
+  # `|| true` keeps a no-match from failing the task, since "nothing matched" is a real answer.
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      # _COMM/_TRANSPORT-scoped, NOT an unfiltered journal: an unscoped grep matches the
+      # journald record of THIS shell's own command line and prints the pattern back as though
+      # it were a log line, inflating every verdict count below.
+      journalctl -b --no-pager -o short-iso --output-fields=MESSAGE \
+        _COMM=gamescope _COMM=gamescope-wl + _COMM=steam + _COMM=steamwebhelper \
+        + _COMM=sddm-helper + _TRANSPORT=kernel 2>/dev/null \
+        | grep -E -i 'gamescope|amdgpu|ring timeout|GPU reset|swapchain|present|steamwebhelper|screensaver|blank|DPMS|vblank' \
+        | tail -80 || true
+  register: _bz_sess_journal
+  changed_when: false
+  failed_when: false
+
+- name: Read GPU ring / reset counters
+  # A GPU hang recovered by a ring reset is the mechanism that most closely matches the symptom:
+  # the kernel resets the engine, the compositor reconnects and keeps drawing its own overlay, and
+  # the application's context is lost so its layer never presents again. These counters say whether
+  # that happened, independently of whether the journal lines have rotated away.
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      for d in /sys/class/drm/card*/device; do
+        [ -d "$d" ] || continue
+        [ -f "$d/reset_counter" ] || [ -f "$d/gpu_recover" ] || continue
+        printf '%s reset_counter=%s\n' "$(basename "$(dirname "$d")")" \
+          "$(cat "$d/reset_counter" 2>/dev/null || echo 'n/a')"
+      done
+      echo "--- amdgpu errors this boot ---"
+      journalctl -b --no-pager -o short-iso _TRANSPORT=kernel 2>/dev/null \
+        | grep -E -i 'amdgpu.*(error|reset|timeout|hang|fault)' \
+        | tail -25 || true
+  register: _bz_sess_gpu
+  changed_when: false
+  failed_when: false
+
+- name: Report
+  ansible.builtin.debug:
+    msg: "{{ _report.splitlines() }}"
+  vars:
+    _j: "{{ _bz_sess_journal.stdout_lines | default([]) }}"
+    # Each candidate cause gets its own detector, so the verdict names a mechanism rather than
+    # saying "something went wrong". A GPU reset and an idle blank need opposite fixes.
+    # A GENUINE reset, not a boot-time display-init warning. `optc*_disable_crtc REG_WAIT
+    # timeout` is emitted by amdgpu while bringing the display up and is benign — matching the
+    # bare word 'timeout' or 'hang' reported a GPU reset on a machine whose only amdgpu lines
+    # were from boot, hours before the symptom. That false positive is exactly what this
+    # exclusion prevents.
+    _gpu_reset: "{{ (_j | select('search', '(?i)(ring [a-z0-9]* ?timeout|GPU reset|gpu recover|GPU fault|soft reset)')
+                        | reject('search', '(?i)optc[0-9]*_disable_crtc')
+                        | list) }}"
+    _webhelper: "{{ (_j | select('search', '(?i)steamwebhelper') | list) }}"
+    _idle_hit: "{{ (_j | select('search', '(?i)(screensaver|idle inhibit|blank)') | list) }}"
+    _report: |
+      ===== SESSION UNITS (user scope) =====
+      {{ (_bz_sess_units.stdout | default('(unreadable)')) | trim }}
+
+      ===== PROCESSES =====
+      {{ (_bz_sess_procs.stdout | default('(unreadable)')) | trim }}
+
+      ===== COMPOSITOR ARGS / HDR =====
+      {{ (_bz_sess_args.stdout | default('(unreadable)')) | trim }}
+
+      ===== GPU RESET / ERROR COUNTERS =====
+      {{ (_bz_sess_gpu.stdout | default('(unreadable)')) | trim }}
+
+      ===== SESSION JOURNAL (filtered, last 80) =====
+      {{ (_j | join('
+      ')) | default('(no matching lines this boot)', true) }}
+
+      ===== WHAT THE EVIDENCE POINTS AT =====
+      gpu reset/hang lines : {{ _gpu_reset | length }}
+      steamwebhelper lines : {{ _webhelper | length }}
+      idle/blank lines     : {{ _idle_hit | length }}
+
+      {{ 'GPU RESET / RING TIMEOUT PRESENT. This is the mechanism that matches a blank app layer
+      with a working overlay: the kernel reset the graphics engine, gamescope reconnected and kept
+      compositing its own layer, and the application lost its context so it never presents again.
+      This is a driver/hardware fault, NOT a power setting — look at the amdgpu lines above and
+      correlate their timestamps with when the screen went dark.'
+         if (_gpu_reset | length) > 0
+         else ('STEAMWEBHELPER FAULTS PRESENT and no GPU reset. Game Mode renders its UI through
+      steamwebhelper (CEF); when it dies the overlay — drawn by gamescope — survives while the
+      main surface goes empty. That matches the symptom and is a Steam-client fault, which
+      Ansible does not manage: it updates itself.'
+         if (_webhelper | length) > 0
+         else 'NO GPU RESET AND NO STEAMWEBHELPER FAULT in what remains of this boot journal. That
+      does not clear them — the journal may have rotated, and a paused game blanking after idle is
+      consistent with an idle action inside Steam whose settings are CLOUD-SYNCED and therefore
+      not visible in any file on this machine (see the inventory note on bazzite_sleep_inhibit).
+      Capture this report again WHILE the screen is blank and compare the process start times.') }}

@@ -1,0 +1,165 @@
+---
+# ENTRYPOINT: enable Wake-on-LAN on the wired NIC, persistently.
+#
+# WHAT WoL NEEDS, in three independent layers. All must be right, and each fails silently:
+#
+#   1. HARDWARE     `ethtool <iface>` must list 'g' under "Supports Wake-on". Nearly all wired
+#                   NICs do. Read, never assumed — a NIC without it cannot be made to work.
+#   2. DRIVER       "Wake-on:" must BE 'g', not 'd'. This is the bit that is usually wrong, and
+#                   it does NOT survive a reboot on its own — hence the systemd unit below.
+#   3. FIRMWARE     The BIOS must keep the NIC powered in the target sleep state. Not settable
+#                   from the OS; reported here, with the exact ASUS setting names, because a
+#                   perfectly configured NIC still will not wake a board with ErP enabled.
+#
+# SLEEP STATE MATTERS AND IS THE USUAL SURPRISE. Waking from SUSPEND (S3) needs only (1)+(2)+NIC
+# standby power. Waking from a full POWER-OFF (S5) additionally needs the board to keep the PCIe
+# slot powered when off — on ASUS that is "Power On By PCI-E/PCI" ENABLED and "ErP Ready"
+# DISABLED. ErP is an EU standby-power compliance mode that cuts NIC power entirely, so enabling
+# it makes WoL-from-off impossible no matter what the OS says.
+#
+# A wake test must not claim a wake it merely observed: a machine with `Wake-on: d` that comes up
+# seconds after a packet, because someone pressed the power button at the same moment, proves
+# nothing about the packet.
+
+- name: Apply role defaults
+  ansible.builtin.include_tasks: setup_vars.yml
+
+- name: Find the wired interfaces
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      ls -1 /sys/class/net | grep -E '^(eno|enp|eth)' || true
+  register: _bz_wol_ifaces
+  changed_when: false
+
+- name: Assert a wired interface exists
+  ansible.builtin.assert:
+    that:
+      - _bz_wol_ifaces.stdout_lines | length > 0
+    fail_msg: "No wired interface found; Wake-on-LAN applies to ethernet only."
+    quiet: true
+
+- name: Read each interface's wake capability and current setting
+  # Two DIFFERENT lines from ethtool: "Supports Wake-on" (hardware capability, fixed) and
+  # "Wake-on" (current setting, changeable). Conflating them is how a NIC that cannot do WoL
+  # gets reported as configured.
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      for i in {{ _bz_wol_ifaces.stdout_lines | join(' ') }}; do
+        sup=$(ethtool "$i" 2>/dev/null | awk -F': ' '/Supports Wake-on/{print $2}')
+        cur=$(ethtool "$i" 2>/dev/null | awk -F': ' '/^[[:space:]]*Wake-on/{print $2}')
+        printf '%s supports=%s current=%s\n' "$i" "${sup:-none}" "${cur:-none}"
+      done
+  register: _bz_wol_state
+  changed_when: false
+  become: true
+
+- name: Report the current state
+  ansible.builtin.debug:
+    msg:
+      - "{{ _bz_wol_state.stdout_lines }}"
+      - >-
+        'g' in supports = the hardware can wake on a magic packet.
+        current must also be 'g'; 'd' means disabled.
+      - >-
+        {{ 'Enabling' if (bazzite_apply | bool) else 'WOULD enable' }} WoL on:
+        {{ _bz_wol_capable | join(', ') | default('(none capable)', true) }}
+        {{ '' if (bazzite_apply | bool) else 'Re-run with bazzite_apply=true.' }}
+  vars:
+    _bz_wol_capable: >-
+      {{ _bz_wol_state.stdout_lines | select('search', 'supports=\S*g')
+         | map('regex_replace', ' .*$', '') | list }}
+
+- name: Assert at least one interface can do it
+  ansible.builtin.assert:
+    that:
+      - _bz_wol_capable | length > 0
+    fail_msg: >-
+      No wired interface advertises magic-packet ('g') support:
+      {{ _bz_wol_state.stdout_lines | join(' | ') }}.
+      This cannot be fixed in software.
+    quiet: true
+  vars:
+    _bz_wol_capable: >-
+      {{ _bz_wol_state.stdout_lines | select('search', 'supports=\S*g')
+         | map('regex_replace', ' .*$', '') | list }}
+
+- name: Enable WoL for this boot
+  ansible.builtin.command:
+    argv: [ethtool, -s, "{{ item }}", wol, g]
+  loop: "{{ _bz_wol_capable }}"
+  vars:
+    _bz_wol_capable: >-
+      {{ _bz_wol_state.stdout_lines | select('search', 'supports=\S*g')
+         | map('regex_replace', ' .*$', '') | list }}
+  become: true
+  changed_when: true
+  when: bazzite_apply | bool
+
+- name: Persist WoL across reboots via NetworkManager
+  # NetworkManager owns these interfaces and REWRITES the wake setting when it brings a link up,
+  # so an ethtool call alone is undone at the next boot — or sooner, if the link bounces. Setting
+  # it on the connection profile is what actually persists.
+  ansible.builtin.command:
+    argv:
+      - nmcli
+      - connection
+      - modify
+      - "{{ item }}"
+      - "802-3-ethernet.wake-on-lan"
+      - "magic"
+  loop: "{{ _bz_wol_profiles }}"
+  vars:
+    _bz_wol_profiles: >-
+      {{ _bz_wol_ifaces.stdout_lines }}
+  become: true
+  changed_when: true
+  failed_when: false
+  when: bazzite_apply | bool
+
+- name: Read the setting back
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      for i in {{ _bz_wol_ifaces.stdout_lines | join(' ') }}; do
+        printf '%s=%s\n' "$i" "$(ethtool "$i" 2>/dev/null | awk -F': ' '/^[[:space:]]*Wake-on/{print $2}')"
+      done
+      printf 'nm=%s\n' "$(nmcli -g 802-3-ethernet.wake-on-lan connection show {{ _bz_wol_ifaces.stdout_lines | first }} 2>/dev/null)"
+  register: _bz_wol_after
+  changed_when: false
+  become: true
+  when: bazzite_apply | bool
+
+- name: Assert WoL is now armed
+  # Gated on the READ-BACK, not on ethtool's exit status: `ethtool -s` returns 0 for a setting the
+  # driver then ignores, which is the failure this check exists to catch.
+  ansible.builtin.assert:
+    that:
+      - _bz_wol_after.stdout is search('=g')
+    fail_msg: >-
+      Wake-on-LAN is still not armed: {{ _bz_wol_after.stdout_lines | join(' ') }}.
+      The driver accepted the change and did not apply it.
+    quiet: true
+  when: bazzite_apply | bool
+
+- name: Report what remains to be done in firmware
+  # The part Ansible cannot do, stated explicitly so it is not mistaken for finished work.
+  ansible.builtin.debug:
+    msg:
+      - "{{ _bz_wol_after.stdout_lines | default([]) }}"
+      - >-
+        The NIC is now armed for magic-packet wake, and this persists across reboots.
+      - >-
+        STILL REQUIRED IN BIOS for waking from a full power-off (S5) on ASUS boards: Advanced > APM Configuration > 'Power On By PCI-E/PCI' = Enabled, and
+        'ErP Ready' = Disabled. ErP cuts standby power to the NIC entirely, so WoL-from-off
+        cannot work with it on. Waking from SUSPEND (S3) does not need these.
+      - >-
+        Test by sending a magic packet to {{ _bz_wol_mac | default('<mac>') }} from another host
+        on the same segment, then probing the machine.
+  vars:
+    _bz_wol_mac: "{{ ansible_default_ipv4.macaddress | default('') }}"
+  when: bazzite_apply | bool

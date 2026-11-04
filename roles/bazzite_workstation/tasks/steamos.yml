@@ -1,0 +1,241 @@
+---
+# ENTRYPOINT: report steamos-manager's view of the machine, and converge HDMI-CEC.
+#
+# WHAT `steamosctl` IS. steamos-manager is the DBus service behind Game Mode's Quick Access
+# sliders, and `steamosctl` is its supported command-line front door. It is present only on a
+# deck-variant image, so this entrypoint no-ops elsewhere rather than failing.
+#
+# WHAT IT IS NOT, because it is the obvious question: it has NO streaming,
+# Remote Play, or performance-overlay commands. Those settings are not on the host at all — the
+# overlay is rendered by mangoapp under Steam's control (the host's live MANGOHUD_CONFIGFILE reads
+# `no_display`), and the quality/overlay knobs a viewer sees belong to the Steam Link CLIENT.
+# Nothing here can reach them, and the role should not pretend otherwise.
+#
+# WHAT IT DOES COVER: CPU governor and scheduler, GPU power profile and clocks, TDP, fan control,
+# WiFi power management, the default login mode, and HDMI-CEC. Reported in full; only CEC is
+# managed, and only behind bazzite_cec_manage.
+#
+# WHY CEC IS THE ONE THAT IS MANAGED. Whether a TV may power this machine off — and whether the
+# machine may power the TV on — is a fact about a particular living room, not something a
+# role can be right about for every caller. The rest are either hardware-gated (TDP, fan control
+# are Deck-only), or already correct and better left to the image: `powersave` on amd_pstate=active
+# is the normal AMD scaling mode and still boosts fully, so "fixing" it to `performance` would be
+# a change made on a misreading.
+#
+# GENERATE-DON'T-APPLY: reports and stops unless bazzite_apply=true AND bazzite_cec_manage=true.
+
+- name: Apply role defaults
+  ansible.builtin.include_tasks: setup_vars.yml
+
+- name: Look for steamos-manager's CLI
+  ansible.builtin.command:
+    cmd: command -v steamosctl
+  register: _bz_steamosctl
+  changed_when: false
+  failed_when: false
+
+- name: Note that this image has no steamos-manager
+  ansible.builtin.debug:
+    msg: >-
+      steamosctl is not installed — this is a non-deck image
+      ({{ bazzite_image_variant }}), which ships no steamos-manager. Nothing to report or manage.
+  when: (_bz_steamosctl.rc | default(1) | int) != 0
+
+- name: Report and converge steamos-manager state
+  when: (_bz_steamosctl.rc | default(1) | int) == 0
+  block:
+    - name: Read every property steamos-manager exposes
+      # One call: `get-all-properties` is the whole surface, and reading it wholesale means a
+      # property added by a future image shows up in the report without a role change.
+      ansible.builtin.command:
+        cmd: steamosctl get-all-properties
+      register: _bz_smprops
+      changed_when: false
+
+    - name: Report what steamos-manager sees
+      ansible.builtin.debug:
+        msg: "{{ _report.splitlines() | select('string') | list }}"
+      vars:
+        _p: "{{ _bz_smprops.stdout_lines | default([]) }}"
+        _report: |
+          ===== steamos-manager =====
+          {{ _p | join('
+          ') }}
+
+          NOTE: nothing above controls Remote Play or the performance overlay — steamosctl has no
+          such commands. The overlay is a Steam Link CLIENT setting; the host's own mangoapp
+          config reads `no_display`.
+
+    - name: Read the HDMI-CEC settings individually
+      # get-all-properties reports these too, but the individual getters are what the setters
+      # mirror — reading them the same way is what makes the read-back below a like-for-like
+      # comparison rather than a reformatting exercise.
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: |
+          set -o pipefail
+          printf 'supported=%s\n' "$(steamosctl hdmi-cec-wake-device-supported 2>/dev/null | grep -oE '(true|false)$')"
+          printf 'control=%s\n'        "$(steamosctl get-hdmi-cec-control 2>/dev/null | grep -oE '(true|false)$')"
+          printf 'suspend_tv=%s\n'     "$(steamosctl get-hdmi-cec-suspend-tv 2>/dev/null | grep -oE '(true|false)$')"
+          printf 'suspend_device=%s\n' "$(steamosctl get-hdmi-cec-suspend-device 2>/dev/null | grep -oE '(true|false)$')"
+          printf 'wake_tv=%s\n'        "$(steamosctl get-hdmi-cec-wake-tv 2>/dev/null | grep -oE '(true|false)$')"
+          printf 'wake_device=%s\n'    "$(steamosctl get-hdmi-cec-wake-device 2>/dev/null | grep -oE '(true|false)$')"
+      register: _bz_cec_now
+      changed_when: false
+
+    - name: Check whether any CEC adapter exists at all
+      # THE QUESTION BEHIND ALL THE OTHERS, and the one steamosctl does not answer. Every CEC
+      # property below reads back happily whatever the hardware is — `suspend_device: true` reports
+      # true on a machine with no CEC adapter, so the reader believes the TV can suspend the machine
+      # when in reality NOTHING can arrive to do it.
+      #
+      # `hdmi-cec-wake-device-supported` is NOT a substitute: it is specifically about WAKE. This
+      # counts real adapters, which is what decides whether any CEC path can fire in either
+      # direction.
+      #
+      # On a desktop Radeon there is no /dev/cec*, no /sys/class/cec — amdgpu registers no CEC
+      # adapter there — so all five settings below are inert.
+      #
+      # A COUNT, not a `grep -q` in a pipe (PIPEQ-01), and printed so a wrong verdict
+      # is visible rather than implicit.
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: |
+          set -o pipefail
+          printf 'adapters=%s\n' "$(ls -1d /dev/cec* /sys/class/cec/* 2>/dev/null | wc -l)"
+      register: _bz_cec_hw
+      changed_when: false
+
+    - name: Parse the current CEC state
+      ansible.builtin.set_fact:
+        _bz_cec: >-
+          {{ dict(_bz_cec_now.stdout_lines | default([])
+                  | select('search', '=')
+                  | map('split', '=') | list) }}
+
+    - name: Work out which CEC settings differ from the declaration
+      # An explicit want/have table rather than six separate comparisons: it is what lets the
+      # report name exactly what would change, and the read-back assert compare like for like.
+      ansible.builtin.set_fact:
+        _bz_cec_want:
+          control: "{{ 'true' if bazzite_cec_control | bool else 'false' }}"
+          suspend_tv: "{{ 'true' if bazzite_cec_suspend_tv | bool else 'false' }}"
+          suspend_device: "{{ 'true' if bazzite_cec_suspend_device | bool else 'false' }}"
+          wake_tv: "{{ 'true' if bazzite_cec_wake_tv | bool else 'false' }}"
+          wake_device: "{{ 'true' if bazzite_cec_wake_device | bool else 'false' }}"
+
+    - name: Report the CEC plan
+      ansible.builtin.debug:
+        msg: "{{ _report.splitlines() | select('string') | list }}"
+      vars:
+        _bz_cec_adapters: "{{ (_bz_cec_hw.stdout | default('adapters=0')
+                              | regex_search('adapters=(\\d+)', '\\1') | first | default(0) | int) }}"
+        _report: |
+          ===== HDMI-CEC =====
+          {% for k, want in (_bz_cec_want | dictsort) %}
+          {{ '%-15s' | format(k) }} have={{ '%-5s' | format(_bz_cec[k] | default('?')) }} want={{ want }}{{ '   <-- would change' if (_bz_cec[k] | default('?')) != want else '' }}
+          {% endfor %}
+
+          CEC adapters present on this machine: {{ _bz_cec_adapters }}
+          {{ 'NO CEC ADAPTER EXISTS HERE, so EVERY setting above is inert — including
+              suspend_device. The properties read back as declared and nothing can ever act on
+              them: no CEC message can arrive to suspend this machine, and none can be sent to
+              the TV. Treat these as recorded intent for hardware that might one day have an
+              adapter, NOT as behaviour this machine exhibits. If the box is suspending, CEC is
+              not the cause — see bazzite_action=power_report.'
+             if _bz_cec_adapters == 0 else '' }}
+
+          wake_device supported by this hardware: {{ _bz_cec.supported | default('?') }}
+          {{ 'NOTE: amdgpu on a desktop Radeon registers no CEC adapter (no /dev/cec*), so
+              wake-on-TV cannot work here whatever this is set to. Wake-on-LAN is the working
+              alternative — see the wol entrypoint.'
+             if (_bz_cec.supported | default('false')) != 'true' else '' }}
+
+          -> {{ 'converging' if (bazzite_apply | bool and bazzite_cec_manage | bool)
+                else ('re-run with bazzite_apply=true bazzite_cec_manage=true to converge'
+                      if bazzite_cec_manage | bool
+                      else 'reporting only — set bazzite_cec_manage=true to let the role own these') }}
+
+    - name: Refuse to enable wake-on-TV on hardware that cannot do it
+      # The setter accepts `true` and the property reads back `true`, but with no CEC adapter
+      # nothing ever receives the wake — a setting that looks applied and does nothing, which is
+      # exactly the shape this repo bans. Better to fail and say why.
+      ansible.builtin.assert:
+        that:
+          - (_bz_cec.supported | default('false')) == 'true'
+        fail_msg: >-
+          bazzite_cec_wake_device is true, but steamos-manager reports
+          hdmi-cec-wake-device-supported=false. amdgpu registers no CEC adapter on this desktop
+          Radeon, so the setting would read back as applied and never wake anything. Use
+          Wake-on-LAN instead (bazzite_action=wol).
+        quiet: true
+      when:
+        - bazzite_cec_manage | bool
+        - bazzite_cec_wake_device | bool
+
+    - name: Converge the CEC settings
+      # Each setter is idempotent and cheap, so every APPLICABLE one is applied rather than only
+      # the drifted ones — the read-back below is what proves the outcome, not a count of changed
+      # tasks.
+      #
+      # wake_device IS SKIPPED when the hardware cannot do it. With no CEC adapter,
+      # `set-hdmi-cec-wake-device` fails with "No HDMI CEC hardware configured" for EITHER value,
+      # while the other four setters succeed and the getters all answer normally. So this is not
+      # "the value is already false" — the setter simply cannot run, and attempting it fails the
+      # whole play over a setting that is correct and unchangeable.
+      ansible.builtin.command:
+        cmd: "steamosctl set-hdmi-cec-{{ _setting.key | replace('_', '-') }} {{ _setting.value }}"
+      loop: "{{ _bz_cec_want | dict2items }}"
+      loop_control:
+        loop_var: _setting
+        label: "{{ _setting.key }}={{ _setting.value }}"
+      register: _bz_cec_set
+      changed_when: (_bz_cec[_setting.key] | default('?')) != _setting.value
+      when:
+        - bazzite_apply | bool
+        - bazzite_cec_manage | bool
+        - _setting.key != 'wake_device' or (_bz_cec.supported | default('false')) == 'true'
+
+    - name: Read the CEC settings back
+      # An INDEPENDENT read: steamosctl exits 0 on a setter whether or not the daemon applied the
+      # value, so "it returned 0" is not the statement this entrypoint wants to make.
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: |
+          set -o pipefail
+          printf 'control=%s\n'        "$(steamosctl get-hdmi-cec-control 2>/dev/null | grep -oE '(true|false)$')"
+          printf 'suspend_tv=%s\n'     "$(steamosctl get-hdmi-cec-suspend-tv 2>/dev/null | grep -oE '(true|false)$')"
+          printf 'suspend_device=%s\n' "$(steamosctl get-hdmi-cec-suspend-device 2>/dev/null | grep -oE '(true|false)$')"
+          printf 'wake_tv=%s\n'        "$(steamosctl get-hdmi-cec-wake-tv 2>/dev/null | grep -oE '(true|false)$')"
+          printf 'wake_device=%s\n'    "$(steamosctl get-hdmi-cec-wake-device 2>/dev/null | grep -oE '(true|false)$')"
+      register: _bz_cec_after
+      changed_when: false
+      when:
+        - bazzite_apply | bool
+        - bazzite_cec_manage | bool
+
+    - name: Assert the CEC settings are what inventory declares
+      # Compares only the settings this hardware can actually carry: wake_device is dropped from
+      # both sides when there is no CEC adapter, since it was deliberately not set. Asserting on
+      # it anyway would fail a correct run over a value nothing can change — and it already reads
+      # false, which is what inventory declares in that case.
+      ansible.builtin.assert:
+        that:
+          - _after_cmp == _want_cmp
+        fail_msg: >-
+          CEC did not converge. declared={{ _want_cmp }} actual={{ _after_cmp }}.
+          steamosctl exits 0 on a setter regardless, so this read-back is the only proof.
+        success_msg: >-
+          HDMI-CEC converged: {{ _after_cmp }}
+          {{ '(wake_device not comparable — no CEC hardware)' if _skip_wake else '' }}
+      vars:
+        _after: >-
+          {{ dict(_bz_cec_after.stdout_lines | default([])
+                  | select('search', '=') | map('split', '=') | list) }}
+        _skip_wake: "{{ (_bz_cec.supported | default('false')) != 'true' }}"
+        _drop: "{{ ['wake_device'] if _skip_wake else [] }}"
+        _after_cmp: "{{ _after | dict2items | rejectattr('key', 'in', _drop) | items2dict }}"
+        _want_cmp: "{{ _bz_cec_want | dict2items | rejectattr('key', 'in', _drop) | items2dict }}"
+      when:
+        - bazzite_apply | bool
+        - bazzite_cec_manage | bool

@@ -1,0 +1,21 @@
+# {{ ansible_managed }}
+# Reactive RGB daemon — drives lighting from live CPU/GPU state via the SDK server.
+[Unit]
+Description=IaaC reactive RGB daemon
+# Requires, not merely After: without the server this process has nothing to talk to and would
+# spin on reconnect attempts indefinitely.
+Requires={{ bazzite_rgb_server_unit }}
+After={{ bazzite_rgb_server_unit }}
+# default.target, not graphical-session.target — see the server unit. PartOf= there means this
+# daemon is NOT pulled in by a gamescope session: it sits enabled and inactive, with no log
+# entries, while the server it depends on starts normally.
+After=default.target
+
+[Service]
+Type=simple
+ExecStart={{ bazzite_python }} {{ bazzite_rgb_daemon_path }} --host {{ bazzite_rgb_server_host }} --port {{ bazzite_rgb_server_port }} --mode {{ bazzite_rgb_daemon_mode }} --color {{ bazzite_rgb_color }} --interval {{ bazzite_rgb_interval }} --cpu-min {{ bazzite_rgb_cpu_min }} --cpu-max {{ bazzite_rgb_cpu_max }} --gpu-min {{ bazzite_rgb_gpu_min }} --gpu-max {{ bazzite_rgb_gpu_max }} {{ ("--zone-sizes '" ~ bazzite_rgb_zone_sizes ~ "'") if bazzite_rgb_zone_sizes else '' }}
+Restart=always
+RestartSec=5s
+
+[Install]
+WantedBy=default.target

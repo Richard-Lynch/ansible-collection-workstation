@@ -1,4 +1,13 @@
+ci/affected-scenarios.sh shellcheck:SC2086
+ci/affected-scenarios.sh shellcheck:SC2164
 roles/asus_tuf_b850m_bios/files/parse_bios_page.py shebang
+roles/bazzite_workstation/files/fan_sweep.py shebang
+roles/bazzite_workstation/files/kwin_hdr.py shebang
+roles/bazzite_workstation/files/openrgb_daemon.py shebang
+roles/bazzite_workstation/files/openrgb_identify.py shebang
+roles/bazzite_workstation/files/steam_guard.py shebang
+roles/bazzite_workstation/files/sunshine_covers.py shebang
+roles/bazzite_workstation/files/test_steam_guard.py shebang
 roles/config_fan_control/files/fand-discover shebang
 roles/config_fan_control/files/fand-loadtest.py shebang
 roles/config_fan_control/files/fand.py shebang

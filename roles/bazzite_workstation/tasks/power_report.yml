@@ -1,0 +1,225 @@
+---
+# ENTRYPOINT: did this machine sleep, and is its power configuration actually in effect?
+#
+# Writes nothing.
+#
+# WHY THIS IS NOT JUST `cat powermanagementprofilesrc`. A machine can suspend during a playbook
+# run and go unreachable while the power entrypoint reports `changed` and the config file on disk
+# holds exactly the intended values — it sleeps anyway, because Plasma 6 MIGRATED AWAY from that file:
+#
+#   [Migration]
+#   MigratedProfilesToPlasma6=powerdevilrc
+#
+# powerdevil now reads ~/.config/powerdevilrc, which did not exist, so it ran stock defaults with
+# suspend enabled. A write that lands in a file nobody reads is the worst kind of green run: the
+# task succeeds, the file is present, the content is correct, and the setting has no effect.
+#
+# So this reports THREE independent things and refuses to conflate them:
+#
+#   1. what the config files SAY          — including which file powerdevil actually reads now
+#   2. what the machine DID               — real suspend events from the journal
+#   3. whether those two agree            — the verdict
+#
+# (2) is the load-bearing one. Only the journal can distinguish "configured not to sleep" from
+# "not sleeping", which otherwise look identical.
+
+- name: Apply role defaults
+  ansible.builtin.include_tasks: setup_vars.yml
+
+- name: Determine which profile file powerdevil reads
+  # The Migration key is the authoritative signal. Its PRESENCE means the Plasma 5 file has been
+  # superseded — so a play writing to the old path is writing to a dead file.
+  ansible.builtin.slurp:
+    src: "{{ ansible_env.HOME }}/.config/powermanagementprofilesrc"
+  register: _bz_pm_old
+  failed_when: false
+
+- name: Read the Plasma 6 profile file
+  ansible.builtin.slurp:
+    src: "{{ ansible_env.HOME }}/.config/powerdevilrc"
+  register: _bz_pm_new
+  failed_when: false
+
+- name: Read real suspend events from this boot
+  # THE EVIDENCE. systemd-sleep logs every entry and exit with timestamps, so this answers "did it
+  # sleep" as a fact rather than an inference from configuration.
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      # _SYSTEMD_UNIT/kernel-only sources, so this cannot match the journald record of its OWN
+      # command line — an unfiltered grep matched the shell script that was running it and
+      # printed a fragment of itself as though it were a sleep event.
+      journalctl -b --no-pager -o short-iso --output-fields=MESSAGE _TRANSPORT=kernel + _COMM=systemd 2>/dev/null \
+        | grep -E "PM: suspend (entry|exit)|Reached target sleep\.target" \
+        | tail -20 || true
+  register: _bz_sleep_events
+  changed_when: false
+
+- name: Read WHAT REQUESTED each suspend
+  # WHY THIS EXISTS. The verdict below used to read "any suspend event this boot = MISCONFIGURED",
+  # which is wrong in the one case that matters most: a DELIBERATE suspend. A machine that slept
+  # because somebody chose Sleep, or because the TV was switched off and CEC asked for it
+  # (bazzite_cec_suspend_device), is behaving exactly as configured — but the old verdict blamed
+  # powerdevil's idle timeout and sent you looking at a config file that was already correct.
+  #
+  # logind names the requester: it logs "The system will suspend now", preceded by the D-Bus
+  # caller in "Suspend requested by client ... uid=N pid=N (comm)". powerstation/steamos-manager
+  # is the CEC path on a deck image; plasmashell/powerdevil is the desktop path (idle OR menu).
+  #
+  # Read-only and best-effort: an empty result means logind's reason lines have rotated out of
+  # this boot's journal, NOT that nothing requested it — which is why the verdict below degrades
+  # to "cause unattributed" rather than claiming idle suspend.
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      # _COMM=systemd-logind only, so this cannot match the journald record of its own command
+      # line — the same self-match trap the sleep-event read above documents.
+      journalctl -b --no-pager -o short-iso --output-fields=MESSAGE _COMM=systemd-logind 2>/dev/null \
+        | grep -E "Suspend requested by|will suspend now|Lid closed" \
+        | tail -20 || true
+  register: _bz_sleep_trigger
+  changed_when: false
+
+- name: Read which power stack is actually running
+  # THE QUESTION THE REPORT USED TO ASSUME AWAY. Everything above reads powerdevilrc — which is
+  # only meaningful IF POWERDEVIL IS RUNNING. On the bazzite-deck variant the machine boots into
+  # gamescope Game Mode: there is no plasmashell and no powerdevil, so a perfectly correct
+  # powerdevilrc governs nothing and the file-based verdict is confidently wrong.
+  #
+  # The failure this catches: AutoSuspendAction=0 (suspend disabled) in the file, no powerdevil
+  # process at all, and the machine suspending anyway.
+  #
+  # cecd is reported alongside because it is the OTHER suspend path on this image: it holds a
+  # logind sleep inhibitor ("Put TV to sleep") and drives suspend from HDMI-CEC, i.e. the TV going
+  # off — bazzite_cec_suspend_device in inventory.
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      # `pgrep -c` and a COUNT comparison rather than `grep -q` in a pipe: a q-grep closes the
+      # pipe early and, under pipefail, inverts the very test it guards (PIPEQ-01).
+      printf 'powerdevil=%s\n'   "$(pgrep -c -x org_kde_powerdevil 2>/dev/null || echo 0)"
+      printf 'plasmashell=%s\n'  "$(pgrep -c -x plasmashell 2>/dev/null || echo 0)"
+      printf 'gamescope=%s\n'    "$(pgrep -c -f gamescope-session 2>/dev/null || echo 0)"
+      printf 'cecd=%s\n'         "$(pgrep -c -x cecd 2>/dev/null || echo 0)"
+  register: _bz_power_stack
+  changed_when: false
+
+- name: Read how long the machine has been up and when it last woke
+  ansible.builtin.command:
+    cmd: uptime -p
+  register: _bz_uptime
+  changed_when: false
+  failed_when: false
+
+- name: Check whether sleep is masked at the systemd level
+  # The belt-and-braces answer, independent of any desktop setting: masking sleep.target makes
+  # suspend impossible regardless of what powerdevil wants. Reported so the verdict can say
+  # whether the machine is protected by configuration or by policy.
+  #
+  # noqa command-instead-of-module — ansible.builtin.systemd_service SETS state; it has no
+  # read-only "report is-enabled for these units" form. Using it here would mean declaring a
+  # desired state on a read-only entrypoint, which is the opposite of what this does.
+  ansible.builtin.command:
+    cmd: systemctl is-enabled sleep.target suspend.target # noqa: command-instead-of-module
+  register: _bz_sleep_masked
+  changed_when: false
+  failed_when: false
+
+- name: Report
+  ansible.builtin.debug:
+    msg: "{{ _report.splitlines() }}"
+  vars:
+    _old: "{{ (_bz_pm_old.content | default('') | b64decode) if (_bz_pm_old.content is defined) else '' }}"
+    _new: "{{ (_bz_pm_new.content | default('') | b64decode) if (_bz_pm_new.content is defined) else '' }}"
+    _migrated: "{{ 'MigratedProfilesToPlasma6' in _old }}"
+    # Entries only — an exit is a wake and would double the count.
+    _entries: "{{ _bz_sleep_events.stdout_lines | default([]) | select('search', 'PM: suspend entry') | list }}"
+    # WHO ASKED. logind names the D-Bus caller; these two classify it. A suspend attributed to
+    # powerstation/steamos-manager is the CEC path (TV switched off -> bazzite_cec_suspend_device),
+    # which is a DELIBERATE suspend and not evidence that the idle config is broken.
+    _trig: "{{ _bz_sleep_trigger.stdout_lines | default([]) | select('search', 'Suspend requested by') | list }}"
+    _cec: "{{ _trig | select('search', 'powerstation|steamos-manager') | list }}"
+    # Which stack is live. `search` on an exact 'key=N' line, so 'powerdevil=0' cannot read as
+    # truthy — the count is parsed, not the presence of the word.
+    _stack: "{{ dict(_bz_power_stack.stdout_lines | default([]) | select('search', '^\\w+=\\d+$')
+                     | map('split', '=') | list) }}"
+    _has_powerdevil: "{{ (_stack.powerdevil | default('0') | int) > 0 }}"
+    _has_gamescope: "{{ (_stack.gamescope | default('0') | int) > 0 }}"
+    _has_cecd: "{{ (_stack.cecd | default('0') | int) > 0 }}"
+    _report: |
+      ===== DID IT SLEEP? (the only authoritative answer) =====
+      uptime: {{ _bz_uptime.stdout | default('unknown') | trim }}
+      suspend events this boot: {{ _entries | length }}
+      {{ (_bz_sleep_events.stdout_lines | default([]) | join('
+      ')) | default('(none — the machine has not slept since boot)', true) }}
+
+      ===== WHAT REQUESTED IT? =====
+      {{ (_trig | join('
+      ')) | default('(logind recorded no requester for this boot — see the verdict)', true) }}
+
+      ===== WHICH POWER STACK IS RUNNING? (read this BEFORE the config below) =====
+      powerdevil (KDE)     : {{ 'running' if _has_powerdevil else 'NOT RUNNING' }}
+      plasmashell          : {{ 'running' if (_stack.plasmashell | default('0') | int) > 0 else 'not running' }}
+      gamescope Game Mode  : {{ 'running' if _has_gamescope else 'not running' }}
+      cecd (HDMI-CEC)      : {{ 'running' if _has_cecd else 'not running' }}
+      {{ 'powerdevil is NOT running, so NOTHING below governs this machine — powerdevilrc is
+      inert here and its values are decoration. On the bazzite-deck/Game Mode image the suspend
+      owners are gamescope/Steam and cecd, NOT KDE.'
+         if not _has_powerdevil
+         else 'powerdevil is running, so the powerdevilrc values below are the live ones.' }}
+
+      ===== WHICH FILE IS AUTHORITATIVE? =====
+      ~/.config/powermanagementprofilesrc : {{ 'present' if _old | length > 0 else 'ABSENT' }}
+      ~/.config/powerdevilrc              : {{ 'present' if _new | length > 0 else 'ABSENT' }}
+      migrated to Plasma 6                : {{ _migrated }}
+
+      {{ 'powerdevil reads ~/.config/powerdevilrc on this machine. The Plasma 5 file is
+      SUPERSEDED — anything written there is ignored, however correct it looks.'
+         if _migrated
+         else 'No migration marker: the Plasma 5 profile file is still authoritative.' }}
+
+      ----- powermanagementprofilesrc (Plasma 5 path) -----
+      {{ _old | default('(absent)', true) }}
+      ----- powerdevilrc (Plasma 6 path) -----
+      {{ _new | default('(absent)', true) }}
+
+      ===== SYSTEMD-LEVEL =====
+      sleep.target / suspend.target: {{ _bz_sleep_masked.stdout_lines | default(['unknown']) | join(' / ') }}
+      {{ 'masked — suspend is impossible regardless of desktop settings.'
+         if ('masked' in (_bz_sleep_masked.stdout | default('')))
+         else 'not masked — suspend is permitted at the systemd level, so the desktop
+      configuration is what decides.' }}
+
+      ===== VERDICT =====
+      {{ 'Consistent so far: no suspend events this boot. Note this is evidence of absence
+      only for the current uptime — a fresh boot has not yet had the chance to sleep.'
+         if (_entries | length) == 0
+
+         else 'DELIBERATE SUSPEND, not an idle-timeout failure: every suspend this boot was
+      requested by powerstation/steamos-manager, which is the HDMI-CEC path — the TV being
+      switched off, via bazzite_cec_suspend_device. The idle configuration is NOT implicated and
+      powerdevilrc needs no change; set bazzite_cec_suspend_device=false in inventory if the
+      machine should survive the telly going off.'
+         if (_cec | length) > 0 and (_cec | length) == (_trig | length)
+
+         else 'WRONG STACK: this machine HAS suspended, and powerdevil is NOT RUNNING — so the
+      powerdevilrc settings this role writes govern nothing, however correct they read. This is
+      the Game Mode image (bazzite-deck): the suspend owners are Steam Game Mode idle (a
+      CLOUD-SYNCED Steam setting, absent from every on-disk store and so not convergeable from
+      here) and HDMI-CEC via cecd. bazzite_action=power reports success here and changes NOTHING
+      about whether it sleeps. The enforceable fix is bazzite_action=sleep_inhibit with
+      bazzite_sleep_inhibit=true, which masks the systemd sleep targets and therefore catches
+      EVERY requester whichever stack asked.'
+         if not _has_powerdevil
+
+         else 'MISCONFIGURED: this machine suspended this boot with no CEC request to explain it,
+      so the desktop idle path is the likely cause. On Plasma 6 the usual reason is a write to the
+      superseded powermanagementprofilesrc while powerdevil reads powerdevilrc.'
+         if (_trig | length) > 0
+
+         else 'SUSPENDED, CAUSE UNATTRIBUTED: this machine HAS suspended this boot, but logind
+      recorded no requester (this systemd build does not log the D-Bus caller). Do NOT read this
+      as an idle-timeout failure without checking the requester.' }}

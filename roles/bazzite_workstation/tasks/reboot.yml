@@ -1,0 +1,192 @@
+---
+# ENTRYPOINT: reboot into a staged deployment, and prove it actually took.
+#
+# WHY NOT JUST `systemctl reboot`. On an image-based system a reboot is how a staged update
+# becomes real, so the interesting question is not "did it come back" but "did it come back
+# RUNNING THE NEW IMAGE". Those differ: a staged deployment can fail to boot and the bootloader
+# silently falls back to the previous one, leaving a machine that is up, healthy, and running
+# exactly what it ran before. Nothing announces that.
+#
+# So this records the version before, reboots, waits for SSH, and compares. A rollback shows up
+# as a reported finding rather than as a puzzling absence of change weeks later.
+
+- name: Apply role defaults
+  ansible.builtin.include_tasks: setup_vars.yml
+
+- name: Read the deployments before rebooting
+  ansible.builtin.command:
+    cmd: rpm-ostree status --json
+  register: _bz_pre
+  changed_when: false
+
+- name: Work out what should be booted afterwards
+  ansible.builtin.set_fact:
+    # deployments[0] is the one that will be booted next; the currently-booted one carries
+    # "booted": true. When an update is staged these differ, and that difference is the thing
+    # this entrypoint verifies.
+    #
+    # VERSION **AND** REFSPEC. A variant rebase leaves the version string IDENTICAL — bazzite and
+    # bazzite-deck are built from the same release, so both read the same 44.YYYYMMDD — and comparing
+    # versions alone would report "no staged change — this is a plain restart" while a whole variant
+    # switch is pending, and would call a silent bootloader fallback a success. The
+    # refspec is what actually distinguishes them.
+    _bz_want: >-
+      {{ ((_bz_pre.stdout | from_json).deployments | default([{}]))[0].version | default('') }}
+    _bz_want_ref: >-
+      {{ ((_bz_pre.stdout | from_json).deployments
+          | default([{}]))[0]['container-image-reference'] | default('') }}
+    _bz_now: >-
+      {{ ((_bz_pre.stdout | from_json).deployments | default([])
+          | selectattr('booted', 'defined') | selectattr('booted') | list | first
+          | default({})).version | default('') }}
+    _bz_now_ref: >-
+      {{ ((_bz_pre.stdout | from_json).deployments | default([])
+          | selectattr('booted', 'defined') | selectattr('booted') | list | first
+          | default({}))['container-image-reference'] | default('') }}
+
+- name: Report the plan
+  ansible.builtin.debug:
+    msg: >-
+      {{ 'Rebooting' if (bazzite_apply | bool) else 'WOULD reboot' }}:
+      currently booted {{ _bz_now }} ({{ _bz_now_ref }}),
+      next boot should be {{ _bz_want }} ({{ _bz_want_ref }}).
+      {{ '(no staged change — this is a plain restart)'
+         if (_bz_want == _bz_now and _bz_want_ref == _bz_now_ref) else '' }}
+      {{ 'VARIANT CHANGE: the refspec differs, though the version string does not.'
+         if _bz_want_ref != _bz_now_ref else '' }}
+      {{ '' if (bazzite_apply | bool) else 'Re-run with bazzite_apply=true.' }}
+
+- name: Reboot and wait for the machine to return
+  # ansible.builtin.reboot handles the disconnect/reconnect properly rather than a fire-and-forget
+  # `systemctl reboot` followed by a guessed sleep. An image-update boot is slower than a normal
+  # one, hence the generous timeout.
+  ansible.builtin.reboot:
+    reboot_timeout: "{{ bazzite_reboot_timeout | int }}"
+    msg: "Reboot initiated by Ansible (bazzite_workstation)"
+  become: true
+  when: bazzite_apply | bool
+
+- name: Read the deployments after rebooting
+  ansible.builtin.command:
+    cmd: rpm-ostree status --json
+  register: _bz_post
+  changed_when: false
+  when: bazzite_apply | bool
+
+- name: Determine what actually booted
+  ansible.builtin.set_fact:
+    _bz_booted: >-
+      {{ ((_bz_post.stdout | from_json).deployments | default([])
+          | selectattr('booted', 'defined') | selectattr('booted') | list | first
+          | default({})).version | default('') }}
+    _bz_booted_ref: >-
+      {{ ((_bz_post.stdout | from_json).deployments | default([])
+          | selectattr('booted', 'defined') | selectattr('booted') | list | first
+          | default({}))['container-image-reference'] | default('') }}
+  when: bazzite_apply | bool
+
+- name: Assert the intended deployment is the one running
+  # THE POINT OF THIS ENTRYPOINT. A silent bootloader fallback leaves a machine that is up and
+  # healthy on the OLD image — indistinguishable from a successful reboot unless something checks.
+  ansible.builtin.assert:
+    that:
+      - _bz_booted == _bz_want
+      # THE REFSPEC TOO. A variant switch keeps the version string identical, so the version
+      # comparison alone would call a failed variant rebase a success.
+      - _bz_booted_ref == _bz_want_ref
+    fail_msg: >-
+      Rebooted, but the running image is {{ _bz_booted }} ({{ _bz_booted_ref }}) and
+      {{ _bz_want }} ({{ _bz_want_ref }}) was expected.
+      The staged deployment did not become active — the bootloader most likely fell back after a
+      failed boot. Check `rpm-ostree status` and the previous boot's journal
+      (`journalctl -b -1 -p err`).
+    quiet: true
+  when: bazzite_apply | bool
+
+# A reboot is the only chance to verify the settings that apply ONLY at session start. Checking
+# them here — rather than leaving it to a later manual look — is what turns "configured" into
+# "confirmed", and both of these have already been reported as working when they were not.
+
+- name: Verify the settings that only take effect on a fresh session
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      # Suspend: powerdevil reads powerdevilrc at session start, so a pre-reboot read proves only
+      # what is on disk. This is the first read that reflects what the daemon actually loaded.
+      # kernel transport only, and anchored on the kernel's own suspend-entry line. An
+      # unqualified `journalctl -b | grep` also matches systemd's SHUTDOWN messages, which are
+      # part of the previous boot's teardown replayed into this boot's log — that reads as
+      # "already suspended" on a machine seconds after boot.
+      printf 'suspend_events=%s\n' "$(journalctl -b --no-pager _TRANSPORT=kernel 2>/dev/null | grep -c 'PM: suspend entry' || true)"
+      printf 'suspend_action=%s\n' "$(kreadconfig6 --file powerdevilrc --group AC --group SuspendAndShutdown --key AutoSuspendAction 2>/dev/null)"
+      # Sunshine: the autostart entry is meant to bring it back with the graphical session. This
+      # is the only real test of that.
+      # `pgrep -x` on the process NAME: `-f sunshine` matched this shell's own command line and
+      # reports instances on a machine with none. `grep -c` already prints 0
+      # on no match, so `|| true` rather than `|| echo 0`, which printed a second 0.
+      printf 'sunshine_ports=%s\n' "$(ss -tuln 2>/dev/null | grep -cE ':(47984|47989|47990|48010)' || true)"
+      printf 'sunshine_proc=%s\n'  "$(pgrep -xc sunshine 2>/dev/null || true)"
+      printf 'uptime_s=%s\n' "$(cut -d. -f1 /proc/uptime)"
+  register: _bz_post_checks
+  changed_when: false
+  when: bazzite_apply | bool
+
+- name: Report the post-reboot state
+  # Reported, not asserted, for the two service checks: Sunshine starts with the GRAPHICAL
+  # session, so on a machine sitting at a login screen it legitimately will not be up yet.
+  # Asserting here would fail a correct configuration for a reason that is not a fault.
+  ansible.builtin.debug:
+    msg: "{{ _report.splitlines() }}"
+  vars:
+    _out: "{{ _bz_post_checks.stdout | default('') }}"
+    _slept: "{{ not ('suspend_events=0' in _out) }}"
+    _sun_up: "{{ not ('sunshine_ports=0' in _out) }}"
+    _report: |
+      ===== POST-REBOOT VERIFICATION =====
+      {{ _bz_post_checks.stdout_lines | default([]) | join('
+      ') }}
+
+      suspend : {{ 'STILL ARMED — the machine has already suspended this boot. The powerdevilrc
+      setting did not take.' if _slept else 'no suspend events this boot, and AutoSuspendAction
+      should read 0 above. This is the first boot where the setting was actually loaded.' }}
+
+      sunshine: {{ ('off, as declared (bazzite_sunshine_enabled: false).' if not _sun_up
+      else 'LISTENING although bazzite_sunshine_enabled is false — something else starts it.')
+      if not (bazzite_sunshine_enabled | bool) else
+      'up and listening — it survived the reboot on its own.'
+      if _sun_up else 'NOT listening yet. Expected if the machine is sitting at a login screen:
+      it autostarts with the graphical session, so log in and re-check with
+      bazzite_action=sunshine.' }}
+  when: bazzite_apply | bool
+
+- name: Assert the powerdevil suspend setting is the declared one
+  # This one IS asserted: unlike Sunshine it does not depend on anyone logging in, and a machine
+  # that suspends is one that vanishes from the network mid-play. Compared against what the
+  # power entrypoint writes (1 when bazzite_power_suspend_minutes > 0, else 0). An EMPTY read
+  # means no powerdevilrc — the Game Mode image, where powerdevil does not run and
+  # sleep_inhibit's logind read-back is the check — so it is reported, not failed.
+  ansible.builtin.assert:
+    that:
+      - _bz_suspend_read == _bz_suspend_want
+    fail_msg: >-
+      AutoSuspendAction read back as '{{ _bz_suspend_read }}' after the reboot, not
+      '{{ _bz_suspend_want }}': {{ _bz_post_checks.stdout_lines | default([]) | join(' ') }}.
+      The machine may still suspend and drop off the network.
+    quiet: true
+  vars:
+    _bz_suspend_read: >-
+      {{ (_bz_post_checks.stdout_lines | default([]) | select('match', 'suspend_action=') | first
+          | default('suspend_action=')).split('=', 1)[1] | trim }}
+    _bz_suspend_want: "{{ '1' if (bazzite_power_suspend_minutes | int) > 0 else '0' }}"
+  when:
+    - bazzite_apply | bool
+    - _bz_suspend_read | length > 0
+
+- name: Confirm
+  ansible.builtin.debug:
+    msg: >-
+      Back up and running {{ _bz_booted }}
+      {{ '(upgraded from ' ~ _bz_now ~ ')' if _bz_booted != _bz_now else '(unchanged, as expected)' }}.
+      The previous deployment is kept; `rpm-ostree rollback` returns to it.
+  when: bazzite_apply | bool
