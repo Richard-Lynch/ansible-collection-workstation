@@ -9,6 +9,7 @@
 .gitignore
 CHANGELOG.md
 LICENSE
+Makefile
 README.md
 ci/affected-scenarios.sh
 configured_roles.txt
@@ -16,6 +17,7 @@ devkit.toml
 export.manifest
 galaxy.yml
 meta/runtime.yml
+requirements.yml
 roles/asus_tuf_b850m_bios/README.md
 roles/asus_tuf_b850m_bios/defaults/main.yml
 roles/asus_tuf_b850m_bios/files/parse_bios_page.py
