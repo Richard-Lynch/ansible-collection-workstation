@@ -17,6 +17,7 @@ devkit.toml
 export.manifest
 galaxy.yml
 meta/runtime.yml
+renovate.json
 requirements.yml
 roles/asus_tuf_b850m_bios/README.md
 roles/asus_tuf_b850m_bios/defaults/main.yml
