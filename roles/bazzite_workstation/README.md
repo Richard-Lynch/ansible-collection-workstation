@@ -70,6 +70,41 @@ future updates should never happen as a side effect of "set the machine up".
 > ansible-lint. The intended shape is one entrypoint per concern (`tasks_from`), so the caller's
 > play names the work and extra-vars carry only `*_apply` / `*_confirm` gates.
 
+## Lighting: brightness and breathing
+
+The `lighting` daemon writes every device in a per-LED mode, so brightness is
+applied by scaling the colour it writes, not through a device's own brightness
+control:
+
+| option                       | default | effect                                                                                      |
+| ---------------------------- | ------- | ------------------------------------------------------------------------------------------- |
+| `bazzite_rgb_brightness`     | `100.0` | percentage (0-100) every colour is scaled to, in every `bazzite_rgb_daemon_mode`            |
+| `bazzite_rgb_breathe_depth`  | `0.0`   | percentage points the brightness swings either side of `bazzite_rgb_brightness`; `0` is off |
+| `bazzite_rgb_breathe_period` | `4.0`   | seconds per breath (one full sine)                                                          |
+| `bazzite_rgb_breathe_rate`   | `20.0`  | render ticks per second while breathing                                                     |
+
+Brightness 20 with depth 7.5 breathes between 12.5% and 27.5%, clamped to 0-100.
+While breathing, the sensors are still read once per `bazzite_rgb_interval`;
+each render tick re-scales the last colour and writes only when the scaled
+colour changed. With depth `0` the daemon writes exactly as often as it does
+without breathing: once per interval, or once per connection in `static` mode.
+Read back what the hardware holds with the daemon's own `--verify`; a breathing
+device reads a different value on each sample.
+
+The SDK server runs from a flatpak, and `flatpak run` moves the real server process into a
+transient scope of its own, outside `openrgb-server.service`. Stopping the unit alone would leave
+the old server holding the port and every new instance failing to bind, so the unit kills the app
+on start and stop, a server-unit change also stops every OpenRGB scope before the start, and the
+entrypoint ends by asserting one server process, one listener, and a restart counter that has not
+moved over `bazzite_rgb_settle_seconds` (default `45`), with the port held by a process that
+started after the unit last did. An OpenRGB GUI open on the desktop is the same flatpak and
+process name: it fails those gates, and the unit's `flatpak kill` closes it on every start and
+stop.
+
+The role has no option for a device's own animated effects. A hardware effect
+replaces the per-LED mode the daemon writes in, so it cannot follow the
+temperature ramp and cannot be dimmed by the daemon.
+
 ## Two power stacks, and only one of them is KDE
 
 `power` writes `~/.config/powerdevilrc`. That is meaningful **only when powerdevil is running** —

@@ -39,14 +39,17 @@ roles/bazzite_workstation/files/openrgb_daemon.py
 roles/bazzite_workstation/files/openrgb_identify.py
 roles/bazzite_workstation/files/steam_guard.py
 roles/bazzite_workstation/files/sunshine_covers.py
+roles/bazzite_workstation/files/test_openrgb_daemon.py
 roles/bazzite_workstation/files/test_steam_guard.py
 roles/bazzite_workstation/meta/argument_specs.py
 roles/bazzite_workstation/meta/argument_specs.yml
 roles/bazzite_workstation/meta/main.yml
 roles/bazzite_workstation/molecule/default/converge.yml
 roles/bazzite_workstation/molecule/default/molecule.yml
+roles/bazzite_workstation/molecule/default/rgb_validate_case.yml
 roles/bazzite_workstation/molecule/default/verify.yml
 roles/bazzite_workstation/tasks/_resolve_defaults.yml
+roles/bazzite_workstation/tasks/_rgb_validate.yml
 roles/bazzite_workstation/tasks/autologin.yml
 roles/bazzite_workstation/tasks/controller_probe.yml
 roles/bazzite_workstation/tasks/controllers.yml

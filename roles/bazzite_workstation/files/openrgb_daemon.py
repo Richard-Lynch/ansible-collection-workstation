@@ -24,6 +24,19 @@ MODES
 The temperature-to-colour ramp is blue -> green -> yellow -> red across the configured range.
 Idle sits blue-green, load pushes it to red, so the case reports at a glance what the machine is
 doing without anyone reading a number.
+
+BRIGHTNESS AND BREATHING
+  --brightness      scales every colour written, in every mode (100 = the colour as given)
+  --breathe-depth   swings the brightness by this many percentage points either side of
+                    --brightness on a sine of --breathe-period seconds; 0 turns it off
+  --breathe-rate    render ticks per second while breathing. The sensors are still read only
+                    every --interval; a tick re-scales the last colour, and a tick whose
+                    scaled colour equals the last one written sends nothing.
+
+The devices are written in a per-LED mode, so brightness is done here by scaling the colour
+rather than through a device's own brightness control, which per-LED modes generally lack.
+With --breathe-depth 0 the write cadence is exactly the non-breathing one: once per --interval,
+or once per connection in static mode.
 """
 
 from __future__ import annotations
@@ -32,11 +45,13 @@ import argparse
 import glob
 import json
 import logging
+import math
 import os
 import signal
 import socket
 import struct
 import sys
+import threading
 import time
 
 MAGIC = b"ORGB"
@@ -544,6 +559,28 @@ def ramp(fraction: float) -> tuple[int, int, int]:
     return stops[-1][1]
 
 
+def scale(color: tuple[int, int, int], brightness: float) -> tuple[int, int, int]:
+    """Scale a colour to a brightness percentage, clamped to 0-100.
+
+    Every channel is multiplied by the same factor, so the hue holds; only the 8-bit rounding
+    moves it, by at most half a step per channel.
+    """
+    k = max(0.0, min(100.0, brightness)) / 100.0
+    return tuple(int(round(c * k)) for c in color)
+
+
+def breathe_level(base: float, depth: float, period: float, t: float) -> float:
+    """Brightness percentage at time t: base +/- depth on a sine of `period` seconds.
+
+    Clamped to 0-100, so a swing past either end holds at that end rather than wrapping.
+    depth <= 0, or a non-positive period, is a constant `base`.
+    """
+    level = base
+    if depth > 0 and period > 0:
+        level = base + depth * math.sin(2.0 * math.pi * t / period)
+    return max(0.0, min(100.0, level))
+
+
 def parse_hex(s: str) -> tuple[int, int, int]:
     s = s.lstrip("#")
     return (int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16))
@@ -561,6 +598,11 @@ class Daemon:
             args.host, args.port, zone_sizes=getattr(args, "zone_sizes_parsed", {})
         )
         self.running = True
+        # Set by the signal handler. Every wait in the loops is a wait on THIS, not time.sleep:
+        # sleep resumes after a signal handler returns, so a SIGTERM during static mode's 60 s
+        # hold was not acted on until the hold ended, systemd's stop timeout expired first, and
+        # the unit was SIGABRTed with a core dump on every stop.
+        self._stopping = threading.Event()
         self.last: tuple[int, int, int] | None = None
         # Devices already switched to a per-LED mode on THIS connection. Cleared on reconnect,
         # since a fresh connection may land on a server that has been restarted.
@@ -571,6 +613,11 @@ class Daemon:
     def _stop(self, *_):
         log.info("stopping")
         self.running = False
+        self._stopping.set()
+
+    def _sleep(self, seconds: float) -> None:
+        """Wait up to `seconds`, returning at once when a stop is requested."""
+        self._stopping.wait(seconds)
 
     def target_color(self) -> tuple[tuple[int, int, int], str]:
         a = self.args
@@ -629,9 +676,13 @@ class Daemon:
                 self.client.set_custom_mode(i)
                 self._moded.add(i)
 
+            # A malformed packet for one device is that device's problem: log it and carry on.
+            # A SOCKET error is the connection's, and is left to propagate so run() reconnects;
+            # caught here it became one warning per device per write (twenty a second while
+            # breathing) against a dead socket, with the lights never recovering.
             try:
                 self.client.set_colors(i, [color])
-            except (OSError, struct.error) as exc:
+            except struct.error as exc:
                 log.warning("device %s (%s): %s", i, dev["name"], exc)
 
     def run(self) -> int:
@@ -640,16 +691,10 @@ class Daemon:
             try:
                 self.client.connect()
                 backoff = 2
-                while self.running:
-                    color, why = self.target_color()
-                    if color != self.last or self.args.mode != "static":
-                        self.apply(color)
-                        if color != self.last:
-                            log.info("#%02x%02x%02x  (%s)", *color, why)
-                        self.last = color
-                    # Static needs no polling: set it once and hold the connection open, which
-                    # is the whole reason the colour persists.
-                    time.sleep(self.args.interval if self.args.mode != "static" else 60)
+                if self.args.breathe_depth > 0:
+                    self._run_breathing()
+                else:
+                    self._run_steady()
             except (OSError, RuntimeError) as exc:
                 if not self.running:
                     break
@@ -657,13 +702,76 @@ class Daemon:
                 self.client.close()
                 self.last = None
                 self._moded.clear()
-                time.sleep(backoff)
+                self._sleep(backoff)
                 backoff = min(backoff * 2, 60)
         self.client.close()
         return 0
 
+    def _run_steady(self) -> None:
+        """One write per sensor read: every --interval, or once per connection in static."""
+        while self.running:
+            base, why = self.target_color()
+            color = scale(base, self.args.brightness)
+            if color != self.last or self.args.mode != "static":
+                self.apply(color)
+                if color != self.last:
+                    log.info("#%02x%02x%02x  (%s)", *color, why)
+                self.last = color
+            # Static needs no polling: set it once and hold the connection open, which
+            # is the whole reason the colour persists.
+            self._sleep(self.args.interval if self.args.mode != "static" else 60)
 
-def main() -> int:
+    def _run_breathing(self) -> None:
+        """Re-scale the last sensor colour every render tick; read the sensors per --interval.
+
+        Two clocks, because they want different rates: reading hwmon twenty times a second gains
+        nothing, while a brightness step every --interval is a visible staircase, not a breath.
+        A tick writes only when the scaled colour changed, so the flat ends of the sine send
+        fewer packets than its steep middle. In a sensor mode a poll also writes when the colour
+        is unchanged, as the steady loop does once per interval.
+        """
+        tick = 1.0 / self.args.breathe_rate
+        start = time.monotonic()
+        next_poll = start
+        base: tuple[int, int, int] | None = None
+        last_base: tuple[int, int, int] | None = None
+        why = ""
+        while self.running:
+            now = time.monotonic()
+            polled = False
+            if base is None or (self.args.mode != "static" and now >= next_poll):
+                base, why = self.target_color()
+                next_poll = now + self.args.interval
+                polled = True
+            level = breathe_level(
+                self.args.brightness, self.args.breathe_depth, self.args.breathe_period, now - start
+            )
+            color = scale(base, level)
+            if color != self.last or (polled and self.args.mode != "static"):
+                self.apply(color)
+                self.last = color
+            # One journal line per change of the BASE colour, as in the steady loop — not one
+            # per tick.
+            if base != last_base:
+                log.info(
+                    "#%02x%02x%02x  (%s; breathing %.1f%% +/- %.1f over %.1fs)",
+                    *color,
+                    why,
+                    self.args.brightness,
+                    self.args.breathe_depth,
+                    self.args.breathe_period,
+                )
+                last_base = base
+            self._sleep(max(0.0, tick - (time.monotonic() - now)))
+
+
+# Upper bounds for the breathing clocks. Above MAX_BREATHE_RATE the tick is shorter than one
+# UPDATEZONELEDS round to every device, and an unbounded rate (or `inf`) is a busy loop.
+MAX_BREATHE_RATE = 100.0
+MAX_BREATHE_PERIOD = 3600.0
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=6742)
@@ -675,6 +783,27 @@ def main() -> int:
     p.add_argument("--gpu-min", type=float, default=30.0)
     p.add_argument("--gpu-max", type=float, default=85.0)
     p.add_argument("--load-max", type=float, default=16.0)
+    p.add_argument(
+        "--brightness",
+        type=float,
+        default=100.0,
+        help="percentage (0-100) every colour is scaled to, in every mode",
+    )
+    p.add_argument(
+        "--breathe-depth",
+        type=float,
+        default=0.0,
+        help="percentage points the brightness swings either side of --brightness; 0 = off",
+    )
+    p.add_argument(
+        "--breathe-period", type=float, default=4.0, help="seconds per breath (one full sine)"
+    )
+    p.add_argument(
+        "--breathe-rate",
+        type=float,
+        default=20.0,
+        help="render ticks per second while breathing (sensors are still read per --interval)",
+    )
     p.add_argument(
         "--once",
         action="store_true",
@@ -697,7 +826,22 @@ def main() -> int:
         action="store_true",
         help="print devices and the current target as JSON, then exit",
     )
-    args = p.parse_args()
+    args = p.parse_args(argv)
+    # Written as "not (inside the range)" so NaN, which compares false with everything, is
+    # refused too, and `inf` fails the upper bound.
+    if not 0.0 <= args.brightness <= 100.0:
+        p.error("--brightness must be 0-100")
+    if not 0.0 <= args.breathe_depth <= 100.0:
+        p.error("--breathe-depth must be 0-100")
+    if not 0.0 < args.breathe_period <= MAX_BREATHE_PERIOD:
+        p.error(f"--breathe-period must be above 0 and at most {MAX_BREATHE_PERIOD:g}")
+    if not 0.0 < args.breathe_rate <= MAX_BREATHE_RATE:
+        p.error(f"--breathe-rate must be above 0 and at most {MAX_BREATHE_RATE:g}")
+    return args
+
+
+def main() -> int:
+    args = parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -722,6 +866,14 @@ def main() -> int:
                         for dev in d.client.devices
                     ],
                     "target": {"rgb": list(color), "hex": "%02X%02X%02X" % color, "reason": why},
+                    # The target scaled to the base brightness, before any breathing swing.
+                    # --verify reads what the hardware holds at this moment.
+                    "applied": {
+                        "hex": "%02X%02X%02X" % scale(color, args.brightness),
+                        "brightness": args.brightness,
+                        "breathe_depth": args.breathe_depth,
+                        "breathe_period": args.breathe_period,
+                    },
                     "sensors": {
                         "cpu_c": read_cpu_temp(),
                         "gpu_c": read_gpu()[0],
@@ -761,7 +913,8 @@ def main() -> int:
     if args.once:
         d = Daemon(args)
         d.client.connect()
-        color, why = d.target_color()
+        base, why = d.target_color()
+        color = scale(base, args.brightness)
         d.apply(color)
         log.info("applied #%02x%02x%02x (%s) — will NOT persist after exit", *color, why)
         d.client.close()

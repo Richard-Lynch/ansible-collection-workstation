@@ -271,3 +271,135 @@
           - "_env_one is not search('(?m)^XWAYLAND_COUNT=')"
         fail_msg: "session env restates image defaults: none={{ _env_none[-300:] }} one={{ _env_one[-300:] }}"
         quiet: true
+
+    # The RGB daemon unit's ExecStart is the only place brightness and breathing reach the
+    # process: a dropped flag starts a daemon on its own defaults (full brightness, no breath)
+    # that is up, healthy and logging colours, so the lighting read-back passes regardless.
+    - name: Read the role's generated defaults, for restoring overridden RGB values
+      ansible.builtin.set_fact:
+        _rgb_defaults: "{{ lookup('ansible.builtin.file', playbook_dir ~ '/../../defaults/main.yml') | from_yaml }}"
+
+    - name: Render the RGB daemon unit from the ROLE'S template, at the defaults
+      ansible.builtin.set_fact:
+        _rgb_exec: >-
+          {{ lookup('ansible.builtin.template', playbook_dir ~ '/../../templates/openrgb-daemon.service.j2')
+             | regex_search('(?m)^ExecStart=.*$') | trim }}
+
+    - name: At the defaults the command line is the pre-brightness one plus the new flags at neutral
+      # Written out literally rather than built from the role's variables, so a change to any
+      # flag's name, order or default rendering fails here. brightness 100 with depth 0 is the
+      # daemon's no-op setting: every colour as given, written exactly as often as before.
+      ansible.builtin.assert:
+        that:
+          - _rgb_exec == _rgb_expected
+        fail_msg: "openrgb-daemon.service.j2 rendered '{{ _rgb_exec }}', expected '{{ _rgb_expected }}'"
+        quiet: true
+      vars:
+        _rgb_expected: >-
+          ExecStart={{ bazzite_python }} {{ bazzite_rgb_daemon_path }} --host 127.0.0.1 --port 6742
+          --mode auto --color FF6600 --interval 2.0 --cpu-min 35.0 --cpu-max 85.0 --gpu-min 30.0
+          --gpu-max 85.0 --brightness 100.0 --breathe-depth 0.0 --breathe-period 4.0
+          --breathe-rate 20.0
+
+    # set_fact, not task `vars:` — setup_vars resolved these with set_fact, which outranks a task
+    # var, so a `vars:` override would render the defaults again. Restored after.
+    - name: Set a dimmed, breathing, zone-sized configuration
+      ansible.builtin.set_fact:
+        bazzite_rgb_daemon_mode: static
+        bazzite_rgb_color: FF0080
+        bazzite_rgb_brightness: 20
+        bazzite_rgb_breathe_depth: 7.5
+        bazzite_rgb_breathe_period: 4.0
+        bazzite_rgb_zone_sizes: TUF=8,8,8
+
+    - name: Render the RGB daemon unit with that configuration
+      ansible.builtin.set_fact:
+        _rgb_exec_set: >-
+          {{ lookup('ansible.builtin.template', playbook_dir ~ '/../../templates/openrgb-daemon.service.j2')
+             | regex_search('(?m)^ExecStart=.*$') | trim }}
+
+    - name: Restore the RGB defaults
+      # From the role's own generated defaults file, not retyped values (MOLMIRROR-02); the
+      # include_role above scopes the role's defaults to itself, so they are read from the file.
+      ansible.builtin.set_fact:
+        bazzite_rgb_daemon_mode: "{{ _rgb_defaults['bazzite_rgb_daemon_mode__default'] }}"
+        bazzite_rgb_color: "{{ _rgb_defaults['bazzite_rgb_color__default'] }}"
+        bazzite_rgb_brightness: "{{ _rgb_defaults['bazzite_rgb_brightness__default'] }}"
+        bazzite_rgb_breathe_depth: "{{ _rgb_defaults['bazzite_rgb_breathe_depth__default'] }}"
+        bazzite_rgb_breathe_period: "{{ _rgb_defaults['bazzite_rgb_breathe_period__default'] }}"
+        bazzite_rgb_zone_sizes: "{{ _rgb_defaults['bazzite_rgb_zone_sizes__default'] }}"
+
+    - name: Brightness and breathing reach the daemon's command line, ahead of the zone sizes
+      ansible.builtin.assert:
+        that:
+          - "'--mode static --color FF0080 ' in _rgb_exec_set"
+          - "'--brightness 20 --breathe-depth 7.5 --breathe-period 4.0 --breathe-rate 20.0 ' in _rgb_exec_set"
+          - _rgb_exec_set is search("--breathe-rate 20.0 --zone-sizes 'TUF=8,8,8'$")
+          # The removed effect option has no flag to carry.
+          - "'--effect' not in _rgb_exec_set and 'bazzite_rgb_mode' not in _rgb_exec_set"
+        fail_msg: "openrgb-daemon.service.j2 rendered '{{ _rgb_exec_set }}'"
+        quiet: true
+
+    - name: Render the OpenRGB server unit from the ROLE'S template
+      ansible.builtin.set_fact:
+        _rgb_server_unit: "{{ lookup('ansible.builtin.template', playbook_dir ~ '/../../templates/openrgb-server.service.j2') }}"
+
+    - name: The server unit kills the flatpak app's own scope on start and on stop
+      # `flatpak run` moves the server into a transient scope outside the unit's cgroup, so
+      # without these a unit restart leaves the old server holding the port and every new
+      # instance crash-loops on bind.
+      ansible.builtin.assert:
+        that:
+          - "_rgb_server_unit is search('(?m)^ExecStartPre=-/usr/bin/flatpak kill org[.]openrgb[.]OpenRGB$')"
+          - "_rgb_server_unit is search('(?m)^ExecStopPost=-/usr/bin/flatpak kill org[.]openrgb[.]OpenRGB$')"
+        fail_msg: "openrgb-server.service.j2 does not clear the flatpak scope: {{ _rgb_server_unit }}"
+        quiet: true
+
+    - name: Read the lighting entrypoint's own tasks
+      ansible.builtin.set_fact:
+        _lighting_tasks: "{{ lookup('ansible.builtin.file', playbook_dir ~ '/../../tasks/lighting.yml') | from_yaml }}"
+
+    - name: The final --report is given the unit's brightness and breathing arguments
+      # Without them the report's `applied` colour is scaled at the CLI default of 100%, so it
+      # reads the unscaled colour exactly when a brightness is set. Matched with [{] rather than a
+      # literal brace pair, which this assertion's own template would try to render.
+      ansible.builtin.assert:
+        that:
+          - _report | length == 1
+          - _report[0] is search('--report')
+          - _report[0] is search('--brightness [{][{] bazzite_rgb_brightness [}][}]')
+          - _report[0] is search('--breathe-depth [{][{] bazzite_rgb_breathe_depth [}][}]')
+          - _report[0] is search('--breathe-period [{][{] bazzite_rgb_breathe_period [}][}]')
+          - _report[0] is search('--breathe-rate [{][{] bazzite_rgb_breathe_rate [}][}]')
+        fail_msg: "the lighting report command is {{ _report }}"
+        quiet: true
+      vars:
+        # Bracket access: `map(attribute=...)` would split 'ansible.builtin.command' on its dots.
+        _matches: >-
+          {{ _lighting_tasks | selectattr('name', 'equalto', 'Report the devices and the current target colour') | list }}
+        _report: "{{ [((_matches | first)['ansible.builtin.command']).cmd] if (_matches | length) == 1 else _matches }}"
+
+    # The range gate is the only type check when the entrypoint is reached with `tasks_from:`.
+    # Each case runs the role's REAL _rgb_validate.yml with set_fact values (set_fact, because
+    # setup_vars resolved these with set_fact), records pass/fail, and the defaults are restored.
+    - name: Run the RGB range gate against good and bad values
+      ansible.builtin.include_tasks: rgb_validate_case.yml
+      loop:
+        - {name: owner, expect: pass, b: 20, d: 7.5, p: 4.0, r: 20.0}
+        - {name: defaults, expect: pass, b: 100.0, d: 0.0, p: 4.0, r: 20.0}
+        - {name: unparseable, expect: fail, b: bright, d: 0.0, p: 4.0, r: 20.0}
+        - {name: brightness-high, expect: fail, b: 101, d: 0.0, p: 4.0, r: 20.0}
+        - {name: depth-negative, expect: fail, b: 20, d: -1, p: 4.0, r: 20.0}
+        - {name: rate-huge, expect: fail, b: 20, d: 7.5, p: 4.0, r: 1e9}
+        - {name: period-zero, expect: fail, b: 20, d: 7.5, p: 0, r: 20.0}
+      loop_control:
+        loop_var: _case
+        label: "{{ _case.name }}"
+
+    - name: Every case went the way it should
+      ansible.builtin.assert:
+        that:
+          - _rgb_cases | length == 7
+          - _rgb_cases | dict2items | selectattr('value', 'equalto', 'wrong') | list | length == 0
+        fail_msg: "range gate results: {{ _rgb_cases }}"
+        quiet: true

@@ -1,0 +1,31 @@
+---
+# One case for verify.yml's RGB range gate test: set the values, run the role's real gate,
+# record whether it went the expected way, restore the defaults.
+- name: Set the case's values ({{ _case.name }})
+  ansible.builtin.set_fact:
+    bazzite_rgb_brightness: "{{ _case.b }}"
+    bazzite_rgb_breathe_depth: "{{ _case.d }}"
+    bazzite_rgb_breathe_period: "{{ _case.p }}"
+    bazzite_rgb_breathe_rate: "{{ _case.r }}"
+
+- name: Run the gate ({{ _case.name }})
+  block:
+    - name: The role's own range gate
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/../../tasks/_rgb_validate.yml"
+
+    - name: Record that the gate passed
+      ansible.builtin.set_fact:
+        _rgb_cases: "{{ _rgb_cases | default({}) | combine({_case.name: ('ok' if _case.expect == 'pass' else 'wrong')}) }}"
+  rescue:
+    - name: Record that the gate refused
+      ansible.builtin.set_fact:
+        _rgb_cases: "{{ _rgb_cases | default({}) | combine({_case.name: ('ok' if _case.expect == 'fail' else 'wrong')}) }}"
+
+- name: Restore the RGB defaults
+  # From the role's own generated defaults file (read into _rgb_defaults by verify.yml),
+  # not retyped values (MOLMIRROR-02).
+  ansible.builtin.set_fact:
+    bazzite_rgb_brightness: "{{ _rgb_defaults['bazzite_rgb_brightness__default'] }}"
+    bazzite_rgb_breathe_depth: "{{ _rgb_defaults['bazzite_rgb_breathe_depth__default'] }}"
+    bazzite_rgb_breathe_period: "{{ _rgb_defaults['bazzite_rgb_breathe_period__default'] }}"
+    bazzite_rgb_breathe_rate: "{{ _rgb_defaults['bazzite_rgb_breathe_rate__default'] }}"

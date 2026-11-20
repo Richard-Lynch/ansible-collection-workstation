@@ -13,7 +13,7 @@ After=default.target
 
 [Service]
 Type=simple
-ExecStart={{ bazzite_python }} {{ bazzite_rgb_daemon_path }} --host {{ bazzite_rgb_server_host }} --port {{ bazzite_rgb_server_port }} --mode {{ bazzite_rgb_daemon_mode }} --color {{ bazzite_rgb_color }} --interval {{ bazzite_rgb_interval }} --cpu-min {{ bazzite_rgb_cpu_min }} --cpu-max {{ bazzite_rgb_cpu_max }} --gpu-min {{ bazzite_rgb_gpu_min }} --gpu-max {{ bazzite_rgb_gpu_max }} {{ ("--zone-sizes '" ~ bazzite_rgb_zone_sizes ~ "'") if bazzite_rgb_zone_sizes else '' }}
+ExecStart={{ bazzite_python }} {{ bazzite_rgb_daemon_path }} --host {{ bazzite_rgb_server_host }} --port {{ bazzite_rgb_server_port }} --mode {{ bazzite_rgb_daemon_mode }} --color {{ bazzite_rgb_color }} --interval {{ bazzite_rgb_interval }} --cpu-min {{ bazzite_rgb_cpu_min }} --cpu-max {{ bazzite_rgb_cpu_max }} --gpu-min {{ bazzite_rgb_gpu_min }} --gpu-max {{ bazzite_rgb_gpu_max }} --brightness {{ bazzite_rgb_brightness }} --breathe-depth {{ bazzite_rgb_breathe_depth }} --breathe-period {{ bazzite_rgb_breathe_period }} --breathe-rate {{ bazzite_rgb_breathe_rate }} {{ ("--zone-sizes '" ~ bazzite_rgb_zone_sizes ~ "'") if bazzite_rgb_zone_sizes else '' }}
 Restart=always
 RestartSec=5s
 
