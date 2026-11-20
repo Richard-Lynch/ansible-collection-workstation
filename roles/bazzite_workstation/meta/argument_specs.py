@@ -572,12 +572,13 @@ argument_specs = ArgumentSpecs(
                 "bazzite_rgb_settle_seconds": OptionSpec(
                     type="int",
                     required=False,
-                    default=30,
+                    default=45,
                     description=[
                         "Seconds the lighting entrypoint waits after starting the units before",
                         "asserting one OpenRGB server process, one listener, and a restart counter",
                         "that has not moved. A server that cannot bind its port reads active between",
-                        "restarts, so only a window shows the loop. 0 skips the wait, not the check.",
+                        "restarts; 45 s covers two of its crash cycles. 0 skips the wait, not the",
+                        "check, and the port holder must also have started after the unit did.",
                     ],
                 ),
                 "bazzite_sunshine_enabled": OptionSpec(

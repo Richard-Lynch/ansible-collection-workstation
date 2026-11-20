@@ -22,8 +22,10 @@
         _rgb_cases: "{{ _rgb_cases | default({}) | combine({_case.name: ('ok' if _case.expect == 'fail' else 'wrong')}) }}"
 
 - name: Restore the RGB defaults
+  # From the role's own generated defaults file (read into _rgb_defaults by verify.yml),
+  # not retyped values (MOLMIRROR-02).
   ansible.builtin.set_fact:
-    bazzite_rgb_brightness: 100.0
-    bazzite_rgb_breathe_depth: 0.0
-    bazzite_rgb_breathe_period: 4.0
-    bazzite_rgb_breathe_rate: 20.0
+    bazzite_rgb_brightness: "{{ _rgb_defaults['bazzite_rgb_brightness__default'] }}"
+    bazzite_rgb_breathe_depth: "{{ _rgb_defaults['bazzite_rgb_breathe_depth__default'] }}"
+    bazzite_rgb_breathe_period: "{{ _rgb_defaults['bazzite_rgb_breathe_period__default'] }}"
+    bazzite_rgb_breathe_rate: "{{ _rgb_defaults['bazzite_rgb_breathe_rate__default'] }}"

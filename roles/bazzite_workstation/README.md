@@ -96,7 +96,10 @@ transient scope of its own, outside `openrgb-server.service`. Stopping the unit 
 the old server holding the port and every new instance failing to bind, so the unit kills the app
 on start and stop, a server-unit change also stops every OpenRGB scope before the start, and the
 entrypoint ends by asserting one server process, one listener, and a restart counter that has not
-moved over `bazzite_rgb_settle_seconds` (default `30`).
+moved over `bazzite_rgb_settle_seconds` (default `45`), with the port held by a process that
+started after the unit last did. An OpenRGB GUI open on the desktop is the same flatpak and
+process name: it fails those gates, and the unit's `flatpak kill` closes it on every start and
+stop.
 
 The role has no option for a device's own animated effects. A hardware effect
 replaces the per-LED mode the daemon writes in, so it cannot follow the

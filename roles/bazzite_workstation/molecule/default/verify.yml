@@ -275,6 +275,10 @@
     # The RGB daemon unit's ExecStart is the only place brightness and breathing reach the
     # process: a dropped flag starts a daemon on its own defaults (full brightness, no breath)
     # that is up, healthy and logging colours, so the lighting read-back passes regardless.
+    - name: Read the role's generated defaults, for restoring overridden RGB values
+      ansible.builtin.set_fact:
+        _rgb_defaults: "{{ lookup('ansible.builtin.file', playbook_dir ~ '/../../defaults/main.yml') | from_yaml }}"
+
     - name: Render the RGB daemon unit from the ROLE'S template, at the defaults
       ansible.builtin.set_fact:
         _rgb_exec: >-
@@ -315,13 +319,15 @@
              | regex_search('(?m)^ExecStart=.*$') | trim }}
 
     - name: Restore the RGB defaults
+      # From the role's own generated defaults file, not retyped values (MOLMIRROR-02); the
+      # include_role above scopes the role's defaults to itself, so they are read from the file.
       ansible.builtin.set_fact:
-        bazzite_rgb_daemon_mode: auto
-        bazzite_rgb_color: FF6600
-        bazzite_rgb_brightness: 100.0
-        bazzite_rgb_breathe_depth: 0.0
-        bazzite_rgb_breathe_period: 4.0
-        bazzite_rgb_zone_sizes: ""
+        bazzite_rgb_daemon_mode: "{{ _rgb_defaults['bazzite_rgb_daemon_mode__default'] }}"
+        bazzite_rgb_color: "{{ _rgb_defaults['bazzite_rgb_color__default'] }}"
+        bazzite_rgb_brightness: "{{ _rgb_defaults['bazzite_rgb_brightness__default'] }}"
+        bazzite_rgb_breathe_depth: "{{ _rgb_defaults['bazzite_rgb_breathe_depth__default'] }}"
+        bazzite_rgb_breathe_period: "{{ _rgb_defaults['bazzite_rgb_breathe_period__default'] }}"
+        bazzite_rgb_zone_sizes: "{{ _rgb_defaults['bazzite_rgb_zone_sizes__default'] }}"
 
     - name: Brightness and breathing reach the daemon's command line, ahead of the zone sizes
       ansible.builtin.assert:

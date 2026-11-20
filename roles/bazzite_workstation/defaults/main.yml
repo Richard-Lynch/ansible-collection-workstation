@@ -241,8 +241,9 @@ bazzite_rgb_breathe_rate__default: 20.0
 # Seconds the lighting entrypoint waits after starting the units before
 # asserting one OpenRGB server process, one listener, and a restart counter
 # that has not moved. A server that cannot bind its port reads active between
-# restarts, so only a window shows the loop. 0 skips the wait, not the check.
-bazzite_rgb_settle_seconds__default: 30
+# restarts; 45 s covers two of its crash cycles. 0 skips the wait, not the
+# check, and the port holder must also have started after the unit did.
+bazzite_rgb_settle_seconds__default: 45
 
 # Whether Sunshine should be RUNNING. False converges the sunshine
 # entrypoint to stopped with no autostart entry, keeping the flatpak,

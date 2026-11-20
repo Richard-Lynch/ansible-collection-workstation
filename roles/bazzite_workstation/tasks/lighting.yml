@@ -159,10 +159,15 @@
     - bazzite_apply | bool
     - _bz_rgb_server_unit.changed | default(false)
 
-- name: Read back that no OpenRGB process is left running or listening
+- name: HARD GATE — no OpenRGB process or listener is left before the server starts
   # The PROCESS TABLE and the PORT, not the stop's exit codes. `pgrep -x` on the process name:
   # an -f pattern would match this shell's own command line. No `|| true` on ss: an unreadable
   # socket table must fail this read, never print port=0.
+  #
+  # THIS TASK IS THE GATE. Once `until:` exhausts its retries the task fails whatever
+  # `failed_when:` says, so a separate assert after it could never be the thing that fires.
+  # An OpenRGB GUI the user has open is the same flatpak and the same process name, so it
+  # counts here too: close it, or it holds this gate (and the unit's `flatpak kill` ends it).
   ansible.builtin.shell:
     executable: /bin/bash
     cmd: |
@@ -177,17 +182,6 @@
   retries: 10
   delay: 2
   until: "(_bz_rgb_off.stdout | default('') | trim) == 'procs=0 port=0'"
-  failed_when: false
-  when:
-    - bazzite_apply | bool
-    - _bz_rgb_server_unit.changed | default(false)
-
-- name: HARD GATE — nothing OpenRGB is left before the server starts
-  ansible.builtin.assert:
-    that:
-      - "(_bz_rgb_off.stdout | default('') | trim) == 'procs=0 port=0'"
-    fail_msg: "OpenRGB is still running or listening after the stop: {{ _bz_rgb_off.stdout | default(_bz_rgb_off) }}"
-    quiet: true
   when:
     - bazzite_apply | bool
     - _bz_rgb_server_unit.changed | default(false)
@@ -284,7 +278,7 @@
                       continue
                   # --size ALONE is accepted and does nothing; the resize only applies when a
                   # mode and colour accompany it. Three bare --size calls left the headers at 0.
-                  subprocess.run([
+                  r = subprocess.run([
                       "flatpak", "run", "org.openrgb.OpenRGB",
                       "--client", "{{ bazzite_rgb_server_host }}:{{ bazzite_rgb_server_port }}",
                       "--device", str(dev["index"]),
@@ -293,6 +287,12 @@
                       "--mode", "Direct",
                       "--color", "{{ bazzite_rgb_color }}",
                   ], capture_output=True, text=True)
+                  # Checked: a client that failed (no server to reach, killed mid-call) would
+                  # otherwise still print "resized" and report CHANGED.
+                  if r.returncode != 0:
+                      print(f"resize of device {dev['index']} zone {zone_index} failed "
+                            f"(rc {r.returncode}): {r.stderr.strip()}")
+                      sys.exit(1)
                   print(f"resized device {dev['index']} zone {zone_index} "
                         f"{dev['zones'][zone_index]} -> {size}")
                   changed += 1
@@ -420,6 +420,20 @@
       printf 'nrestarts=%s\n' "$(systemctl --user show {{ bazzite_rgb_server_unit }} -p NRestarts --value)"
       printf 'procs=%s\n' "$(pgrep -u "$(id -u)" -xc openrgb || true)"
       printf 'listeners=%s\n' "$(printf '%s' "$_ss" | grep -cE ':{{ bazzite_rgb_server_port }}\b' || true)"
+      # WINDOW-FREE: the process holding the port must have started no earlier than the unit
+      # last became active. An orphan from before the restart is older; a crash-looping unit
+      # keeps moving ActiveEnterTimestamp past the orphan. Wall-clock seconds on both sides
+      # (ps lstart, systemd's timestamp), so a suspend cannot skew one against the other.
+      _holder=$(ss -ltnpH "sport = :{{ bazzite_rgb_server_port }}" | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2 || true)
+      _active=$(systemctl --user show {{ bazzite_rgb_server_unit }} -p ActiveEnterTimestamp --value)
+      if [ -n "$_holder" ] && [ -n "$_active" ]; then
+        _hs=$(date -d "$(ps -o lstart= -p "$_holder")" +%s)
+        _as=$(date -d "$_active" +%s)
+        printf 'holder_started_after_unit=%s\n' "$([ "$_hs" -ge "$_as" ] && echo yes || echo no)"
+        printf 'holder=pid %s started %s, unit active since %s\n' "$_holder" "$_hs" "$_as"
+      else
+        printf 'holder_started_after_unit=unknown\n'
+      fi
   register: _bz_rgb_settled
   changed_when: false
   when: bazzite_apply | bool
@@ -430,11 +444,14 @@
       - "('nrestarts=' ~ (_bz_rgb_nrestarts_before.stdout | trim)) in _bz_rgb_settled.stdout_lines"
       - "'procs=1' in _bz_rgb_settled.stdout_lines"
       - "'listeners=1' in _bz_rgb_settled.stdout_lines"
+      - "'holder_started_after_unit=yes' in _bz_rgb_settled.stdout_lines"
     fail_msg: >-
       The OpenRGB server is not running clean: {{ _bz_rgb_settled.stdout_lines }} (restart counter
       was {{ _bz_rgb_nrestarts_before.stdout | trim }} before the settle window). More than one
-      process, or a moving counter, is a stacked server: an orphan in an
-      app-flatpak-org.openrgb.OpenRGB scope holds the port.
+      process, a moving counter, or a port holder older than the unit is a stacked server: an
+      orphan in an app-flatpak-org.openrgb.OpenRGB scope holds the port. An OpenRGB GUI open on
+      the desktop is the same flatpak and process name and also reads as a second process; close
+      it and re-run.
     quiet: true
   when: bazzite_apply | bool
 

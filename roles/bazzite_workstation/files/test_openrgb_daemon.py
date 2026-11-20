@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Tests for openrgb_daemon.py's brightness scaling, breathe curve and write cadence. Stdlib only.
 
