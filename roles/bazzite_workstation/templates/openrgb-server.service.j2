@@ -21,9 +21,16 @@ Type=simple
 # its main config — only inside a profile — so without this every restart reverts an
 # addressable header to 0 LEDs, and a zero-LED zone is silently skipped by every write. Fans
 # then keep reverting to the BIOS effect.
+# `flatpak run` moves the real server into a transient scope of its own, outside this unit's
+# cgroup, so stopping the unit kills only the `flatpak run` wrapper and the old server keeps the
+# port: every later start then fails to bind and Restart= loops. `flatpak kill` ends the app in
+# that scope, before a start (an orphan from an earlier run) and after a stop. The leading `-`
+# lets it fail when nothing is running, which is the usual case.
+ExecStartPre=-/usr/bin/flatpak kill org.openrgb.OpenRGB
 ExecStart=/usr/bin/flatpak run org.openrgb.OpenRGB --server --server-host {{ bazzite_rgb_server_host }} --server-port {{ bazzite_rgb_server_port }} --noautoconnect{{ (" --profile " ~ bazzite_rgb_profile) if bazzite_rgb_profile else "" }}
 Restart=on-failure
 RestartSec=5s
+ExecStopPost=-/usr/bin/flatpak kill org.openrgb.OpenRGB
 
 [Install]
 WantedBy=default.target

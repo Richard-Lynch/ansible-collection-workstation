@@ -27,6 +27,10 @@
 #   gpu      colour follows GPU temperature
 #   load     colour follows load average
 #   auto     whichever of cpu/gpu is proportionally hotter (default)
+#
+# In every mode the colour is scaled to bazzite_rgb_brightness, and bazzite_rgb_breathe_depth > 0
+# swings that brightness on a sine (bazzite_rgb_breathe_period), rendered at
+# bazzite_rgb_breathe_rate ticks a second.
 
 - name: Apply role defaults
   ansible.builtin.include_tasks: setup_vars.yml
@@ -39,6 +43,9 @@
       bazzite_rgb_color must be six hex digits with no leading '#'
       (got '{{ bazzite_rgb_color }}').
     quiet: true
+
+- name: Validate brightness and breathing
+  ansible.builtin.include_tasks: _rgb_validate.yml
 
 - name: Check OpenRGB is installed
   ansible.builtin.command:
@@ -124,12 +131,74 @@
     - bazzite_apply | bool
     - (_bz_rgb_server_unit.changed | default(false)) or (_bz_rgb_daemon_unit.changed | default(false)) or (_bz_rgb_stale_links.changed | default(false))
 
+# THE SERVER RUNS OUTSIDE ITS OWN UNIT. `flatpak run` hands the real openrgb process to a
+# transient scope of its own (app-flatpak-org.openrgb.OpenRGB-<n>.scope), so restarting the unit
+# kills only the `flatpak run` wrapper and leaves the old server holding the port. Every new
+# instance then exits within seconds (cannot bind) and Restart= loops on it, while the lights look
+# fine, because the daemon keeps reconnecting to the orphan. The unit now kills the app on start
+# and stop (openrgb-server.service.j2); a server-unit change, which is when the previous unit
+# definition may lack that, also stops every scope here and proves nothing is left before the
+# start. Same trap, and the same fix, as the Sunshine entrypoint's.
+- name: Stop the RGB units and every OpenRGB flatpak scope
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      export XDG_RUNTIME_DIR=/run/user/$(id -u)
+      export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus
+      systemctl --user stop {{ bazzite_rgb_daemon_unit }} {{ bazzite_rgb_server_unit }}
+      for s in $(systemctl --user list-units --type=scope --no-legend --plain 2>/dev/null \
+                 | awk '/app-flatpak-org\.openrgb\.OpenRGB.*\.scope/ {print $1}'); do
+        systemctl --user stop "$s"
+        echo "stopped $s"
+      done
+      systemctl --user reset-failed {{ bazzite_rgb_server_unit }} {{ bazzite_rgb_daemon_unit }} || true
+  register: _bz_rgb_stop
+  changed_when: true
+  when:
+    - bazzite_apply | bool
+    - _bz_rgb_server_unit.changed | default(false)
+
+- name: Read back that no OpenRGB process is left running or listening
+  # The PROCESS TABLE and the PORT, not the stop's exit codes. `pgrep -x` on the process name:
+  # an -f pattern would match this shell's own command line. No `|| true` on ss: an unreadable
+  # socket table must fail this read, never print port=0.
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      _ss=$(ss -tln)
+      case "$_ss" in State*) ;; *) echo "ss returned no socket table"; exit 1 ;; esac
+      printf 'procs=%s port=%s\n' \
+        "$(pgrep -u "$(id -u)" -xc openrgb || true)" \
+        "$(printf '%s' "$_ss" | grep -cE ':{{ bazzite_rgb_server_port }}\b' || true)"
+  register: _bz_rgb_off
+  changed_when: false
+  retries: 10
+  delay: 2
+  until: "(_bz_rgb_off.stdout | default('') | trim) == 'procs=0 port=0'"
+  failed_when: false
+  when:
+    - bazzite_apply | bool
+    - _bz_rgb_server_unit.changed | default(false)
+
+- name: HARD GATE — nothing OpenRGB is left before the server starts
+  ansible.builtin.assert:
+    that:
+      - "(_bz_rgb_off.stdout | default('') | trim) == 'procs=0 port=0'"
+    fail_msg: "OpenRGB is still running or listening after the stop: {{ _bz_rgb_off.stdout | default(_bz_rgb_off) }}"
+    quiet: true
+  when:
+    - bazzite_apply | bool
+    - _bz_rgb_server_unit.changed | default(false)
+
 - name: Enable and start the SDK server
+  # `started`, not `restarted`: a changed unit was stopped above, scopes and all.
   ansible.builtin.systemd_service:
     name: "{{ bazzite_rgb_server_unit }}"
     scope: user
     enabled: true
-    state: "{{ 'restarted' if (_bz_rgb_server_unit.changed | default(false)) else 'started' }}"
+    state: started
   when: bazzite_apply | bool
 
 - name: Wait for the SDK server to accept connections
@@ -147,6 +216,19 @@
     scope: user
     enabled: true
     state: "{{ 'restarted' if ((_bz_rgb_daemon_unit.changed | default(false)) or (_bz_rgb_script.changed | default(false))) else 'started' }}"
+  when: bazzite_apply | bool
+
+- name: Record the server's restart counter
+  # The baseline for the settle-window gate below. Compared against this, not against 0: whether
+  # a manual start resets NRestarts is systemd's business, and a counter that does not move is
+  # the property that matters.
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      systemctl --user show {{ bazzite_rgb_server_unit }} -p NRestarts --value
+  register: _bz_rgb_nrestarts_before
+  changed_when: false
   when: bazzite_apply | bool
 
 # ADDRESSABLE-HEADER SIZING. Done here with OpenRGB's own CLI rather than from the daemon.
@@ -254,8 +336,15 @@
 - name: Report the devices and the current target colour
   # Runs the daemon's own --report against the live server, so the report reflects exactly what
   # the daemon sees rather than a second implementation that could disagree with it.
+  #
+  # Given the unit's brightness and breathing arguments, so the report's `applied` colour is the
+  # one the daemon writes. Without them it scales at the CLI default of 100% and reports the
+  # unscaled colour, wrong exactly when brightness is set.
   ansible.builtin.command:
-    cmd: "{{ bazzite_python }} {{ bazzite_rgb_daemon_path }} --report --port {{ bazzite_rgb_server_port }}"
+    cmd: >-
+      {{ bazzite_python }} {{ bazzite_rgb_daemon_path }} --report --port {{ bazzite_rgb_server_port }}
+      --brightness {{ bazzite_rgb_brightness }} --breathe-depth {{ bazzite_rgb_breathe_depth }}
+      --breathe-period {{ bazzite_rgb_breathe_period }} --breathe-rate {{ bazzite_rgb_breathe_rate }}
   register: _bz_rgb_report
   changed_when: false
   failed_when: false
@@ -312,19 +401,61 @@
     quiet: true
   when: bazzite_apply | bool
 
+- name: Settle, so a server crash loop has time to show itself
+  # "active" is not health: a server that cannot bind exits within seconds and Restart= brings it
+  # straight back, so at any instant it can read active while it loops.
+  ansible.builtin.pause:
+    seconds: "{{ bazzite_rgb_settle_seconds | int }}"
+  when:
+    - bazzite_apply | bool
+    - (bazzite_rgb_settle_seconds | int) > 0
+
+- name: Read back the server after the settle window
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      _ss=$(ss -tln)
+      case "$_ss" in State*) ;; *) echo "ss returned no socket table"; exit 1 ;; esac
+      printf 'nrestarts=%s\n' "$(systemctl --user show {{ bazzite_rgb_server_unit }} -p NRestarts --value)"
+      printf 'procs=%s\n' "$(pgrep -u "$(id -u)" -xc openrgb || true)"
+      printf 'listeners=%s\n' "$(printf '%s' "$_ss" | grep -cE ':{{ bazzite_rgb_server_port }}\b' || true)"
+  register: _bz_rgb_settled
+  changed_when: false
+  when: bazzite_apply | bool
+
+- name: HARD GATE — one server process, one listener, and no restarts over the settle window
+  ansible.builtin.assert:
+    that:
+      - "('nrestarts=' ~ (_bz_rgb_nrestarts_before.stdout | trim)) in _bz_rgb_settled.stdout_lines"
+      - "'procs=1' in _bz_rgb_settled.stdout_lines"
+      - "'listeners=1' in _bz_rgb_settled.stdout_lines"
+    fail_msg: >-
+      The OpenRGB server is not running clean: {{ _bz_rgb_settled.stdout_lines }} (restart counter
+      was {{ _bz_rgb_nrestarts_before.stdout | trim }} before the settle window). More than one
+      process, or a moving counter, is a stacked server: an orphan in an
+      app-flatpak-org.openrgb.OpenRGB scope holds the port.
+    quiet: true
+  when: bazzite_apply | bool
+
 - name: Report
   ansible.builtin.debug:
     msg:
       - "{{ _bz_rgb_state.stdout_lines | default([]) }}"
+      - "{{ _bz_rgb_settled.stdout_lines | default([]) }}"
       - >-
         Mode '{{ bazzite_rgb_daemon_mode }}'.
         {{ 'Colour follows temperature: blue when idle through green and yellow to red under
         load.' if bazzite_rgb_daemon_mode != 'static'
         else 'Holding a fixed ' ~ bazzite_rgb_color ~ '.' }}
+        Brightness {{ bazzite_rgb_brightness }}%{{ (', breathing +/- ' ~ bazzite_rgb_breathe_depth
+        ~ ' over ' ~ bazzite_rgb_breathe_period ~ 's') if (bazzite_rgb_breathe_depth | float) > 0
+        else '' }}.
       - >-
         The colour persists because the daemon holds the SDK connection open — stopping
         {{ bazzite_rgb_daemon_unit }} lets the devices revert.
       - "{{ (_bz_rgb_report.stdout | default('') | from_json).target | default('(report unavailable)') }}"
+      - "{{ (_bz_rgb_report.stdout | default('') | from_json).applied | default('(report unavailable)') }}"
   when: bazzite_apply | bool
 
 - name: Report devices (read-only run)

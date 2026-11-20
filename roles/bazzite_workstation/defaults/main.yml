@@ -216,17 +216,33 @@ bazzite_python__default: /usr/bin/python3
 # without writing otherwise.
 bazzite_rgb_color__default: FF6600
 
-# Brightness percentage (0-100) for devices whose mode supports it.
-# Silently ignored by devices that do not.
-bazzite_rgb_brightness__default: 100
+# Brightness percentage (0-100) the RGB daemon scales every colour to, in
+# every bazzite_rgb_daemon_mode, including the temperature ramp. 100 writes
+# the colour as given. Done by scaling the colour, so it works on every
+# device the daemon drives, whatever brightness control its mode has.
+bazzite_rgb_brightness__default: 100.0
 
-# An ANIMATED effect to run instead of a static colour, e.g.
-# 'Rainbow Wave' or 'Spectrum Cycle'. Empty (the default) means set a
-# static colour from bazzite_rgb_color instead.
-# Effect names are per-vendor and case-sensitive — run the lighting
-# entrypoint read-only to see what each device declares. A device that
-# does not offer the named effect is skipped, not failed.
-bazzite_rgb_mode__default: ''
+# Breathing: percentage points (0-100) the brightness swings either side of
+# bazzite_rgb_brightness, on a sine of bazzite_rgb_breathe_period seconds,
+# clamped to 0-100. 0 (the default) turns breathing off, and the daemon then
+# writes exactly as often as without it. E.g. brightness 20 and depth 7.5
+# breathes between 12.5% and 27.5%.
+bazzite_rgb_breathe_depth__default: 0.0
+
+# Seconds per breath (one full sine). Must be positive.
+bazzite_rgb_breathe_period__default: 4.0
+
+# Render ticks per second while breathing. Sensors are still read only every
+# bazzite_rgb_interval; a tick re-scales the last colour and writes only if
+# the scaled colour changed. Lower it if a device's bus does not keep up:
+# SMBus-attached DRAM is the slow one.
+bazzite_rgb_breathe_rate__default: 20.0
+
+# Seconds the lighting entrypoint waits after starting the units before
+# asserting one OpenRGB server process, one listener, and a restart counter
+# that has not moved. A server that cannot bind its port reads active between
+# restarts, so only a window shows the loop. 0 skips the wait, not the check.
+bazzite_rgb_settle_seconds__default: 30
 
 # Whether Sunshine should be RUNNING. False converges the sunshine
 # entrypoint to stopped with no autostart entry, keeping the flatpak,

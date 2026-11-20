@@ -1,0 +1,25 @@
+---
+# Range checks for the RGB daemon's numeric options, included by lighting.yml before anything is
+# written. Its own file so the molecule scenario can run these exact assertions against good and
+# bad values.
+#
+# The daemon refuses an out-of-range value at startup, which under Restart=always is a unit that
+# crash-loops after the play has reported success. And this is the ONLY check on the types: an
+# entrypoint reached with `tasks_from:` skips the argument spec. So each value is cast with a
+# default that is itself out of range — `float(-1)` — because a bare `| float` turns an
+# unparseable string into 0.0, which would pass a 0-100 gate and render `--brightness bright`.
+- name: Validate brightness and breathing
+  ansible.builtin.assert:
+    that:
+      - (bazzite_rgb_brightness | float(-1)) >= 0 and (bazzite_rgb_brightness | float(-1)) <= 100
+      - (bazzite_rgb_breathe_depth | float(-1)) >= 0 and (bazzite_rgb_breathe_depth | float(-1)) <= 100
+      # Upper bounds as the daemon's own MAX_BREATHE_PERIOD / MAX_BREATHE_RATE.
+      - (bazzite_rgb_breathe_period | float(-1)) > 0 and (bazzite_rgb_breathe_period | float(-1)) <= 3600
+      - (bazzite_rgb_breathe_rate | float(-1)) > 0 and (bazzite_rgb_breathe_rate | float(-1)) <= 100
+    fail_msg: >-
+      bazzite_rgb_brightness and bazzite_rgb_breathe_depth must be numbers from 0 to 100,
+      bazzite_rgb_breathe_period a number of seconds above 0 and at most 3600, and
+      bazzite_rgb_breathe_rate a number above 0 and at most 100 (got brightness
+      {{ bazzite_rgb_brightness }}, depth {{ bazzite_rgb_breathe_depth }}, period
+      {{ bazzite_rgb_breathe_period }}, rate {{ bazzite_rgb_breathe_rate }}).
+    quiet: true
